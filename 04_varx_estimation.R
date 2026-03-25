@@ -740,34 +740,41 @@ varx_chol <- VAR(Y_chol, p=P_LAG, type="const",
 #   Captures: when funding costs rise (Fed hike transmission), how does NIM,
 #   loan demand, membership, and deposit mix respond?
 
-irf_pll <- irf(
-  varx_chol,
-  impulse  = if ("pll_rate" %in% chol_order) "pll_rate" else chol_order[1],
-  response = chol_order,
-  n.ahead  = IRF_HORIZON,
-  boot     = TRUE, ci=0.90, runs=N_BOOT, ortho=TRUE
-)
+# ── Compute ALL 8 IRFs — one per endogenous variable in Cholesky order ───────
+# Each shows: "when THIS variable is shocked, how does the WHOLE system respond?"
+# This gives the complete picture of dynamic transmission in the CU system.
 
-irf_cof <- irf(
-  varx_chol,
-  impulse  = if ("costfds" %in% chol_order) "costfds" else chol_order[1],
-  response = chol_order,
-  n.ahead  = IRF_HORIZON,
-  boot     = TRUE, ci=0.90, runs=N_BOOT, ortho=TRUE
-)
+safe_irf <- function(model, impulse_var, response_vars, horizon, boot, ci, runs) {
+  if (!impulse_var %in% colnames(model$y)) {
+    msg("  SKIP IRF: impulse '%s' not in model", impulse_var)
+    return(NULL)
+  }
+  tryCatch(
+    irf(model, impulse=impulse_var, response=response_vars,
+        n.ahead=horizon, boot=boot, ci=ci, runs=runs, ortho=TRUE),
+    error=function(e) {
+      msg("  IRF failed for impulse '%s': %s", impulse_var, e$message)
+      NULL
+    }
+  )
+}
 
-# Keep delinquency shock for comparison with earlier version
-irf_delq <- irf(
-  varx_chol,
-  impulse  = if ("dq_rate" %in% chol_order) "dq_rate" else chol_order[2],
-  response = chol_order,
-  n.ahead  = IRF_HORIZON,
-  boot     = TRUE, ci=0.90, runs=N_BOOT, ortho=TRUE
-)
+irf_pll    <- safe_irf(varx_chol, "pll_rate",             chol_order, IRF_HORIZON, TRUE, 0.90, N_BOOT)
+irf_delq   <- safe_irf(varx_chol, "dq_rate",              chol_order, IRF_HORIZON, TRUE, 0.90, N_BOOT)
+irf_cof    <- safe_irf(varx_chol, "costfds",              chol_order, IRF_HORIZON, TRUE, 0.90, N_BOOT)
+irf_nim    <- safe_irf(varx_chol, "netintmrg",            chol_order, IRF_HORIZON, TRUE, 0.90, N_BOOT)
+irf_dep    <- safe_irf(varx_chol, "insured_share_growth", chol_order, IRF_HORIZON, TRUE, 0.90, N_BOOT)
+irf_mem    <- safe_irf(varx_chol, "member_growth_yoy",    chol_order, IRF_HORIZON, TRUE, 0.90, N_BOOT)
+irf_lts    <- safe_irf(varx_chol, "loan_to_share",        chol_order, IRF_HORIZON, TRUE, 0.90, N_BOOT)
+irf_nw     <- safe_irf(varx_chol, "pcanetworth",          chol_order, IRF_HORIZON, TRUE, 0.90, N_BOOT)
 
-saveRDS(list(irf_pll=irf_pll, irf_cof=irf_cof, irf_delq=irf_delq),
-        "Results/04_varx_irf.rds")
-msg("IRFs saved \u2192 Results/04_varx_irf.rds")
+saveRDS(
+  list(irf_pll  = irf_pll,  irf_delq = irf_delq, irf_cof = irf_cof,
+       irf_nim  = irf_nim,  irf_dep  = irf_dep,  irf_mem = irf_mem,
+       irf_lts  = irf_lts,  irf_nw   = irf_nw),
+  "Results/04_varx_irf.rds"
+)
+msg("All 8 IRFs saved \u2192 Results/04_varx_irf.rds")
 
 # ── 7.3 Plot IRFs ─────────────────────────────────────────────────────────────
 plot_irf <- function(irf_obj, impulse_label, outfile) {
@@ -844,9 +851,79 @@ plot_irf <- function(irf_obj, impulse_label, outfile) {
   invisible(p)
 }
 
-plot_irf(irf_pll,  "PLL Rate (Forward-Looking Provisions)", "Figures/04_irf_pll_rate.png")
-plot_irf(irf_cof,  "Cost of Funds (Rate Channel)",          "Figures/04_irf_cost_of_funds.png")
-plot_irf(irf_delq, "Delinquency Rate (Credit Channel)",     "Figures/04_irf_delinquency.png")
+plot_irf(irf_pll,  "PLL Rate (Forward-Looking Provisions)",    "Figures/04_irf_pll_rate.png")
+plot_irf(irf_delq, "Delinquency Rate (Realised Credit Stress)", "Figures/04_irf_delinquency.png")
+plot_irf(irf_cof,  "Cost of Funds (Rate Channel)",             "Figures/04_irf_cost_of_funds.png")
+plot_irf(irf_nim,  "Net Interest Margin (NIM Compression)",    "Figures/04_irf_net_int_margin.png")
+plot_irf(irf_dep,  "Insured Share Growth (Deposit Channel)",   "Figures/04_irf_deposit_growth.png")
+plot_irf(irf_mem,  "Membership Growth (Early Warning Signal)", "Figures/04_irf_membership.png")
+plot_irf(irf_lts,  "Loan-to-Share Ratio (Balance Sheet)",      "Figures/04_irf_loan_to_share.png")
+plot_irf(irf_nw,   "Net Worth Ratio (Capital Adequacy)",       "Figures/04_irf_net_worth.png")
+
+msg("All 8 IRF charts saved to Figures/")
+
+# ── Combined 2×4 IRF summary grid for paper ──────────────────────────────────
+# Shows headline response (dq_rate) to each of the 8 structural shocks
+# Answers: "Which shock matters most for credit quality?"
+hdr("IRF Summary Grid: dq_rate response to all 8 shocks")
+
+irf_list_all <- list(
+  list(obj=irf_pll,  label="PLL Rate shock"),
+  list(obj=irf_delq, label="Delinquency shock"),
+  list(obj=irf_cof,  label="Cost of Funds shock"),
+  list(obj=irf_nim,  label="NIM shock"),
+  list(obj=irf_dep,  label="Deposit Growth shock"),
+  list(obj=irf_mem,  label="Membership shock"),
+  list(obj=irf_lts,  label="Loan-to-Share shock"),
+  list(obj=irf_nw,   label="Net Worth shock")
+)
+
+# For each shock, extract dq_rate response
+dq_resp_list <- lapply(irf_list_all, function(x) {
+  if (is.null(x$obj) || is.null(x$obj$irf[["dq_rate"]])) return(NULL)
+  vals <- x$obj$irf[["dq_rate"]]
+  lo   <- x$obj$Lower[["dq_rate"]]
+  up   <- x$obj$Upper[["dq_rate"]]
+  n    <- if (is.matrix(vals)) nrow(vals) else length(vals)
+  data.table(
+    horizon  = seq(0L, n-1L),
+    irf      = if (is.matrix(vals)) as.numeric(vals[,1]) else as.numeric(vals),
+    lower    = if (!is.null(lo) && is.matrix(lo)) as.numeric(lo[,1]) else NA_real_,
+    upper    = if (!is.null(up) && is.matrix(up)) as.numeric(up[,1]) else NA_real_,
+    impulse  = x$label
+  )
+})
+dq_resp_dt <- rbindlist(Filter(Negate(is.null), dq_resp_list))
+
+if (nrow(dq_resp_dt) > 0) {
+  has_ci_grid <- dq_resp_dt[, any(!is.na(lower) & !is.na(upper))]
+  p_grid <- ggplot(dq_resp_dt, aes(x=horizon)) +
+    { if (has_ci_grid)
+        geom_ribbon(aes(ymin=lower, ymax=upper), fill="#d73027", alpha=0.12)
+      else list() } +
+    geom_line(aes(y=irf), color="#d73027", linewidth=0.8) +
+    geom_hline(yintercept=0, linetype="dashed", color="#888", linewidth=0.35) +
+    facet_wrap(~impulse, scales="free_y", ncol=4) +
+    scale_x_continuous(breaks=seq(0, IRF_HORIZON, 4),
+                       labels=function(x) paste0("Q", x)) +
+    labs(
+      title    = "IRF Summary — Delinquency Rate Response to Each Structural Shock",
+      subtitle = paste("Which shock matters most for credit quality?",
+                       "| Cholesky-identified | 90% bootstrap CI"),
+      caption  = paste("VARX(p=2) | Full sample 2005Q1-2025Q4",
+                       "| Red shading = 90% CI band"),
+      x="Quarters after shock", y="Response of Delinquency Rate"
+    ) +
+    theme_minimal(base_size=10) +
+    theme(
+      plot.title       = element_text(face="bold", size=11),
+      strip.text       = element_text(face="bold", size=8.5),
+      panel.grid.minor = element_blank()
+    )
+  ggsave("Figures/04_irf_dq_summary_grid.png", p_grid,
+         width=16, height=8, dpi=150, bg="white")
+  msg("  Combined IRF grid \u2192 Figures/04_irf_dq_summary_grid.png")
+}
 
 # ── 7.4 FEVD (Forecast Error Variance Decomposition) ─────────────────────────
 fevd_obj  <- fevd(varx_chol, n.ahead=IRF_HORIZON)
