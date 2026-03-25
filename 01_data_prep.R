@@ -222,6 +222,77 @@ if (all(c("yldavgloans","costfds") %in% names(cr))) {
   msg("  ✓ nim_spread (yldavgloans - costfds)")
 }
 
+# ── pll_rate = pll / avg_loans ────────────────────────────────────────────────
+# Provision for Loan Loss rate — primary forward-looking credit quality measure.
+# Unlike dq_rate (backward: loans already delinquent) or chg_tot_lns_ratio
+# (realised losses), pll_rate captures management's EXPECTATION of future losses.
+#
+# Transmission logic:
+#   Rising oil → energy-sector stress → management raises provisions proactively
+#   Falling oil (bust) → regional unemployment → PLL spikes in oil-state CUs
+#   Post-2015: pll_rate should diverge from dq_rate because provisions are
+#   forward-looking and respond faster to macro signals
+#
+# Construction: pll / ((lns_tot_t + lns_tot_{t-1}) / 2)
+#   Denominator = average loans (current + prior quarter) to smooth balance
+#   sheet seasonality and avoid timing distortions from large loan originations
+#
+# Variables:
+#   pll      = provision for loan losses ($000s)    [call report field]
+#   lns_tot  = total loans outstanding ($000s)      [call report field]
+#   lns_tot_n = total number of loans               [call report field — count]
+#
+# pll_rate is expressed as % of average loans (annualised × 4 is optional)
+# We keep it quarterly (not annualised) to match other ratio variables
+
+if ("pll" %in% names(cr) && "lns_tot" %in% names(cr)) {
+
+  # Average loans denominator: mean of current and prior quarter within CU
+  cr[, lns_avg := (lns_tot + shift(lns_tot, 1L)) / 2, by = join_number]
+
+  cr[, pll_rate := fifelse(
+    !is.na(pll) & !is.na(lns_avg) &
+    is.finite(lns_avg) & lns_avg > 0,
+    pll / lns_avg * 100,   # expressed as % of average loans
+    NA_real_)]
+
+  # Bound: negative PLL (recoveries > provisions) is valid but extreme negatives
+  # are data errors; cap at [-2%, +5%] which covers all realistic scenarios
+  cr[!is.na(pll_rate),
+     pll_rate := pmin(pmax(pll_rate, -2), 5)]
+
+  # Winsorise within those bounds at 1/99 to remove outlier CU-quarters
+  cr[!is.na(pll_rate), pll_rate := winsor(pll_rate)]
+
+  msg("  \u2713 pll_rate = pll / avg_lns_tot (%% of avg loans, bounded [-2,5], winsorised)")
+  msg("  pll_rate obs: %s non-NA | mean=%.4f%% | p99=%.4f%%",
+      format(sum(!is.na(cr$pll_rate)), big.mark=","),
+      mean(cr$pll_rate, na.rm=TRUE),
+      quantile(cr$pll_rate, 0.99, na.rm=TRUE))
+
+  # Drop intermediate average — keep lns_tot and lns_tot_n as raw columns
+  cr[, lns_avg := NULL]
+
+} else {
+  missing_pll <- setdiff(c("pll","lns_tot"), names(cr))
+  msg("  SKIP pll_rate — missing columns: %s", paste(missing_pll, collapse=", "))
+}
+
+# ── pll_per_loan = pll / lns_tot_n (provision per loan — size-neutral) ────────
+# Complements pll_rate (volume-weighted) with a count-weighted version.
+# Useful for comparing small CUs (fewer but larger loans) vs large CUs.
+if ("pll" %in% names(cr) && "lns_tot_n" %in% names(cr)) {
+  cr[, pll_per_loan := fifelse(
+    !is.na(pll) & !is.na(lns_tot_n) &
+    is.finite(lns_tot_n) & lns_tot_n > 0,
+    pll / lns_tot_n,   # $ provision per loan outstanding
+    NA_real_)]
+  cr[!is.na(pll_per_loan), pll_per_loan := winsor(pll_per_loan)]
+  msg("  \u2713 pll_per_loan = pll / lns_tot_n ($ per loan, winsorised)")
+} else {
+  msg("  SKIP pll_per_loan — pll or lns_tot_n not found")
+}
+
 saveRDS(cr, "Data/call_clean.rds")
 msg("  Saved: Data/call_clean.rds")
 
@@ -708,8 +779,9 @@ check_vars <- c(
   "join_number","year","quarter",
   # CU outcomes — direct ratios
   "netintmrg","networth","pcanetworth","costfds","roa",
-  # Credit quality
+  # Credit quality — realised + forward-looking
   "dq_rate","chg_tot_lns_ratio",
+  "pll","pll_rate","pll_per_loan",
   # Deposit & membership channel
   "insured_tot","dep_shrcert","acct_018","members",
   "insured_share_growth","cert_share","loan_to_share",
@@ -747,6 +819,8 @@ cat("    member_growth_yoy     YoY %% change in total membership\n")
 cat("    cert_share            Certificate share of total deposits (0-1)\n")
 cat("    loan_to_share         Loan-to-share ratio (bounded 0-2)\n")
 cat("    nim_spread            yldavgloans - costfds\n")
+cat("    pll_rate              pll / avg_lns_tot (%% of avg loans, bounded, winsorised)\n")
+cat("    pll_per_loan          pll / lns_tot_n ($$ provision per loan count)\n")
 cat("\n  Direct effect captured via:\n")
 cat("    oil_x_brent         oil_exposure_cont × macro_base_yoy_oil\n")
 cat("    oil_x_brent_bin     oil_exposure_bin  × macro_base_yoy_oil\n")
