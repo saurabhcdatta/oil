@@ -1217,6 +1217,23 @@ if (!exists("macro_severe") || !is.data.table(macro_severe)) {
   }
 }
 
+# ── CRITICAL: ensure cal_date exists on both macro objects ────────────────────
+# macro_base / macro_severe may arrive from 01_data_prep.R in the same session
+# without cal_date (it is only added inside the load blocks above when the
+# object didn't already exist). Always recompute if missing.
+for (.nm in c("macro_base","macro_severe")) {
+  .obj <- tryCatch(get(.nm), error=function(e) NULL)
+  if (!is.null(.obj) && is.data.table(.obj) &&
+      !"cal_date" %in% names(.obj)) {
+    .obj[, cal_date := as.Date(paste(year,
+                                      Q_MONTH[as.character(quarter)],
+                                      "01", sep="-"))]
+    assign(.nm, .obj)
+    msg("  Added cal_date to %s", .nm)
+  }
+}
+rm(.nm, .obj)
+
 if (!is.null(macro_severe) && !is.null(macro_base) &&
     nrow(macro_severe) > 0 && nrow(macro_base) > 0) {
 
