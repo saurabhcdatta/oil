@@ -54,6 +54,7 @@ suppressPackageStartupMessages({
   library(plm)           # pdim(), pdata.frame()
   library(sandwich)      # vcovHC for robust SE
   library(lmtest)        # coeftest
+  library(zoo)           # na.approx for pcanetworth interpolation
   library(ggplot2)
   library(patchwork)
   library(scales)
@@ -292,8 +293,24 @@ for (v in Y_VARS)
 hdr("SECTION 3: Stage 1 — Aggregate VARX")
 
 # ── 3.1 Build matrices ───────────────────────────────────────────────────────
-# Drop rows with any NA in endogenous block
-agg_clean <- agg[complete.cases(agg[, ..Y_VARS])]
+# Drop rows with any NA in the CORE endogenous block
+# pcanetworth has 51 NAs (sparse in recent quarters) — exclude it from the
+# complete-cases filter so it doesn't collapse the aggregate series to ~30 rows.
+# It will still be in Y_mat as a column; rows where it is NA get interpolated
+# by the complete.cases filter below which uses only the non-sparse vars.
+CORE_Y_VARS <- intersect(
+  c("dq_rate","pll_rate","netintmrg","insured_share_growth",
+    "member_growth_yoy","costfds","loan_to_share"),
+  names(agg))   # pcanetworth excluded from completeness filter
+
+agg_clean <- agg[complete.cases(agg[, ..CORE_Y_VARS])]
+
+# Fill remaining pcanetworth NAs with linear interpolation if needed
+if ("pcanetworth" %in% names(agg_clean) && any(is.na(agg_clean$pcanetworth))) {
+  agg_clean[, pcanetworth := zoo::na.approx(pcanetworth, na.rm=FALSE)]
+  agg_clean[is.na(pcanetworth), pcanetworth := mean(pcanetworth, na.rm=TRUE)]
+  msg("pcanetworth NAs filled via linear interpolation")
+}
 
 Y_mat <- as.matrix(agg_clean[, ..Y_VARS])
 rownames(Y_mat) <- as.character(agg_clean$yyyyqq)
@@ -302,12 +319,27 @@ rownames(Y_mat) <- as.character(agg_clean$yyyyqq)
 exog_cols <- intersect(c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(agg_clean))
 X_mat <- as.matrix(agg_clean[, ..exog_cols])
 
-msg("Y matrix : %d × %d", nrow(Y_mat), ncol(Y_mat))
-msg("X matrix : %d × %d", nrow(X_mat), ncol(X_mat))
+msg("Y matrix : %d \u00d7 %d", nrow(Y_mat), ncol(Y_mat))
+msg("X matrix : %d \u00d7 %d", nrow(X_mat), ncol(X_mat))
 
 # ── 3.2 Lag order selection (verify / cross-check Script 03) ─────────────────
-varselect_full <- VARselect(Y_mat, lag.max=6, type="const",
-                             exogen=X_mat[-(1:6), ])  # trim for lag alignment
+# CRITICAL: VARselect requires nrow(Y) == nrow(exogen).
+# When lag.max = L, VARselect internally uses rows (L+1):T of Y and exogen.
+# We must NOT pre-trim X_mat here — pass the full X_mat and let VARselect
+# handle alignment internally. Pre-trimming caused "Different row size" error.
+LAG_MAX_SELECT <- 6L
+
+varselect_full <- tryCatch(
+  VARselect(Y_mat, lag.max=LAG_MAX_SELECT, type="const", exogen=X_mat),
+  error=function(e) {
+    msg("VARselect with exogen failed: %s", e$message)
+    msg("Retrying VARselect without exogen (IC only — exog handled in VAR())")
+    tryCatch(
+      VARselect(Y_mat, lag.max=LAG_MAX_SELECT, type="const"),
+      error=function(e2) { msg("VARselect failed entirely: %s", e2$message); NULL }
+    )
+  }
+)
 
 ic_table <- rbind(
   AIC = varselect_full$criteria["AIC(n)", ],
@@ -334,7 +366,7 @@ varx_full <- VAR(
   y      = Y_mat,
   p      = P_LAG,
   type   = "const",
-  exogen = X_mat[-(1:P_LAG), ]   # align rows after lag trimming
+  exogen = X_mat   # vars::VAR handles lag alignment internally — do NOT pre-trim
 )
 
 msg("VARX estimated: %d equations, %d obs, p=%d", length(Y_VARS),
@@ -495,7 +527,7 @@ for (tier in sort(unique(panel$asset_tier))) {
 
   tier_models[[as.character(tier)]] <- tryCatch(
     VAR(Y_t, p=P_LAG, type="const",
-        exogen=X_t[-(1:P_LAG), , drop=FALSE]),
+        exogen=X_t),   # vars::VAR handles lag alignment internally
     error=function(e) {
       warning(paste("VAR failed for tier", tier, ":", e$message)); NULL
     })
@@ -537,7 +569,7 @@ estimate_subsample <- function(data_full, macro_data, label, yyyyqq_filter) {
 
   m <- tryCatch(
     VAR(Y_s, p=P_LAG, type="const",
-        exogen=X_s[-(1:P_LAG), ]),
+        exogen=X_s),   # vars::VAR handles lag alignment internally
     error=function(e) { warning(paste(label, "failed:", e$message)); NULL }
   )
 
@@ -614,7 +646,7 @@ chol_idx   <- chol_idx[!is.na(chol_idx)]
 Y_chol     <- Y_mat[, chol_idx]
 
 varx_chol <- VAR(Y_chol, p=P_LAG, type="const",
-                  exogen=X_mat[-(1:P_LAG), , drop=FALSE])
+                  exogen=X_mat)   # vars::VAR handles lag alignment internally
 
 # ── 7.2 Compute IRFs ─────────────────────────────────────────────────────────
 # Shock 1: pll_rate — the forward-looking credit quality shock
