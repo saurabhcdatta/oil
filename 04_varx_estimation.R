@@ -293,70 +293,109 @@ for (v in Y_VARS)
 hdr("SECTION 3: Stage 1 — Aggregate VARX")
 
 # ── 3.1 Build matrices ───────────────────────────────────────────────────────
-# Drop rows with any NA in the CORE endogenous block
-# pcanetworth has 51 NAs (sparse in recent quarters) — exclude it from the
-# complete-cases filter so it doesn't collapse the aggregate series to ~30 rows.
-# It will still be in Y_mat as a column; rows where it is NA get interpolated
-# by the complete.cases filter below which uses only the non-sparse vars.
+# vars::VAR and VARselect require ZERO NAs in Y.
+# Strategy:
+#   Step 1 — Start with rows where CORE non-sparse vars are all present
+#            (excludes pcanetworth which has 51 NAs in recent quarters)
+#   Step 2 — Fill remaining NAs in every Y variable via linear interpolation
+#            (handles pll_rate 1 NA, insured_share_growth 4, member_growth_yoy 4)
+#   Step 3 — Drop any row still NA after interpolation (tail end effect)
+#   Step 4 — Verify zero NAs before passing to vars functions
+
 CORE_Y_VARS <- intersect(
-  c("dq_rate","pll_rate","netintmrg","insured_share_growth",
-    "member_growth_yoy","costfds","loan_to_share"),
-  names(agg))   # pcanetworth excluded from completeness filter
+  c("dq_rate","netintmrg","costfds","loan_to_share"),  # densest cols only
+  names(agg))
 
 agg_clean <- agg[complete.cases(agg[, ..CORE_Y_VARS])]
+setorder(agg_clean, yyyyqq)
 
-# Fill remaining pcanetworth NAs with linear interpolation if needed
-if ("pcanetworth" %in% names(agg_clean) && any(is.na(agg_clean$pcanetworth))) {
-  agg_clean[, pcanetworth := zoo::na.approx(pcanetworth, na.rm=FALSE)]
-  agg_clean[is.na(pcanetworth), pcanetworth := mean(pcanetworth, na.rm=TRUE)]
-  msg("pcanetworth NAs filled via linear interpolation")
+# Interpolate ALL Y variables — handles any remaining NAs
+for (v in intersect(Y_VARS, names(agg_clean))) {
+  n_na <- sum(is.na(agg_clean[[v]]))
+  if (n_na > 0) {
+    agg_clean[, (v) := zoo::na.approx(get(v), na.rm=FALSE)]
+    # If interpolation leaves leading/trailing NAs, fill with column mean
+    still_na <- sum(is.na(agg_clean[[v]]))
+    if (still_na > 0)
+      agg_clean[is.na(get(v)), (v) := mean(agg_clean[[v]], na.rm=TRUE)]
+    msg("  Interpolated %d NAs in %s (%d still NA after → filled with mean)",
+        n_na, v, still_na)
+  }
 }
 
+# Also fill any NAs in X (exog) columns
+exog_cols_raw <- intersect(c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(agg_clean))
+for (v in exog_cols_raw) {
+  n_na <- sum(is.na(agg_clean[[v]]))
+  if (n_na > 0) {
+    agg_clean[, (v) := zoo::na.approx(get(v), na.rm=FALSE)]
+    agg_clean[is.na(get(v)), (v) := 0]  # dummies default to 0
+    msg("  Interpolated %d NAs in exog: %s", n_na, v)
+  }
+}
+
+# Final complete-case drop (should remove nothing if interpolation worked)
+y_na_check  <- !complete.cases(agg_clean[, ..Y_VARS])
+agg_clean   <- agg_clean[!y_na_check]
+msg("  Rows dropped after final NA check: %d", sum(y_na_check))
+
+# Build Y and X matrices — guaranteed zero NA
 Y_mat <- as.matrix(agg_clean[, ..Y_VARS])
 rownames(Y_mat) <- as.character(agg_clean$yyyyqq)
 
-# Exogenous: Z + interactions + dummies
 exog_cols <- intersect(c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(agg_clean))
 X_mat <- as.matrix(agg_clean[, ..exog_cols])
 
-msg("Y matrix : %d \u00d7 %d", nrow(Y_mat), ncol(Y_mat))
-msg("X matrix : %d \u00d7 %d", nrow(X_mat), ncol(X_mat))
+msg("Y matrix : %d \u00d7 %d | NAs: %d", nrow(Y_mat), ncol(Y_mat), sum(is.na(Y_mat)))
+msg("X matrix : %d \u00d7 %d | NAs: %d", nrow(X_mat), ncol(X_mat), sum(is.na(X_mat)))
 
-# ── 3.2 Lag order selection (verify / cross-check Script 03) ─────────────────
-# CRITICAL: VARselect requires nrow(Y) == nrow(exogen).
-# When lag.max = L, VARselect internally uses rows (L+1):T of Y and exogen.
-# We must NOT pre-trim X_mat here — pass the full X_mat and let VARselect
-# handle alignment internally. Pre-trimming caused "Different row size" error.
-LAG_MAX_SELECT <- 6L
+if (sum(is.na(Y_mat)) > 0)
+  stop("Y_mat still contains NAs after interpolation — check agg construction")
+
+# ── 3.2 Lag order selection ───────────────────────────────────────────────────
+# VARselect requires nrow(Y) == nrow(exogen) — pass full matrices, no pre-trim.
+# vars handles alignment internally for each candidate lag order.
+LAG_MAX_SELECT <- min(6L, floor(nrow(Y_mat) / (ncol(Y_mat) + ncol(X_mat) + 1L)))
+LAG_MAX_SELECT <- max(LAG_MAX_SELECT, 2L)   # always test at least p=1,2
+msg("VARselect lag.max = %d (capped by obs/params ratio)", LAG_MAX_SELECT)
 
 varselect_full <- tryCatch(
   VARselect(Y_mat, lag.max=LAG_MAX_SELECT, type="const", exogen=X_mat),
   error=function(e) {
     msg("VARselect with exogen failed: %s", e$message)
-    msg("Retrying VARselect without exogen (IC only — exog handled in VAR())")
+    msg("Retrying without exogen (IC only — exog still used in VAR())")
     tryCatch(
       VARselect(Y_mat, lag.max=LAG_MAX_SELECT, type="const"),
-      error=function(e2) { msg("VARselect failed entirely: %s", e2$message); NULL }
+      error=function(e2) {
+        msg("VARselect failed entirely: %s — using default P_LAG=%d", e2$message, P_LAG)
+        NULL
+      }
     )
   }
 )
 
-ic_table <- rbind(
-  AIC = varselect_full$criteria["AIC(n)", ],
-  BIC = varselect_full$criteria["SC(n)", ],
-  HQ  = varselect_full$criteria["HQ(n)", ]
-)
-cat("\n  Information Criteria by Lag Order:\n")
-print(round(ic_table, 4))
-
-p_aic <- varselect_full$selection["AIC(n)"]
-p_bic <- varselect_full$selection["SC(n)"]
-msg("AIC selects p=%d | BIC selects p=%d | Using configured p=%d",
-    p_aic, p_bic, P_LAG)
-
-if (P_LAG != p_aic)
-  warning(sprintf("Configured P_LAG=%d differs from AIC selection=%d. Review.",
-                  P_LAG, p_aic))
+# Guard against NULL varselect (both attempts failed) — use configured P_LAG
+if (!is.null(varselect_full) && !is.null(varselect_full$criteria)) {
+  ic_table <- tryCatch(
+    rbind(
+      AIC = varselect_full$criteria["AIC(n)", ],
+      BIC = varselect_full$criteria["SC(n)",  ],
+      HQ  = varselect_full$criteria["HQ(n)",  ]
+    ),
+    error=function(e) NULL
+  )
+  if (!is.null(ic_table) && is.numeric(ic_table)) {
+    cat("\n  Information Criteria by Lag Order:\n")
+    print(round(ic_table, 4))
+  }
+  p_aic <- tryCatch(as.integer(varselect_full$selection["AIC(n)"]), error=function(e) P_LAG)
+  p_bic <- tryCatch(as.integer(varselect_full$selection["SC(n)"]),  error=function(e) P_LAG)
+  msg("AIC selects p=%d | BIC selects p=%d | Using configured p=%d", p_aic, p_bic, P_LAG)
+  if (P_LAG != p_aic)
+    warning(sprintf("Configured P_LAG=%d differs from AIC p=%d. Review.", P_LAG, p_aic))
+} else {
+  msg("VARselect unavailable — proceeding with configured P_LAG=%d", P_LAG)
+}
 
 # ── 3.3 Estimate VARX ────────────────────────────────────────────────────────
 # vars::VAR with exogen argument implements VARX directly
