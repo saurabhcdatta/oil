@@ -1048,14 +1048,16 @@ msg("Fan charts → Figures/04_fan_charts_all.png")
 # =============================================================================
 hdr("SECTION 9: Headline Finding — Triple Interaction Extract")
 
-# Pull post_shale × yoy_oil × direct_exposure from panel FE models
-# This is the paper's headline — only meaningful in post-shale + hiking regime
+if (!exists("coef_table") || nrow(coef_table) == 0) {
+  msg("  coef_table empty — Section 9 skipped (panel FE section must run first)")
+} else {
 
+# Pull post_shale × yoy_oil × direct_exposure from panel FE models
 triple_coefs <- coef_table[term %like% "post_x_oil_x_direct",
                              .(dep_var, term, estimate, se, p)]
 setorder(triple_coefs, dep_var)
 
-cat("\n  Triple Interaction: post_shale × yoy_oil × direct_exposure\n")
+cat("\n  Triple Interaction: post_shale \u00d7 yoy_oil \u00d7 direct_exposure\n")
 cat("  (Interpretation: oil price rise impact on CUs with direct energy exposure\n")
 cat("   in post-shale era vs. pre-shale era)\n\n")
 
@@ -1063,25 +1065,38 @@ triple_coefs[, sig := fcase(
   p < 0.01, "***",
   p < 0.05, "**",
   p < 0.10, "*",
-  default  , ""
+  default  = ""
 )]
 
-print(triple_coefs[, .(dep_var, estimate=round(estimate,5),
-                         se=round(se,5), p=round(p,4), sig)])
+if (nrow(triple_coefs) > 0)
+  print(triple_coefs[, .(dep_var, estimate=round(estimate,5),
+                           se=round(se,5), p=round(p,4), sig)])
+else
+  msg("  No post_x_oil_x_direct terms found in coef_table")
 
 # Also extract fomc × oil (two-way — rate channel activation)
 fomc_oil_coefs <- coef_table[term %like% "fomc_x_brent",
                                .(dep_var, term, estimate, se, p)]
-fomc_oil_coefs[, sig := fcase(p<0.01,"***", p<0.05,"**", p<0.10,"*", default,"")]
+fomc_oil_coefs[, sig := fcase(p<0.01,"***", p<0.05,"**", p<0.10,"*", default="")]
 
-cat("\n  Two-Way Interaction: fomc_regime × yoy_oil (rate channel)\n\n")
-print(fomc_oil_coefs[, .(dep_var, estimate=round(estimate,5),
-                           se=round(se,5), p=round(p,4), sig)])
+cat("\n  Two-Way Interaction: fomc_regime \u00d7 yoy_oil (rate channel)\n\n")
+if (nrow(fomc_oil_coefs) > 0)
+  print(fomc_oil_coefs[, .(dep_var, estimate=round(estimate,5),
+                             se=round(se,5), p=round(p,4), sig)])
+else
+  msg("  No fomc_x_brent terms found in coef_table")
 
-fwrite(rbindlist(list(triple_coefs[, type:="triple"],
-                      fomc_oil_coefs[, type:="fomc_oil"]), fill=TRUE),
-       "Results/04_headline_coefs.csv")
-msg("\nHeadline coefficients → Results/04_headline_coefs.csv")
+out_coefs <- rbindlist(list(
+  if (nrow(triple_coefs)   > 0) triple_coefs[,   type := "triple"]   else NULL,
+  if (nrow(fomc_oil_coefs) > 0) fomc_oil_coefs[, type := "fomc_oil"] else NULL
+), fill=TRUE)
+
+if (nrow(out_coefs) > 0) {
+  fwrite(out_coefs, "Results/04_headline_coefs.csv")
+  msg("\nHeadline coefficients \u2192 Results/04_headline_coefs.csv")
+}
+
+}  # end coef_table guard
 
 # =============================================================================
 # 10. SESSION & OUTPUT MANIFEST
