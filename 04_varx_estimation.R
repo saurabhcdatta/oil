@@ -745,47 +745,75 @@ msg("IRFs saved \u2192 Results/04_varx_irf.rds")
 # ── 7.3 Plot IRFs ─────────────────────────────────────────────────────────────
 plot_irf <- function(irf_obj, impulse_label, outfile) {
 
-  # Extract IRF data into tidy data.table
-  extract_one <- function(series_nm) {
-    irf_dt <- data.table(
-      horizon = 0:IRF_HORIZON,
-      irf     = irf_obj$irf[[series_nm]],
-      lower   = irf_obj$Lower[[series_nm]],
-      upper   = irf_obj$Upper[[series_nm]],
-      response = series_nm
-    )
-    irf_dt
+  # vars::irf() stores $irf, $Lower, $Upper as named lists.
+  # Each element is a MATRIX of shape (n.ahead+1) × k (k = impulse vars).
+  # When a single impulse is specified, k=1, so we extract column 1.
+  # as.numeric() ensures it is a plain vector, not a matrix-column.
+  safe_vec <- function(x) {
+    if (is.matrix(x)) as.numeric(x[, 1L]) else as.numeric(x)
   }
 
-  all_irf <- rbindlist(lapply(names(irf_obj$irf), extract_one))
+  extract_one <- function(series_nm) {
+    irf_vals <- irf_obj$irf[[series_nm]]
+    lo_vals  <- irf_obj$Lower[[series_nm]]
+    up_vals  <- irf_obj$Upper[[series_nm]]
+
+    if (is.null(irf_vals)) return(NULL)
+
+    n_rows <- if (is.matrix(irf_vals)) nrow(irf_vals) else length(irf_vals)
+
+    data.table(
+      horizon  = seq(0L, n_rows - 1L),
+      irf      = safe_vec(irf_vals),
+      lower    = if (!is.null(lo_vals)) safe_vec(lo_vals) else NA_real_,
+      upper    = if (!is.null(up_vals)) safe_vec(up_vals) else NA_real_,
+      response = series_nm
+    )
+  }
+
+  all_irf <- rbindlist(
+    Filter(Negate(is.null), lapply(names(irf_obj$irf), extract_one))
+  )
+
+  if (nrow(all_irf) == 0) {
+    msg("  plot_irf: no data extracted for %s — skipping", impulse_label)
+    return(invisible(NULL))
+  }
 
   # Clean labels
   all_irf[, response_lbl := str_replace_all(response, "_", " ") |>
                               str_to_title()]
 
+  # Only draw ribbon where CI bands are available
+  has_ci <- all_irf[, any(!is.na(lower) & !is.na(upper))]
+
   p <- ggplot(all_irf, aes(x=horizon)) +
-    geom_ribbon(aes(ymin=lower, ymax=upper), fill="#2196F3", alpha=0.15) +
+    { if (has_ci)
+        geom_ribbon(aes(ymin=lower, ymax=upper), fill="#2196F3", alpha=0.15)
+      else
+        list()   # empty layer — avoids error when CI absent
+    } +
     geom_line(aes(y=irf), color="#1565C0", linewidth=0.8) +
     geom_hline(yintercept=0, linetype="dashed", color="#666", linewidth=0.4) +
     facet_wrap(~response_lbl, scales="free_y", ncol=3) +
-    scale_x_continuous(breaks=seq(0, IRF_HORIZON, 4),
+    scale_x_continuous(breaks=seq(0, max(all_irf$horizon), 4),
                        labels=function(x) paste0("Q", x)) +
     labs(
-      title    = sprintf("Impulse Response: %s shock → CU system", impulse_label),
-      subtitle = sprintf("Cholesky-identified; 90%% bootstrap CI (%d runs); p=%d",
+      title    = sprintf("Impulse Response: %s shock \u2192 CU system", impulse_label),
+      subtitle = sprintf("Cholesky-identified; 90%%%% bootstrap CI (%d runs); p=%d",
                          N_BOOT, P_LAG),
       x        = "Quarters after shock",
       y        = "Response (level units of dependent var)"
     ) +
     theme_minimal(base_size=10) +
     theme(
-      plot.title    = element_text(face="bold", size=11),
-      strip.text    = element_text(face="bold", size=9),
+      plot.title       = element_text(face="bold", size=11),
+      strip.text       = element_text(face="bold", size=9),
       panel.grid.minor = element_blank()
     )
 
-  ggsave(outfile, p, width=12, height=7, dpi=150)
-  msg("  IRF chart → %s", outfile)
+  ggsave(outfile, p, width=12, height=7, dpi=150, bg="white")
+  msg("  IRF chart \u2192 %s", outfile)
   invisible(p)
 }
 
