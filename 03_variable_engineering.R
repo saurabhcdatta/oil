@@ -307,7 +307,9 @@ if (all(c("pll_rate","dq_rate") %in% names(panel))) {
     pll_rate - dq_rate,
     NA_real_)]
   msg("  \u2713 pll_dq_gap = pll_rate - dq_rate (provisioning lead/lag indicator)")
-} (for stationarity) ─────────────────────────────────
+}
+
+# ── 3.3 First differences (for stationarity) ─────────────────────────────────
 diff_vars <- intersect(c("netintmrg","costfds","roa","cert_share",
                           "loan_to_share"), names(panel))
 for (v in diff_vars) {
