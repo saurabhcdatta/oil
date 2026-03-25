@@ -50,11 +50,8 @@
 suppressPackageStartupMessages({
   library(data.table)
   library(vars)          # VAR(), irf(), fevd()
-  library(lfe)           # felm() — panel FE with clustering
-  library(plm)           # pdim(), pdata.frame()
-  library(sandwich)      # vcovHC for robust SE
-  library(lmtest)        # coeftest
-  library(zoo)           # na.approx for pcanetworth interpolation
+  library(fixest)        # feols() — panel FE with clustering
+  library(zoo)           # na.approx for NA interpolation
   library(ggplot2)
   library(patchwork)
   library(scales)
@@ -66,6 +63,7 @@ hdr <- function(x) cat("\n", strrep("=", 70), "\n##", x, "\n",
                         strrep("=", 70), "\n")
 msg <- function(fmt, ...) cat(sprintf(paste0("  ", fmt, "\n"), ...))
 ts  <- function() format(Sys.time(), "%H:%M:%S")
+`%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !is.na(a[1])) a else b
 
 # ── fill_nas: interpolate NAs in all specified columns of a data.table ────────
 # Used wherever a matrix must be NA-free before passing to vars::VAR/VARselect.
@@ -527,17 +525,24 @@ for (dep in Y_VARS) {
       fe_coefs[[dep]] <- cf
       r2v <- tryCatch(as.numeric(fixest::r2(fe_models[[dep]], "wr2"))[[1L]],
                       error=function(e) NA_real_)
-      msg("  %-30s : within-R²=%.4f | N=%s",
+      msg("  %-30s : within-R\u00b2=%.4f | N=%s",
           dep, r2v %||% NA_real_,
-          format(fixest::nobs(fe_models[[dep]]), big.mark=","))
+          format(nobs(fe_models[[dep]]), big.mark=","))
     }
   }
 }
 
-# Combine coefficient table
-coef_table <- rbindlist(fe_coefs)
+# Combine coefficient table — guard against empty list
+fe_coefs_valid <- Filter(function(x) !is.null(x) && nrow(x) > 0, fe_coefs)
+coef_table <- if (length(fe_coefs_valid) > 0)
+  rbindlist(fe_coefs_valid, fill=TRUE)
+else {
+  msg("  WARNING: no panel FE equations estimated — coef_table empty")
+  data.table(dep_var=character(), term=character(),
+             estimate=numeric(), se=numeric(), t=numeric(), p=numeric())
+}
 fwrite(coef_table, "Results/04_varx_coef_panel_fe.csv")
-msg("\n  Coefficient table → Results/04_varx_coef_panel_fe.csv")
+msg("\n  Coefficient table \u2192 Results/04_varx_coef_panel_fe.csv (%d rows)", nrow(coef_table))
 
 # =============================================================================
 # 5. STAGE 3 — ASSET-TIER STRATIFIED MODELS
@@ -1017,7 +1022,12 @@ for (scen in names(scenario_paths)) {
   }
 }
 
-all_forecasts <- rbindlist(forecast_results)
+all_forecasts <- if (length(forecast_results) > 0)
+  rbindlist(forecast_results, fill=TRUE)
+else {
+  msg("  WARNING: no scenario forecasts produced")
+  data.table()
+}
 
 # Attach historical actuals
 hist_long <- agg_clean[yyyyqq >= 200501L,
@@ -1085,16 +1095,19 @@ fan_plots <- Filter(Negate(is.null), list(
   plot_fan("pcanetworth",          "Net Worth Ratio (%)")
 ))
 
-p_fan_combined <- wrap_plots(fan_plots, ncol=2) +
-  plot_annotation(
-    title    = "CU System — CCAR 2026 Scenario Fan Charts",
-    subtitle = sprintf("VARX(p=%d) | Cholesky-identified | Full sample 2005Q1–2025Q4", P_LAG),
-    theme    = theme(plot.title=element_text(face="bold", size=13))
-  )
-
-ggsave("Figures/04_fan_charts_all.png", p_fan_combined,
-       width=14, height=10, dpi=150)
-msg("Fan charts → Figures/04_fan_charts_all.png")
+if (length(fan_plots) >= 2) {
+  p_fan_combined <- wrap_plots(fan_plots, ncol=2) +
+    plot_annotation(
+      title    = "CU System \u2014 CCAR 2026 Scenario Fan Charts",
+      subtitle = sprintf("VARX(p=%d) | Cholesky-identified | Full sample 2005Q1\u20132025Q4", P_LAG),
+      theme    = theme(plot.title=element_text(face="bold", size=13))
+    )
+  ggsave("Figures/04_fan_charts_all.png", p_fan_combined,
+         width=14, height=10, dpi=150, bg="white")
+  msg("Fan charts \u2192 Figures/04_fan_charts_all.png")
+} else {
+  msg("Fan charts skipped — fewer than 2 dep vars have projection data")
+}
 
 # =============================================================================
 # 9. HEADLINE COEFFICIENT EXTRACT — The Three-Way Interaction
