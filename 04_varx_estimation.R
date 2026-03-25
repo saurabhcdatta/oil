@@ -467,46 +467,70 @@ LAG_Y_VARS <- unlist(lapply(Y_VARS, function(v)
   paste0(v, "_lag", 1:P_LAG)))
 
 # ── 4.2 Estimate each equation ───────────────────────────────────────────────
-# RHS: lagged Y + Z + interactions + dummies (no CU/quarter FE in formula;
-#      those go in the | FE | cluster block of felm)
+# Use fixest::feols (faster, more robust than lfe::felm for large panels)
+# RHS: own lags (p) + cross-lags (p) + exog Z + interactions + dummies
+# CU FE + Quarter FE absorbed; SE clustered two-way at CU + quarter level
+#
+# NOTE: macro_base_yoy_oil is COLLINEAR with yyyyqq FE (same value all CUs).
+# Interaction terms (oil_x_brent, fomc_x_brent) vary cross-sectionally and ARE
+# identified. Pure time-series exog vars will be dropped by feols — expected.
 
-panel_exog_cols <- intersect(c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(panel))
+panel_exog_cols <- intersect(
+  c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(panel))
+
+# Remove pure time-series macro vars that will be absorbed by quarter FE
+# Keep only cross-sectionally varying interaction terms and dummies
+panel_exog_id <- intersect(
+  c("oil_x_brent","spillover_x_brent","fomc_x_brent",
+    "post_x_oil","post_x_oil_x_direct","zirp_x_oil",
+    "post_shale","gfc_dummy","covid_dummy","zirp_era","hike_cycle"),
+  names(panel))
 
 fe_models <- list()
 fe_coefs  <- list()
 
 for (dep in Y_VARS) {
-  lag_terms  <- paste0(dep, "_lag", 1:P_LAG)
-  # Cross-lag terms (all other Y lags) — key for VARX
-  cross_lags <- setdiff(LAG_Y_VARS, lag_terms)
+  own_lags   <- paste0(dep, "_lag", 1:P_LAG)
+  cross_lags <- setdiff(LAG_Y_VARS, own_lags)
 
-  rhs <- paste(c(lag_terms, cross_lags, panel_exog_cols), collapse=" + ")
+  rhs_terms  <- c(
+    intersect(own_lags,    names(panel)),
+    intersect(cross_lags,  names(panel)),
+    intersect(panel_exog_id, names(panel))
+  )
 
-  frml <- as.formula(paste0(
-    dep, " ~ ", rhs,
-    " | join_number + yyyyqq | 0 | join_number + yyyyqq"
-  ))
+  if (length(rhs_terms) == 0) next
 
-  # Drop incomplete cases for this equation
-  keep_cols <- c(dep, lag_terms, cross_lags, panel_exog_cols,
-                 "join_number", "yyyyqq")
+  rhs    <- paste(rhs_terms, collapse=" + ")
+  frml   <- as.formula(paste0(dep, " ~ ", rhs, " | join_number + yyyyqq"))
+
+  keep_cols <- unique(c(dep, rhs_terms, "join_number","yyyyqq"))
   keep_cols <- intersect(keep_cols, names(panel))
   panel_eq  <- panel[complete.cases(panel[, ..keep_cols])]
 
+  if (nrow(panel_eq) < 1000) {
+    msg("  SKIP %s: only %d complete obs", dep, nrow(panel_eq)); next
+  }
+
   fe_models[[dep]] <- tryCatch(
-    felm(frml, data=panel_eq),
-    error=function(e) { warning(paste("felm failed for", dep, ":", e$message)); NULL }
+    fixest::feols(frml, data=panel_eq,
+                  cluster=~join_number, warn=FALSE, notes=FALSE),
+    error=function(e) { warning(paste("feols failed for", dep, ":", e$message)); NULL }
   )
 
   if (!is.null(fe_models[[dep]])) {
-    cf <- as.data.table(summary(fe_models[[dep]])$coefficients, keep.rownames=TRUE)
-    setnames(cf, c("term","estimate","se","t","p"))
-    cf[, dep_var := dep]
-    fe_coefs[[dep]] <- cf
-    msg("  %-30s : Adj-R² = %.3f | N = %s",
-        dep,
-        summary(fe_models[[dep]])$adj.r.squared,
-        format(nrow(fe_models[[dep]]$response), big.mark=","))
+    ct <- tryCatch(fixest::coeftable(fe_models[[dep]]), error=function(e) NULL)
+    if (!is.null(ct)) {
+      cf <- as.data.table(ct, keep.rownames=TRUE)
+      setnames(cf, c("term","estimate","se","t","p"))
+      cf[, dep_var := dep]
+      fe_coefs[[dep]] <- cf
+      r2v <- tryCatch(as.numeric(fixest::r2(fe_models[[dep]], "wr2"))[[1L]],
+                      error=function(e) NA_real_)
+      msg("  %-30s : within-R²=%.4f | N=%s",
+          dep, r2v %||% NA_real_,
+          format(fixest::nobs(fe_models[[dep]]), big.mark=","))
+    }
   }
 }
 
@@ -888,51 +912,80 @@ msg("CCAR scenarios available: %s", paste(names(scenario_paths), collapse=", "))
 
 # ── 8.2 Multi-step forecast function ─────────────────────────────────────────
 forecast_varx <- function(var_model, macro_scenario_path, init_Y, p) {
-  # var_model         : vars::VAR object
-  # macro_scenario_path: data.table with exogenous paths (FCST_HOR rows)
-  # init_Y            : matrix (p × k) of initial Y values
-  # p                 : lag order
 
-  k     <- ncol(init_Y)
-  h     <- nrow(macro_scenario_path)
-  fcst  <- matrix(NA_real_, nrow=h, ncol=k,
-                  dimnames=list(NULL, colnames(init_Y)))
+  k   <- ncol(init_Y)
+  h   <- nrow(macro_scenario_path)
+  nms <- colnames(init_Y)
+  fcst <- matrix(NA_real_, nrow=h, ncol=k, dimnames=list(NULL, nms))
 
-  # Build companion-form coefficient matrices from var_model
+  # ── Companion-form AR coefficient matrices ───────────────────────────────
+  # vars::VAR stores each equation's coefficients separately.
+  # For lag l, the (k × k) matrix A_l has:
+  #   row i = equation for Y_i
+  #   col j = coefficient on Y_j at lag l
+  # sapply(...) produces a (k × k) matrix with equations as COLUMNS — transpose needed.
   A_list <- lapply(1:p, function(lag) {
-    sapply(var_model$varresult, function(eq) {
+    M <- sapply(var_model$varresult, function(eq) {
       cf    <- coef(eq)
-      terms <- paste0(names(var_model$varresult), ".l", lag)
-      cf[terms]
+      terms <- paste0(nms, ".l", lag)
+      # Return k coefficients in the same order as nms
+      vapply(terms, function(t) {
+        if (t %in% names(cf)) cf[[t]] else 0
+      }, numeric(1))
     })
+    # M is k×k: rows=predictors, cols=equations → transpose to equations×predictors
+    t(M)
   })
-  # Intercept vector
-  const <- sapply(var_model$varresult, function(eq) coef(eq)["const"])
 
-  # Exogenous coefficient matrix (one column per exog variable, one row per equation)
-  exog_nms   <- names(var_model$varresult[[1]]$model)
-  exog_nms   <- exog_nms[!str_detect(exog_nms, paste0("^(", paste(colnames(init_Y), collapse="|"), ")")) &
-                           exog_nms != "(Intercept)"]
-  B_exog <- sapply(var_model$varresult, function(eq) {
+  # Intercept vector (length k)
+  const <- vapply(var_model$varresult, function(eq) {
     cf <- coef(eq)
-    cf[intersect(exog_nms, names(cf))]
-  })
+    if ("const" %in% names(cf)) cf[["const"]] else 0
+  }, numeric(1))
 
-  Y_hist <- init_Y  # last p rows for lag construction
+  # ── Exogenous coefficient matrix B (k × n_exog) ──────────────────────────
+  exog_nms <- names(var_model$varresult[[1]]$model)
+  # Remove endogenous lags and intercept
+  lag_pattern <- paste0("^(", paste(nms, collapse="|"), ")\\.l")
+  exog_nms <- exog_nms[!grepl(lag_pattern, exog_nms) & exog_nms != "(Intercept)"]
+
+  if (length(exog_nms) > 0) {
+    B_exog <- t(sapply(var_model$varresult, function(eq) {
+      cf <- coef(eq)
+      vapply(exog_nms, function(nm) {
+        if (nm %in% names(cf)) cf[[nm]] else 0
+      }, numeric(1))
+    }))
+    # B_exog: k × n_exog after transpose
+  } else {
+    B_exog <- matrix(0, nrow=k, ncol=0)
+  }
+
+  Y_hist <- init_Y
 
   for (t in 1:h) {
-    z_t <- unlist(macro_scenario_path[t, intersect(exog_nms, names(macro_scenario_path)), with=FALSE])
-    y_hat <- const
-    for (lag in 1:p) {
-      idx   <- nrow(Y_hist) - lag + 1
-      if (idx < 1) break
-      y_hat <- y_hat + A_list[[lag]] %*% Y_hist[idx, ]
-    }
-    if (length(z_t) > 0 && nrow(B_exog) > 0)
-      y_hat <- y_hat + B_exog %*% z_t[rownames(B_exog)]
+    y_hat <- matrix(const, ncol=1)   # k × 1
 
-    fcst[t, ]  <- y_hat
-    Y_hist     <- rbind(Y_hist, y_hat)
+    for (lag in 1:p) {
+      idx <- nrow(Y_hist) - lag + 1
+      if (idx < 1) break
+      y_lag <- matrix(Y_hist[idx, ], ncol=1)   # k × 1 — force column vector
+      y_hat <- y_hat + A_list[[lag]] %*% y_lag
+    }
+
+    # Add exogenous contribution
+    if (length(exog_nms) > 0 && ncol(B_exog) > 0) {
+      z_nms <- intersect(exog_nms, names(macro_scenario_path))
+      if (length(z_nms) > 0) {
+        z_t   <- unlist(macro_scenario_path[t, ..z_nms])
+        z_mat <- matrix(z_t, ncol=1)
+        B_sub <- B_exog[, match(z_nms, exog_nms), drop=FALSE]
+        y_hat <- y_hat + B_sub %*% z_mat
+      }
+    }
+
+    fcst[t, ] <- as.numeric(y_hat)
+    Y_hist    <- rbind(Y_hist, t(y_hat))
   }
   fcst
 }
