@@ -151,17 +151,20 @@ agg_group <- function(dt, vars, group_col, by_vars = c("yyyyqq", group_col)) {
   ][order(yyyyqq)]
 }
 
-# Available outcome vars — includes member_growth_yoy from 01_data_prep.R
+# Available outcome vars — includes member_growth_yoy and pll_rate from 01_data_prep.R
 cu_outcomes <- intersect(c("dq_rate","chg_tot_lns_ratio","netintmrg",
                              "pcanetworth","networth","roa","costfds",
                              "insured_share_growth","cert_share",
                              "loan_to_share","nim_spread",
-                             "member_growth_yoy"),
+                             "member_growth_yoy",
+                             "pll_rate","pll_per_loan"),
                           names(panel))
 
 msg("  CU outcomes available: %s", paste(cu_outcomes, collapse=", "))
 if (!"member_growth_yoy" %in% cu_outcomes)
   msg("  NOTE: member_growth_yoy not found — Charts NEW-A/B/C/D will be skipped")
+if (!"pll_rate" %in% cu_outcomes)
+  msg("  NOTE: pll_rate not found — check pll and lns_tot are in call report")
 
 # Episode rectangles helper — returns flat list for ggplot layer addition
 ep_rects <- function(episodes = EPISODES) {
@@ -260,6 +263,7 @@ make_dual_axis <- function(outcome_var, outcome_label, y_fmt = waiver()) {
 
 panels_02 <- list(
   make_dual_axis("dq_rate",            "Delinquency Rate (%)",    percent_format(scale=1)),
+  make_dual_axis("pll_rate",           "PLL Rate (% of Avg Loans)", number_format(accuracy=0.01)),
   make_dual_axis("netintmrg",          "Net Interest Margin (%)", number_format(accuracy=0.1)),
   make_dual_axis("costfds",            "Cost of Funds (%)",       number_format(accuracy=0.01)),
   make_dual_axis("insured_share_growth","Insured Share Growth (YoY%)", number_format(accuracy=0.1)),
@@ -315,7 +319,9 @@ out_labels <- c(
   cert_share           = "Certificate Share",
   loan_to_share        = "Loan-to-Share Ratio",
   roa                  = "Return on Assets",
-  member_growth_yoy    = "Membership Growth (YoY%)"
+  member_growth_yoy    = "Membership Growth (YoY%)",
+  pll_rate             = "PLL Rate (% of Avg Loans)",
+  pll_per_loan         = "PLL per Loan ($)"
 )
 cc_results[, outcome_label := out_labels[outcome]]
 cc_results[is.na(outcome_label), outcome_label := outcome]
@@ -480,6 +486,7 @@ if (!is.null(panel04)) {
 
   p04_panels <- list(
     make_grp04("dq_rate",             "Delinquency Rate (%)"),
+    make_grp04("pll_rate",            "PLL Rate (% of Avg Loans)"),
     make_grp04("netintmrg",           "Net Interest Margin (%)"),
     make_grp04("insured_share_growth","Insured Share Growth (YoY%)"),
     make_grp04("member_growth_yoy",   "Membership Growth (YoY%)"),
@@ -604,7 +611,7 @@ if ("asset_tier" %in% names(panel)) {
   tier_agg <- agg_group(panel,
                          intersect(c("dq_rate","netintmrg","costfds",
                                      "cert_share","insured_share_growth",
-                                     "member_growth_yoy"),
+                                     "member_growth_yoy","pll_rate"),
                                    names(panel)),
                          "asset_tier")
   tier_agg <- merge(tier_agg,
@@ -627,6 +634,8 @@ if ("asset_tier" %in% names(panel)) {
 
   t_panels <- list(
     make_tier_plot("dq_rate",           "Delinquency Rate (%)"),
+    make_tier_plot("pll_rate",          "PLL Rate (% of Avg Loans)",
+                   number_format(accuracy=0.01)),
     make_tier_plot("netintmrg",         "Net Interest Margin (%)"),
     make_tier_plot("costfds",           "Cost of Funds (%)"),
     make_tier_plot("cert_share",        "Certificate Share",
@@ -666,7 +675,7 @@ sb_long[, outcome_label := out_labels[as.character(outcome)]]
 sb_long[is.na(outcome_label), outcome_label := as.character(outcome)]
 
 # Scatter: yoy_oil vs each outcome, coloured by era
-plot_sb_outcomes <- intersect(c("dq_rate","netintmrg","costfds",
+plot_sb_outcomes <- intersect(c("dq_rate","pll_rate","netintmrg","costfds",
                                  "insured_share_growth",
                                  "member_growth_yoy"), cu_outcomes)
 
@@ -730,7 +739,8 @@ if ("spillover_exposure" %in% names(panel)) {
     }
 
     spill_agg <- agg_group(non_oil,
-                            intersect(c("dq_rate","netintmrg","insured_share_growth",
+                            intersect(c("dq_rate","pll_rate","netintmrg",
+                                        "insured_share_growth",
                                         "costfds","member_growth_yoy"), names(non_oil)),
                             "spill_tercile")
     spill_agg <- merge(spill_agg,
@@ -742,7 +752,8 @@ if ("spillover_exposure" %in% names(panel)) {
     SPILL_COLS <- SPILL_COLS[!duplicated(names(SPILL_COLS))]
 
     sp_panels <- lapply(
-      intersect(c("dq_rate","netintmrg","member_growth_yoy"), names(spill_agg)),
+      intersect(c("dq_rate","pll_rate","netintmrg","member_growth_yoy"),
+                names(spill_agg)),
       function(v) {
         lab <- out_labels[v] %||% v
         ggplot(spill_agg[!is.na(get(v)) & !is.na(spill_tercile)],
@@ -845,6 +856,7 @@ check_miss <- c(
   "networth","costfds","roa","insured_tot","dep_shrcert","acct_018",
   "insured_share_growth","cert_share","loan_to_share","nim_spread",
   "members","member_growth_yoy",
+  "pll","lns_tot","lns_tot_n","pll_rate","pll_per_loan",
   "macro_base_pbrent","macro_base_lurc","macro_base_pcpi",
   "macro_base_rmtg","macro_base_phpi","macro_base_uypsav",
   "macro_base_yoy_oil","macro_base_yield_curve","macro_base_fomc_regime",
@@ -1159,6 +1171,105 @@ if ("member_growth_yoy" %in% names(panel)) {
   msg("  SKIP NEW-D: member_growth_yoy not in panel")
 }
 
+# =============================================================================
+# CHART NEW-E — PLL Rate: Provision for Loan Losses Dynamics
+# =============================================================================
+hdr("Chart NEW-E: PLL Rate analysis")
+
+if ("pll_rate" %in% names(panel)) {
+
+  pll_agg <- agg_quarter(panel, c("pll_rate","dq_rate","pll_per_loan"))
+  pll_agg <- merge(pll_agg,
+                   mac_spine[, .(yyyyqq, pbrent, yoy_oil, fomc_regime)],
+                   by="yyyyqq", all.x=TRUE)
+
+  # ── Panel 1: PLL rate vs dq_rate vs oil — the lead/lag story ─────────────
+  # PLL is forward-looking (management expectation); dq_rate is backward-looking
+  # (loans already delinquent). PLL should LEAD dq_rate.
+  pll_max <- max(abs(pll_agg$pll_rate), na.rm=TRUE)
+  dq_max  <- max(abs(pll_agg$dq_rate),  na.rm=TRUE)
+  pll_scale <- if (is.finite(dq_max) && pll_max > 0) dq_max / pll_max else 1
+
+  pE1 <- ggplot(pll_agg[!is.na(pll_rate) & !is.na(dq_rate)],
+                aes(x=cal_date)) +
+    ep_rects() +
+    geom_line(aes(y=dq_rate, colour="Delinquency Rate (actual)"),
+              linewidth=0.85) +
+    geom_line(aes(y=pll_rate * pll_scale,
+                  colour="PLL Rate (scaled, forward-looking)"),
+              linewidth=0.85, linetype="dashed") +
+    scale_colour_manual(
+      values=c("Delinquency Rate (actual)"              = "#c0392b",
+               "PLL Rate (scaled, forward-looking)"     = "#1a3a5c"),
+      name=NULL) +
+    scale_x_date(date_breaks="2 years", date_labels="%Y") +
+    scale_y_continuous(labels=number_format(accuracy=0.01)) +
+    labs(title    = "PLL Rate vs Delinquency Rate — Forward vs Backward Looking",
+         subtitle = "Dashed = PLL rate (management provision expectation) | Solid = actual delinquency rate",
+         x=NULL, y="Rate (%%)") +
+    theme_pub()
+
+  # ── Panel 2: PLL rate by direct vs indirect CU group ─────────────────────
+  if (!is.null(panel04) && "plot_group" %in% names(panel04)) {
+    pll_grp <- panel04[!is.na(pll_rate) & !is.na(plot_group),
+                        .(pll_rate = mean(pll_rate, na.rm=TRUE),
+                          cal_date = first(cal_date)),
+                        by=.(yyyyqq, plot_group)][order(yyyyqq)]
+
+    pE2 <- ggplot(pll_grp, aes(x=cal_date, y=pll_rate, colour=plot_group)) +
+      ep_rects() +
+      geom_line(linewidth=0.85) +
+      geom_hline(yintercept=0, linewidth=0.4, colour="#888") +
+      scale_colour_manual(values=GRP_COLS04, name=NULL) +
+      scale_x_date(date_breaks="2 years", date_labels="%Y") +
+      scale_y_continuous(labels=number_format(accuracy=0.01)) +
+      labs(title    = "PLL Rate: Oil-State vs Non-Oil CUs",
+           subtitle = "Direct channel: oil bust → energy-sector stress → higher provisions in oil-state CUs",
+           x=NULL, y="PLL Rate (%% of avg loans)") +
+      theme_pub() + theme(legend.position="bottom")
+  } else {
+    pE2 <- NULL
+  }
+
+  # ── Panel 3: PLL rate structural break — pre/post 2015 ───────────────────
+  pll_sb <- merge(
+    agg_quarter(panel, "pll_rate"),
+    mac_spine[, .(yyyyqq, yoy_oil)], by="yyyyqq", all.x=TRUE)
+  pll_sb[, era := fifelse(yyyyqq < 201501L,
+                           "Pre-Shale (2005\u20132014)",
+                           "Post-Shale (2015\u20132025)")]
+
+  pE3 <- ggplot(pll_sb[!is.na(pll_rate) & !is.na(yoy_oil)],
+                aes(x=yoy_oil, y=pll_rate, colour=era)) +
+    geom_point(alpha=0.5, size=1.5) +
+    geom_smooth(method="lm", se=TRUE, linewidth=1.0) +
+    geom_hline(yintercept=0, linewidth=0.4, colour="#888") +
+    geom_vline(xintercept=0, linewidth=0.4, colour="#888") +
+    scale_colour_manual(
+      values=c("Pre-Shale (2005\u20132014)"="#1a3a5c",
+               "Post-Shale (2015\u20132025)"="#b5470a"),
+      name="Era") +
+    labs(title    = "PLL Rate vs Oil Price: Structural Break at 2015Q1",
+         subtitle = "Pre-shale: oil bust → PLL spikes. Post-shale: rate cycle dominates provisioning",
+         x="PBRENT YoY %%", y="PLL Rate (%% of avg loans)") +
+    theme_pub() + theme(legend.position="right")
+
+  # Assemble
+  pE_top <- if (!is.null(pE2)) pE1 | pE2 else pE1
+  pNE    <- pE_top / pE3 + plot_annotation(
+    title    = "FIGURE NEW-E — Provision for Loan Losses (PLL) Rate Dynamics",
+    subtitle = paste("PLL rate = pll / avg(lns_tot) — forward-looking credit quality indicator.",
+                     "Leads delinquency by 1\u20132 quarters; more sensitive to oil shocks than dq_rate."),
+    caption  = "Source: NCUA Form 5300 | pll / ((lns_tot_t + lns_tot_{t-1})/2) \u00d7 100",
+    theme    = theme(plot.title=element_text(face="bold",size=12),
+                     plot.subtitle=element_text(size=9,colour="#555"))
+  )
+  save_plot(pNE, "NEW_E_pll_rate_dynamics.png", w=13, h=12)
+  msg("  Saved: NEW_E_pll_rate_dynamics.png")
+} else {
+  msg("  SKIP NEW-E: pll_rate not in panel")
+}
+
 
 # =============================================================================
 hdr("Descriptive statistics")
@@ -1166,7 +1277,8 @@ hdr("Descriptive statistics")
 desc_vars <- intersect(c("dq_rate","chg_tot_lns_ratio","netintmrg",
                           "pcanetworth","costfds","roa",
                           "insured_share_growth","cert_share",
-                          "loan_to_share","member_growth_yoy"), names(panel))
+                          "loan_to_share","member_growth_yoy",
+                          "pll_rate","pll_per_loan"), names(panel))
 
 group_col <- if ("cu_group" %in% names(panel)) "cu_group" else "oil_exposure_bin"
 
