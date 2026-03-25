@@ -311,17 +311,20 @@ cc_results <- rbindlist(lapply(cu_outcomes, function(v) {
 }))
 
 out_labels <- c(
-  dq_rate              = "Delinquency Rate",
-  chg_tot_lns_ratio    = "Net Charge-Off Ratio",
-  netintmrg            = "Net Interest Margin",
-  costfds              = "Cost of Funds",
-  insured_share_growth = "Insured Share Growth",
-  cert_share           = "Certificate Share",
+  dq_rate              = "Delinquency Rate (%)",
+  chg_tot_lns_ratio    = "Net Charge-Off Ratio (%)",
+  netintmrg            = "Net Interest Margin (%)",
+  costfds              = "Cost of Funds (%)",
+  insured_share_growth = "Insured Share Growth (YoY%)",
+  cert_share           = "Certificate Share of Deposits",
   loan_to_share        = "Loan-to-Share Ratio",
-  roa                  = "Return on Assets",
+  roa                  = "Return on Assets (%)",
   member_growth_yoy    = "Membership Growth (YoY%)",
   pll_rate             = "PLL Rate (% of Avg Loans)",
-  pll_per_loan         = "PLL per Loan ($)"
+  pll_per_loan         = "PLL per Loan ($)",
+  pcanetworth          = "Net Worth Ratio (% of Assets)",
+  networth             = "Net Worth ($000s)",
+  nim_spread           = "NIM Spread (Loan Yield - CoF)"
 )
 cc_results[, outcome_label := out_labels[outcome]]
 cc_results[is.na(outcome_label), outcome_label := outcome]
@@ -335,23 +338,22 @@ cc_coverage <- cc_results[, .(
 cat("\n  Cross-correlation coverage:\n")
 print(cc_coverage, row.names=FALSE)
 
-# ── Colour palette — must support up to 13 outcomes (Dark2 only has 8) ────────
-# Use a custom palette drawn from ColorBrewer + manual additions
+# ── Colour palette — must support all outcomes (Dark2 only has 8) ─────────────
 CC_COLS <- c(
-  "Cost of Funds"              = "#1b9e77",
-  "Delinquency Rate"           = "#d95f02",
-  "Insured Share Growth"       = "#7570b3",
-  "Loan-to-Share Ratio"        = "#e7298a",
-  "Net Interest Margin"        = "#66a61e",
-  "Membership Growth (YoY%)"   = "#e6ab02",
-  "PLL Rate (% of Avg Loans)"  = "#a6761d",
-  "Return on Assets"           = "#666666",
-  "Certificate Share"          = "#1f78b4",
-  "PLL per Loan ($)"           = "#b2df8a",
-  "Net Charge-Off Ratio"       = "#fb9a99",
-  "pcanetworth"                = "#cab2d6",
-  "networth"                   = "#fdbf6f",
-  "nim_spread"                 = "#b15928"
+  "Cost of Funds (%)"               = "#1b9e77",
+  "Delinquency Rate (%)"            = "#d95f02",
+  "Insured Share Growth (YoY%)"     = "#7570b3",
+  "Loan-to-Share Ratio"             = "#e7298a",
+  "Net Interest Margin (%)"         = "#66a61e",
+  "Membership Growth (YoY%)"        = "#e6ab02",
+  "PLL Rate (% of Avg Loans)"       = "#a6761d",
+  "Return on Assets (%)"            = "#666666",
+  "Certificate Share of Deposits"   = "#1f78b4",
+  "PLL per Loan ($)"                = "#b2df8a",
+  "Net Charge-Off Ratio (%)"        = "#fb9a99",
+  "Net Worth Ratio (% of Assets)"   = "#cab2d6",
+  "Net Worth ($000s)"               = "#fdbf6f",
+  "NIM Spread (Loan Yield - CoF)"   = "#b15928"
 )
 
 # Only plot outcomes that have at least some valid correlations
@@ -895,24 +897,48 @@ heat_long[, value_label := fifelse(
   as.character(round(value, 2))
 )]
 
-p09 <- ggplot(heat_long[!is.na(norm_val)],
+p09 <- ggplot(heat_long,   # use ALL rows including NA norm_val
               aes(x=episode, y=outcome_label, fill=norm_val)) +
   geom_tile(colour="white", linewidth=0.5) +
+  # Blank cells (NA norm_val) get light grey fill explicitly
+  geom_tile(data=heat_long[is.na(norm_val)],
+            fill="#eeeeee", colour="white", linewidth=0.5) +
   geom_text(aes(label=value_label), size=2.5, colour="#1a1a1a") +
-  scale_fill_gradient2(low="#2166ac", mid="#f7f7f7", high="#d73027",
-                       midpoint=0.5, name="Relative\nlevel\n(green=good)") +
+  # Show "N/A" in blank cells so they are visibly missing not invisible
+  geom_text(data=heat_long[is.na(norm_val)],
+            aes(label="N/A"), size=2.2, colour="#aaaaaa", fontface="italic") +
+  scale_fill_gradient2(
+    low      = "#2166ac",    # blue  = favourable / low stress
+    mid      = "#f7f7f7",    # white = neutral / average
+    high     = "#d73027",    # red   = elevated stress / tight
+    midpoint = 0.5,
+    na.value = "#eeeeee",    # grey for NA cells
+    name     = "Relative level\n(Blue = good\nRed = stress)"
+  ) +
   scale_x_discrete(position="top") +
-  labs(title   = "FIGURE 09 — CU Outcome Heatmap by Oil Price Episode",
-       subtitle = "Red = elevated stress / tight conditions | Blue = favourable | Raw values shown",
-       caption  = "Source: NCUA Form 5300; FRB CCAR 2026 Baseline",
-       x=NULL, y=NULL) +
+  labs(
+    title    = "FIGURE 09 \u2014 CU Outcome Heatmap by Oil Price Episode",
+    subtitle = paste(
+      "Blue = favourable conditions | Red = elevated stress | White = average |",
+      "Grey (N/A) = variable not available for that episode\n",
+      "Colour direction: for stress variables (DQ rate, PLL rate, CoF)",
+      "higher values shown as red; for performance variables higher = blue"
+    ),
+    caption  = "Source: NCUA Form 5300; FRB CCAR 2026 Baseline | Raw episode mean values shown",
+    x=NULL, y=NULL
+  ) +
   theme_pub() +
-  theme(axis.text.x    = element_text(size=8.5, angle=0),
-        axis.text.y    = element_text(size=8.5),
-        legend.position= "right",
-        panel.grid     = element_blank())
+  theme(
+    axis.text.x     = element_text(size=8.5, angle=0, face="bold"),
+    axis.text.y     = element_text(size=8.5),
+    legend.position = "right",
+    legend.title    = element_text(size=8.5, face="bold"),
+    legend.text     = element_text(size=8),
+    plot.subtitle   = element_text(size=8, lineheight=1.3),
+    panel.grid      = element_blank()
+  )
 
-save_plot(p09, "09_episode_heatmap.png", w=13, h=6)
+save_plot(p09, "09_episode_heatmap.png", w=14, h=8)   # taller to fit all rows
 
 # =============================================================================
 # CHART 10 — Missingness Overview
