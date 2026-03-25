@@ -534,12 +534,12 @@ for (dep in Y_VARS) {
 
 # Combine coefficient table — guard against empty list
 fe_coefs_valid <- Filter(function(x) !is.null(x) && nrow(x) > 0, fe_coefs)
-coef_table <- if (length(fe_coefs_valid) > 0)
-  rbindlist(fe_coefs_valid, fill=TRUE)
-else {
+if (length(fe_coefs_valid) > 0) {
+  coef_table <- rbindlist(fe_coefs_valid, fill=TRUE)
+} else {
   msg("  WARNING: no panel FE equations estimated — coef_table empty")
-  data.table(dep_var=character(), term=character(),
-             estimate=numeric(), se=numeric(), t=numeric(), p=numeric())
+  coef_table <- data.table(dep_var=character(), term=character(),
+                            estimate=numeric(), se=numeric(), t=numeric(), p=numeric())
 }
 fwrite(coef_table, "Results/04_varx_coef_panel_fe.csv")
 msg("\n  Coefficient table \u2192 Results/04_varx_coef_panel_fe.csv (%d rows)", nrow(coef_table))
@@ -591,10 +591,11 @@ for (tier in sort(unique(panel$asset_tier))) {
   y_cols_t  <- intersect(Y_VARS, names(agg_t_clean))
   Y_t       <- as.matrix(agg_t_clean[, ..y_cols_t])
   exog_t_cols <- intersect(c(avail_z, avail_int_panel, avail_dum), names(agg_t_clean))
-  X_t <- if (length(exog_t_cols) > 0)
-    as.matrix(agg_t_clean[, ..exog_t_cols])
-  else
-    matrix(0, nrow=nrow(agg_t_clean), ncol=1)
+  if (length(exog_t_cols) > 0) {
+    X_t <- as.matrix(agg_t_clean[, ..exog_t_cols])
+  } else {
+    X_t <- matrix(0, nrow=nrow(agg_t_clean), ncol=1)
+  }
 
   tier_models[[as.character(tier)]] <- tryCatch(
     VAR(Y_t, p=P_LAG, type="const",
@@ -649,10 +650,7 @@ estimate_subsample <- function(data_full, macro_data, label,
     intersect(c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(sub)),
     "post_shale"   # collinear within a single era subsample
   )
-  X_s <- if (length(exog_s_cols) > 0)
-    as.matrix(sub[, ..exog_s_cols])
-  else
-    matrix(rep(1, nrow(sub)), ncol=1)
+  X_s <- if (length(exog_s_cols) > 0) as.matrix(sub[, ..exog_s_cols]) else matrix(rep(1, nrow(sub)), ncol=1)
 
   m <- tryCatch(
     VAR(Y_s, p=P_LAG, type="const", exogen=X_s),
@@ -1022,11 +1020,11 @@ for (scen in names(scenario_paths)) {
   }
 }
 
-all_forecasts <- if (length(forecast_results) > 0)
-  rbindlist(forecast_results, fill=TRUE)
-else {
+if (length(forecast_results) > 0) {
+  all_forecasts <- rbindlist(forecast_results, fill=TRUE)
+} else {
   msg("  WARNING: no scenario forecasts produced")
-  data.table()
+  all_forecasts <- data.table()
 }
 
 # Attach historical actuals
