@@ -67,6 +67,23 @@ hdr <- function(x) cat("\n", strrep("=", 70), "\n##", x, "\n",
 msg <- function(fmt, ...) cat(sprintf(paste0("  ", fmt, "\n"), ...))
 ts  <- function() format(Sys.time(), "%H:%M:%S")
 
+# ── fill_nas: interpolate NAs in all specified columns of a data.table ────────
+# Used wherever a matrix must be NA-free before passing to vars::VAR/VARselect.
+# Applies zoo::na.approx (linear) then fills any residual NAs with column mean.
+fill_nas <- function(dt, vars) {
+  dt <- copy(dt)
+  for (v in intersect(vars, names(dt))) {
+    n_na <- sum(is.na(dt[[v]]))
+    if (n_na > 0) {
+      dt[, (v) := zoo::na.approx(get(v), na.rm=FALSE)]
+      still_na <- sum(is.na(dt[[v]]))
+      if (still_na > 0)
+        dt[is.na(get(v)), (v) := mean(dt[[v]], na.rm=TRUE)]
+    }
+  }
+  dt
+}
+
 dir.create("Models",   showWarnings = FALSE)
 dir.create("Results",  showWarnings = FALSE)
 dir.create("Figures",  showWarnings = FALSE)
@@ -310,29 +327,11 @@ agg_clean <- agg[complete.cases(agg[, ..CORE_Y_VARS])]
 setorder(agg_clean, yyyyqq)
 
 # Interpolate ALL Y variables — handles any remaining NAs
-for (v in intersect(Y_VARS, names(agg_clean))) {
-  n_na <- sum(is.na(agg_clean[[v]]))
-  if (n_na > 0) {
-    agg_clean[, (v) := zoo::na.approx(get(v), na.rm=FALSE)]
-    # If interpolation leaves leading/trailing NAs, fill with column mean
-    still_na <- sum(is.na(agg_clean[[v]]))
-    if (still_na > 0)
-      agg_clean[is.na(get(v)), (v) := mean(agg_clean[[v]], na.rm=TRUE)]
-    msg("  Interpolated %d NAs in %s (%d still NA after → filled with mean)",
-        n_na, v, still_na)
-  }
-}
+agg_clean <- fill_nas(agg_clean, Y_VARS)
 
 # Also fill any NAs in X (exog) columns
 exog_cols_raw <- intersect(c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(agg_clean))
-for (v in exog_cols_raw) {
-  n_na <- sum(is.na(agg_clean[[v]]))
-  if (n_na > 0) {
-    agg_clean[, (v) := zoo::na.approx(get(v), na.rm=FALSE)]
-    agg_clean[is.na(get(v)), (v) := 0]  # dummies default to 0
-    msg("  Interpolated %d NAs in exog: %s", n_na, v)
-  }
-}
+agg_clean <- fill_nas(agg_clean, exog_cols_raw)
 
 # Final complete-case drop (should remove nothing if interpolation worked)
 y_na_check  <- !complete.cases(agg_clean[, ..Y_VARS])
@@ -546,11 +545,15 @@ for (tier in sort(unique(panel$asset_tier))) {
 
   setorder(agg_t, yyyyqq)
   agg_t <- merge(agg_t, macro_ts,  by="yyyyqq", all.x=TRUE)
-  # panel_dum already contains DUMMY_VARS at quarter level — merge once
   agg_t <- merge(agg_t, panel_dum, by="yyyyqq", all.x=TRUE, allow.cartesian=FALSE)
   tier_agg[[as.character(tier)]] <- agg_t
 
-  agg_t_clean <- agg_t[complete.cases(agg_t[, intersect(Y_VARS, names(agg_t)), with=FALSE])]
+  # Fill NAs via interpolation before building Y/X matrices
+  y_cols_tier  <- intersect(Y_VARS, names(agg_t))
+  exog_tier    <- intersect(c(avail_z, avail_int_panel, avail_dum), names(agg_t))
+  agg_t_clean  <- fill_nas(agg_t, c(y_cols_tier, exog_tier))
+  agg_t_clean  <- agg_t_clean[complete.cases(agg_t_clean[, ..y_cols_tier])]
+
   if (nrow(agg_t_clean) < 30) {
     msg("Tier %s: insufficient obs (%d) — skipping", tier, nrow(agg_t_clean))
     next
@@ -589,41 +592,56 @@ msg("\nTier models → Models/varx_tiers.rds")
 # =============================================================================
 hdr("SECTION 6: Stage 4 — Pre/Post-2015 Structural Split")
 
-estimate_subsample <- function(data_full, macro_data, label, yyyyqq_filter) {
+estimate_subsample <- function(data_full, macro_data, label,
+                               yyyyqq_from, yyyyqq_to=Inf) {
+  # Filter by yyyyqq range — avoids logical vector length mismatch
+  sub <- data_full[yyyyqq >= yyyyqq_from & yyyyqq <= yyyyqq_to]
+  mac <- macro_data[yyyyqq >= yyyyqq_from & yyyyqq <= yyyyqq_to]
 
-  sub  <- data_full[yyyyqq_filter]
-  mac  <- macro_data[yyyyqq_filter]
-  sub  <- merge(sub, mac, by="yyyyqq", all.x=TRUE)
-  sub  <- sub[complete.cases(sub[, ..Y_VARS])]
+  if (nrow(sub) == 0) {
+    msg("  %s: no rows in range — skipping", label); return(NULL)
+  }
+
+  sub <- merge(sub, mac, by="yyyyqq", all.x=TRUE)
+
+  # Interpolate NAs in Y and X before building matrices
+  all_exog <- intersect(c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(sub))
+  sub <- fill_nas(sub, c(Y_VARS, all_exog))
+
+  sub <- sub[complete.cases(sub[, intersect(Y_VARS, names(sub)), with=FALSE])]
 
   if (nrow(sub) < P_LAG + ncol(Y_mat) + 5) {
     msg("  %s: too few obs (%d) — skipping", label, nrow(sub)); return(NULL)
   }
 
-  Y_s <- as.matrix(sub[, ..Y_VARS])
-  exog_s_cols <- intersect(c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(sub))
-  # Remove post_shale (collinear within subsample)
-  exog_s_cols <- setdiff(exog_s_cols, "post_shale")
-  X_s <- as.matrix(sub[, ..exog_s_cols])
+  y_cols_s    <- intersect(Y_VARS, names(sub))
+  Y_s         <- as.matrix(sub[, ..y_cols_s])
+  exog_s_cols <- setdiff(
+    intersect(c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(sub)),
+    "post_shale"   # collinear within a single era subsample
+  )
+  X_s <- if (length(exog_s_cols) > 0)
+    as.matrix(sub[, ..exog_s_cols])
+  else
+    matrix(rep(1, nrow(sub)), ncol=1)
 
   m <- tryCatch(
-    VAR(Y_s, p=P_LAG, type="const",
-        exogen=X_s),   # vars::VAR handles lag alignment internally
+    VAR(Y_s, p=P_LAG, type="const", exogen=X_s),
     error=function(e) { warning(paste(label, "failed:", e$message)); NULL }
   )
 
   if (!is.null(m)) {
     r2s <- sapply(m$varresult, function(eq) summary(eq)$adj.r.squared)
-    msg("  %-15s | Obs=%-5d | Avg Adj-R²=%.3f | Max root=%.4f",
+    msg("  %-15s | Obs=%-5d | Avg Adj-R\u00b2=%.3f | Max root=%.4f",
         label, nrow(Y_s), mean(r2s, na.rm=TRUE), max(roots(m)))
   }
   m
 }
 
 varx_pre  <- estimate_subsample(agg, macro_ts, "Pre-2015",
-                                 agg$yyyyqq < 201501L)
+                                 yyyyqq_from=200501L, yyyyqq_to=201404L)
 varx_post <- estimate_subsample(agg, macro_ts, "Post-2015",
-                                 agg$yyyyqq >= 201501L)
+                                 yyyyqq_from=201501L)
 
 saveRDS(varx_pre,  "Models/varx_pre2015.rds")
 saveRDS(varx_post, "Models/varx_post2015.rds")
