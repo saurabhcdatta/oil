@@ -326,16 +326,52 @@ out_labels <- c(
 cc_results[, outcome_label := out_labels[outcome]]
 cc_results[is.na(outcome_label), outcome_label := outcome]
 
-p03 <- ggplot(cc_results[!is.na(correlation)],
+# ── Diagnostic: report which outcomes have valid correlations ─────────────────
+cc_coverage <- cc_results[, .(
+  n_valid   = sum(!is.na(correlation)),
+  max_abs   = max(abs(correlation), na.rm=TRUE)
+), by=.(outcome, outcome_label)][order(-max_abs)]
+
+cat("\n  Cross-correlation coverage:\n")
+print(cc_coverage, row.names=FALSE)
+
+# ── Colour palette — must support up to 13 outcomes (Dark2 only has 8) ────────
+# Use a custom palette drawn from ColorBrewer + manual additions
+CC_COLS <- c(
+  "Cost of Funds"              = "#1b9e77",
+  "Delinquency Rate"           = "#d95f02",
+  "Insured Share Growth"       = "#7570b3",
+  "Loan-to-Share Ratio"        = "#e7298a",
+  "Net Interest Margin"        = "#66a61e",
+  "Membership Growth (YoY%)"   = "#e6ab02",
+  "PLL Rate (% of Avg Loans)"  = "#a6761d",
+  "Return on Assets"           = "#666666",
+  "Certificate Share"          = "#1f78b4",
+  "PLL per Loan ($)"           = "#b2df8a",
+  "Net Charge-Off Ratio"       = "#fb9a99",
+  "pcanetworth"                = "#cab2d6",
+  "networth"                   = "#fdbf6f",
+  "nim_spread"                 = "#b15928"
+)
+
+# Only plot outcomes that have at least some valid correlations
+plot_outcomes_03 <- cc_coverage[n_valid > 0 & is.finite(max_abs), outcome_label]
+
+p03 <- ggplot(cc_results[!is.na(correlation) &
+                           outcome_label %in% plot_outcomes_03],
               aes(x = lag, y = correlation, colour = outcome_label)) +
   geom_hline(yintercept = 0, linewidth = 0.3, colour = "#888") +
   geom_vline(xintercept = 0, linewidth = 0.4, linetype="dashed",
              colour = COL_OIL) +
   geom_line(linewidth = 0.75) +
   geom_point(size = 1.8) +
-  annotate("text", x=0.1, y=Inf, label="← Oil leads  |  Oil lags →",
+  annotate("text", x=0.1, y=Inf, label="\u2190 Oil leads  |  Oil lags \u2192",
            vjust=1.5, hjust=0, size=2.8, colour="#888") +
-  scale_colour_brewer(palette="Dark2", name="CU Outcome") +
+  scale_colour_manual(
+    values = CC_COLS,
+    name   = "CU Outcome",
+    breaks = plot_outcomes_03   # legend order matches plot
+  ) +
   scale_x_continuous(breaks=-4:8,
                      labels=c(paste0("Lag\n",4:1),"0",
                                paste0("Lead\n",1:8))) +
@@ -807,10 +843,28 @@ heat_list <- lapply(1:nrow(ep_def), function(i) {
   ep  <- ep_def[i]
   sub <- agg_ep[yyyyqq >= ep$yyyyqq_from & yyyyqq <= ep$yyyyqq_to]
   if (nrow(sub) == 0) return(NULL)
-  means <- sapply(cu_outcomes, function(v) mean(sub[[v]], na.rm=TRUE))
+  # Use sapply with explicit NA return when column missing or all-NA
+  means <- sapply(cu_outcomes, function(v) {
+    if (!v %in% names(sub)) return(NA_real_)
+    val <- mean(sub[[v]], na.rm=TRUE)
+    if (!is.finite(val)) NA_real_ else val  # NaN/Inf → NA so heatmap shows blank not crash
+  })
   as.data.table(c(list(episode=ep$episode), as.list(means)))
 })
 heat_dt <- rbindlist(heat_list, fill=TRUE)
+
+# ── Diagnostic: show which variables have NA in which episodes ────────────────
+cat("\n  Heatmap NA coverage by outcome × episode:\n")
+na_check <- heat_dt[, lapply(.SD, function(x) sum(is.na(x))),
+                     .SDcols = intersect(cu_outcomes, names(heat_dt))]
+if (any(unlist(na_check) > 0)) {
+  problem_vars <- names(na_check)[unlist(na_check) > 0]
+  cat(sprintf("  Variables with missing episode means: %s\n",
+              paste(problem_vars, collapse=", ")))
+  cat("  Check: are these variables populated in the call report for recent quarters?\n")
+} else {
+  cat("  All outcomes have complete episode coverage\n")
+}
 
 # Normalise each outcome 0-1 for heatmap colouring
 heat_long <- melt(heat_dt, id.vars="episode",
@@ -819,18 +873,32 @@ heat_long[, outcome_label := out_labels[as.character(outcome)]]
 heat_long[is.na(outcome_label), outcome_label := as.character(outcome)]
 heat_long[, norm_val := {
   mn <- min(value, na.rm=TRUE); mx <- max(value, na.rm=TRUE)
-  if (mx > mn) (value - mn)/(mx - mn) else 0.5
+  if (is.finite(mn) && is.finite(mx) && mx > mn)
+    (value - mn)/(mx - mn)
+  else
+    rep(0.5, .N)   # constant series → neutral colour, not dropped
 }, by=outcome]
 heat_long[, episode := factor(episode, levels=ep_def$episode)]
 
-# For outcomes where high = stress, flip the colour scale
-stress_outcomes <- c("dq_rate","chg_tot_lns_ratio","costfds")
+# For outcomes where HIGH value = STRESS → invert so red = bad consistently
+# pll_rate: high provisions = stress; dq_rate: high delinquency = stress
+# costfds: high cost of funds = stress; chg_tot_lns_ratio: high charge-offs = stress
+# pll_per_loan: high per-loan provision = stress
+stress_outcomes <- c("dq_rate","chg_tot_lns_ratio","costfds",
+                     "pll_rate","pll_per_loan")
 heat_long[outcome %in% stress_outcomes, norm_val := 1 - norm_val]
+
+# Display label for value: show 2 decimal places, handle NA gracefully
+heat_long[, value_label := fifelse(
+  is.na(value) | !is.finite(value),
+  "",
+  as.character(round(value, 2))
+)]
 
 p09 <- ggplot(heat_long[!is.na(norm_val)],
               aes(x=episode, y=outcome_label, fill=norm_val)) +
   geom_tile(colour="white", linewidth=0.5) +
-  geom_text(aes(label=round(value,2)), size=2.5, colour="#1a1a1a") +
+  geom_text(aes(label=value_label), size=2.5, colour="#1a1a1a") +
   scale_fill_gradient2(low="#2166ac", mid="#f7f7f7", high="#d73027",
                        midpoint=0.5, name="Relative\nlevel\n(green=good)") +
   scale_x_discrete(position="top") +
