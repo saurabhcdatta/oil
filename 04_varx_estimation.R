@@ -869,13 +869,14 @@ plot_irf <- function(irf_obj, impulse_label, outfile) {
   p <- ggplot(all_irf, aes(x=horizon))
 
   # Layer 1: CI ribbon — split by significance colour
+  # inherit.aes=FALSE means parent x=horizon is dropped → must supply x explicitly
   if (has_ci) {
     for (sig_type in c("insig","pos","neg")) {
       dt_sub <- all_irf[sig == sig_type & !is.na(lower) & !is.na(upper)]
       if (nrow(dt_sub) > 0) {
         p <- p + geom_ribbon(
           data    = dt_sub,
-          aes(ymin=lower, ymax=upper),
+          aes(x=horizon, ymin=lower, ymax=upper),   # x required when inherit.aes=FALSE
           fill    = RIBBON_COLS[sig_type],
           alpha   = RIBBON_ALPHA[sig_type],
           inherit.aes = FALSE
@@ -888,32 +889,32 @@ plot_irf <- function(irf_obj, impulse_label, outfile) {
   p <- p + geom_hline(yintercept=0, linetype="dashed",
                        colour="#555555", linewidth=0.4)
 
-  # Layer 3: IRF point estimate — solid where significant, thinner where not
+  # Layer 3: IRF point estimate — thick+coloured where significant, thin+grey where not
+  # Must supply x=horizon explicitly for data= subsets (same reason as ribbon)
   if (has_ci) {
     p <- p +
       geom_line(data=all_irf[sig == "insig"],
-                aes(y=irf), colour="#607D8B",
-                linewidth=0.6, linetype="solid") +
+                aes(x=horizon, y=irf, group=response),
+                colour="#607D8B", linewidth=0.6, inherit.aes=FALSE) +
       geom_line(data=all_irf[sig == "pos"],
-                aes(y=irf), colour="#1B7837",
-                linewidth=1.0) +
+                aes(x=horizon, y=irf, group=response),
+                colour="#1B7837", linewidth=1.0, inherit.aes=FALSE) +
       geom_line(data=all_irf[sig == "neg"],
-                aes(y=irf), colour="#C62828",
-                linewidth=1.0) +
+                aes(x=horizon, y=irf, group=response),
+                colour="#C62828", linewidth=1.0, inherit.aes=FALSE) +
       geom_line(data=all_irf[sig == "no_ci"],
-                aes(y=irf), colour="#1565C0",
-                linewidth=0.8)
+                aes(x=horizon, y=irf, group=response),
+                colour="#1565C0", linewidth=0.8, inherit.aes=FALSE)
   } else {
     p <- p + geom_line(aes(y=irf), colour="#1565C0", linewidth=0.8)
   }
 
-  # Layer 4: Significance bar at bottom of each panel
-  # Uses geom_rug on the x-axis with colour mapped to significance
+  # Layer 4: Significance bar at bottom of each panel via geom_rug
   if (has_ci && nrow(sig_bar) > 0) {
     p <- p + geom_rug(
       data        = sig_bar,
       aes(x=horizon, colour=sig),
-      sides       = "b",           # bottom only
+      sides       = "b",
       linewidth   = 1.2,
       length      = unit(0.04, "npc"),
       inherit.aes = FALSE
@@ -928,12 +929,12 @@ plot_irf <- function(irf_obj, impulse_label, outfile) {
     )
   }
 
-  # Layer 5: Significance window annotation per panel
+  # Layer 5: Significance window label  (label.size → linewidth from ggplot2 3.5.0)
   if (has_ci && exists("sig_windows") && nrow(sig_windows) > 0) {
     sig_windows[, response_lbl := str_replace_all(response, "_", " ") |>
                                    str_to_title()]
-    sig_windows[, label := sprintf("Q%d\u2013Q%d", first_sig, last_sig)]
-    sig_windows[, ann_col := fifelse(direction=="pos", "#1B7837", "#C62828")]
+    sig_windows[, label    := sprintf("Q%d\u2013Q%d", first_sig, last_sig)]
+    sig_windows[, ann_col  := fifelse(direction=="pos", "#1B7837", "#C62828")]
     p <- p + geom_label(
       data        = sig_windows,
       aes(x=first_sig, y=Inf, label=label),
@@ -943,7 +944,7 @@ plot_irf <- function(irf_obj, impulse_label, outfile) {
       fontface    = "bold",
       hjust       = 0,
       vjust       = 1.4,
-      label.size  = 0.2,
+      linewidth   = 0.2,          # replaces deprecated label.size
       inherit.aes = FALSE
     )
   }
