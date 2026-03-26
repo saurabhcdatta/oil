@@ -84,12 +84,15 @@ cl_export <- function(...) {
 }
 
 # Helper: load packages on all workers
+# clusterCall serialises both the function AND its arguments to each worker,
+# so pkgs arrives as a concrete vector — not a reference to a local variable.
+# clusterEvalQ only sends quoted code, so local variables like pkgs are
+# invisible to the workers (PSOCK scoping bug on Windows).
 cl_libs <- function(...) {
   pkgs <- c(...)
-  invisible(clusterEvalQ(cl, {
-    suppressPackageStartupMessages(lapply(pkgs, library,
-                                           character.only=TRUE))
-  }))
+  invisible(clusterCall(cl, function(p) {
+    suppressPackageStartupMessages(lapply(p, library, character.only=TRUE))
+  }, pkgs))
 }
 cl_libs("neuralnet", "data.table")
 
