@@ -779,10 +779,7 @@ msg("All 8 IRFs saved \u2192 Results/04_varx_irf.rds")
 # ── 7.3 Plot IRFs ─────────────────────────────────────────────────────────────
 plot_irf <- function(irf_obj, impulse_label, outfile) {
 
-  # vars::irf() stores $irf, $Lower, $Upper as named lists.
-  # Each element is a MATRIX of shape (n.ahead+1) × k (k = impulse vars).
-  # When a single impulse is specified, k=1, so we extract column 1.
-  # as.numeric() ensures it is a plain vector, not a matrix-column.
+  # ── Extract IRF matrices into tidy data.table ─────────────────────────────
   safe_vec <- function(x) {
     if (is.matrix(x)) as.numeric(x[, 1L]) else as.numeric(x)
   }
@@ -791,11 +788,8 @@ plot_irf <- function(irf_obj, impulse_label, outfile) {
     irf_vals <- irf_obj$irf[[series_nm]]
     lo_vals  <- irf_obj$Lower[[series_nm]]
     up_vals  <- irf_obj$Upper[[series_nm]]
-
     if (is.null(irf_vals)) return(NULL)
-
     n_rows <- if (is.matrix(irf_vals)) nrow(irf_vals) else length(irf_vals)
-
     data.table(
       horizon  = seq(0L, n_rows - 1L),
       irf      = safe_vec(irf_vals),
@@ -808,45 +802,191 @@ plot_irf <- function(irf_obj, impulse_label, outfile) {
   all_irf <- rbindlist(
     Filter(Negate(is.null), lapply(names(irf_obj$irf), extract_one))
   )
-
   if (nrow(all_irf) == 0) {
     msg("  plot_irf: no data extracted for %s — skipping", impulse_label)
     return(invisible(NULL))
+  }
+
+  # ── Statistical significance classification ───────────────────────────────
+  # The 90% bootstrap CI is the standard significance test for IRFs.
+  # Interpretation:
+  #   sig_pos: lower > 0  → CI entirely above zero → significantly POSITIVE
+  #   sig_neg: upper < 0  → CI entirely below zero → significantly NEGATIVE
+  #   insig  : CI crosses zero → effect not distinguishable from zero
+  #
+  # This is equivalent to a two-sided test at α = 0.10.
+  # We visualise this in three ways:
+  #   1. Shaded ribbon: green (pos) / red (neg) / grey (insig)
+  #   2. Significance bar: coloured tick strip along x-axis bottom
+  #   3. Annotation: first and last significant quarter per panel
+
+  has_ci <- all_irf[, any(!is.na(lower) & !is.na(upper))]
+
+  if (has_ci) {
+    all_irf[, sig := fcase(
+      !is.na(lower) & !is.na(upper) & lower > 0,  "pos",   # sig positive
+      !is.na(lower) & !is.na(upper) & upper < 0,  "neg",   # sig negative
+      !is.na(lower) & !is.na(upper),              "insig", # CI crosses 0
+      default = "no_ci"
+    )]
+
+    # Ribbon fill colour per horizon point — use sig classification
+    RIBBON_COLS <- c(
+      pos   = "#1B7837",   # green  — significantly positive
+      neg   = "#C62828",   # red    — significantly negative
+      insig = "#90A4AE",   # grey   — not significant
+      no_ci = "#BBDEFB"    # pale blue — no CI available
+    )
+    RIBBON_ALPHA <- c(pos=0.22, neg=0.22, insig=0.10, no_ci=0.10)
+
+    # Significance bar data: strip along bottom of each panel
+    # y position is dynamically placed at panel minimum
+    sig_bar <- all_irf[sig != "no_ci", .(
+      horizon, sig, response,
+      response_lbl = str_replace_all(response, "_", " ") |> str_to_title()
+    )]
+    sig_bar[, bar_col := fcase(
+      sig == "pos",   "#1B7837",
+      sig == "neg",   "#C62828",
+      sig == "insig", "#CFD8DC",
+      default         = "#CFD8DC"
+    )]
+
+    # First / last significant quarter per panel (for annotation)
+    sig_windows <- all_irf[sig %in% c("pos","neg"),
+      .(first_sig = min(horizon), last_sig = max(horizon),
+        direction = sig[which.max(abs(irf))]),
+      by=response]
+  } else {
+    all_irf[, sig := "no_ci"]
   }
 
   # Clean labels
   all_irf[, response_lbl := str_replace_all(response, "_", " ") |>
                               str_to_title()]
 
-  # Only draw ribbon where CI bands are available
-  has_ci <- all_irf[, any(!is.na(lower) & !is.na(upper))]
+  # ── Build plot ────────────────────────────────────────────────────────────
+  p <- ggplot(all_irf, aes(x=horizon))
 
-  p <- ggplot(all_irf, aes(x=horizon)) +
-    { if (has_ci)
-        geom_ribbon(aes(ymin=lower, ymax=upper), fill="#2196F3", alpha=0.15)
-      else
-        list()   # empty layer — avoids error when CI absent
-    } +
-    geom_line(aes(y=irf), color="#1565C0", linewidth=0.8) +
-    geom_hline(yintercept=0, linetype="dashed", color="#666", linewidth=0.4) +
+  # Layer 1: CI ribbon — split by significance colour
+  if (has_ci) {
+    for (sig_type in c("insig","pos","neg")) {
+      dt_sub <- all_irf[sig == sig_type & !is.na(lower) & !is.na(upper)]
+      if (nrow(dt_sub) > 0) {
+        p <- p + geom_ribbon(
+          data    = dt_sub,
+          aes(ymin=lower, ymax=upper),
+          fill    = RIBBON_COLS[sig_type],
+          alpha   = RIBBON_ALPHA[sig_type],
+          inherit.aes = FALSE
+        )
+      }
+    }
+  }
+
+  # Layer 2: Zero reference line
+  p <- p + geom_hline(yintercept=0, linetype="dashed",
+                       colour="#555555", linewidth=0.4)
+
+  # Layer 3: IRF point estimate — solid where significant, thinner where not
+  if (has_ci) {
+    p <- p +
+      geom_line(data=all_irf[sig == "insig"],
+                aes(y=irf), colour="#607D8B",
+                linewidth=0.6, linetype="solid") +
+      geom_line(data=all_irf[sig == "pos"],
+                aes(y=irf), colour="#1B7837",
+                linewidth=1.0) +
+      geom_line(data=all_irf[sig == "neg"],
+                aes(y=irf), colour="#C62828",
+                linewidth=1.0) +
+      geom_line(data=all_irf[sig == "no_ci"],
+                aes(y=irf), colour="#1565C0",
+                linewidth=0.8)
+  } else {
+    p <- p + geom_line(aes(y=irf), colour="#1565C0", linewidth=0.8)
+  }
+
+  # Layer 4: Significance bar at bottom of each panel
+  # Uses geom_rug on the x-axis with colour mapped to significance
+  if (has_ci && nrow(sig_bar) > 0) {
+    p <- p + geom_rug(
+      data        = sig_bar,
+      aes(x=horizon, colour=sig),
+      sides       = "b",           # bottom only
+      linewidth   = 1.2,
+      length      = unit(0.04, "npc"),
+      inherit.aes = FALSE
+    ) +
+    scale_colour_manual(
+      values = c(pos="darkgreen", neg="darkred", insig="grey60"),
+      labels = c(pos="Sig. positive (90% CI)",
+                 neg="Sig. negative (90% CI)",
+                 insig="Not significant"),
+      name   = NULL,
+      guide  = guide_legend(override.aes=list(linewidth=2))
+    )
+  }
+
+  # Layer 5: Significance window annotation per panel
+  if (has_ci && exists("sig_windows") && nrow(sig_windows) > 0) {
+    sig_windows[, response_lbl := str_replace_all(response, "_", " ") |>
+                                   str_to_title()]
+    sig_windows[, label := sprintf("Q%d\u2013Q%d", first_sig, last_sig)]
+    sig_windows[, ann_col := fifelse(direction=="pos", "#1B7837", "#C62828")]
+    p <- p + geom_label(
+      data        = sig_windows,
+      aes(x=first_sig, y=Inf, label=label),
+      colour      = sig_windows$ann_col,
+      fill        = "white",
+      size        = 2.5,
+      fontface    = "bold",
+      hjust       = 0,
+      vjust       = 1.4,
+      label.size  = 0.2,
+      inherit.aes = FALSE
+    )
+  }
+
+  # Facet + scales + labels
+  p <- p +
     facet_wrap(~response_lbl, scales="free_y", ncol=3) +
-    scale_x_continuous(breaks=seq(0, max(all_irf$horizon), 4),
-                       labels=function(x) paste0("Q", x)) +
+    scale_x_continuous(
+      breaks = seq(0, max(all_irf$horizon), 4),
+      labels = function(x) paste0("Q", x)
+    ) +
     labs(
-      title    = sprintf("Impulse Response: %s shock \u2192 CU system", impulse_label),
-      subtitle = sprintf("Cholesky-identified; 90%%%% bootstrap CI (%d runs); p=%d",
-                         N_BOOT, P_LAG),
-      x        = "Quarters after shock",
-      y        = "Response (level units of dependent var)"
+      title    = sprintf("Impulse Response: %s shock \u2192 CU system",
+                          impulse_label),
+      subtitle = sprintf(
+        paste("Cholesky-identified | 90%%%% bootstrap CI (%d runs) | p=%d",
+              "| Green = sig. positive | Red = sig. negative | Grey = not sig."),
+        N_BOOT, P_LAG
+      ),
+      caption  = paste(
+        "Significance: 90%% CI band does not cross zero.",
+        "Coloured tick marks at bottom = significant quarters.",
+        "QX\u2013QY label = window of statistical significance."
+      ),
+      x = "Quarters after shock",
+      y = "Response (level units of dependent var)"
     ) +
     theme_minimal(base_size=10) +
     theme(
       plot.title       = element_text(face="bold", size=11),
+      plot.subtitle    = element_text(size=8, colour="#444444",
+                                       lineheight=1.3),
+      plot.caption     = element_text(size=7.5, colour="#888888", hjust=0),
       strip.text       = element_text(face="bold", size=9),
-      panel.grid.minor = element_blank()
+      strip.background = element_rect(fill="#f5f5f5", colour="#cccccc"),
+      panel.grid.minor = element_blank(),
+      panel.border     = element_rect(colour="#dddddd", fill=NA,
+                                       linewidth=0.3),
+      legend.position  = "bottom",
+      legend.text      = element_text(size=8)
     )
 
-  ggsave(outfile, p, width=12, height=7, dpi=150, bg="white")
+  ggsave(outfile, p, width=13, height=8, dpi=200, bg="white")
   msg("  IRF chart \u2192 %s", outfile)
   invisible(p)
 }
@@ -988,7 +1128,40 @@ msg("FEVD heatmap → Figures/04_fevd_h8.png")
 # =============================================================================
 hdr("SECTION 7.5: Oil Shock Simulation — CU Response to Oil Price Change")
 
-# ── Helper: simulate one path and return Y trajectory ────────────────────────
+# ── Guard: Section 7.5 requires varx_full from Section 3 ─────────────────────
+if (!exists("varx_full") || is.null(varx_full)) {
+  msg("WARNING: varx_full not found — attempting to load from Models/varx_full.rds")
+  varx_full <- tryCatch(readRDS("Models/varx_full.rds"),
+                         error=function(e) {
+                           msg("ERROR: could not load varx_full: %s", e$message)
+                           msg("Section 7.5 skipped — re-run Section 3 first")
+                           NULL
+                         })
+}
+
+if (is.null(varx_full)) {
+  msg("Section 7.5 skipped — varx_full unavailable")
+} else {
+
+# ── Build z_var_names_sim: exogenous variable names as they appear in varx_full
+# These are the column names of the exogenous block in the estimated VAR,
+# excluding endogenous lags and the intercept.
+# Must be built from varx_full (not Z_VARS directly) because some vars may
+# have been dropped during estimation due to collinearity or missing data.
+z_var_names_sim <- tryCatch({
+  # Get all term names from the first equation of varx_full
+  all_terms <- names(varx_full$varresult[[1]]$model)
+  # Remove endogenous lag terms (pattern: varname.lN) and intercept
+  lag_pattern <- paste0("^(", paste(colnames(Y_mat), collapse="|"), ")\\.l")
+  all_terms[!grepl(lag_pattern, all_terms) & all_terms != "(Intercept)"]
+}, error = function(e) {
+  msg("Could not extract z_var_names_sim from varx_full: %s", e$message)
+  msg("Falling back to Z_VARS + INTERACT_VARS + DUMMY_VARS")
+  intersect(c(Z_VARS, INTERACT_VARS, DUMMY_VARS), names(agg_clean))
+})
+
+msg("VARX exogenous vars (%d): %s", length(z_var_names_sim),
+    paste(z_var_names_sim, collapse=", "))
 # =============================================================================
 # FULL MACRO SIMULATION — All Z variables move together
 # =============================================================================
@@ -1529,6 +1702,8 @@ if (!is.null(sim_flat) && !is.null(sim_current)) {
   msg("  Oil shock simulation skipped — baseline simulation failed")
   msg("  Check that varx_full was estimated successfully in Section 3")
 }
+
+}  # end varx_full guard (Section 7.5)
 
 # =============================================================================
 # 8. STAGE 6 — CCAR 2026 SCENARIO PROJECTIONS
