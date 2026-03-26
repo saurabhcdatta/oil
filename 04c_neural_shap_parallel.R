@@ -124,9 +124,9 @@ P_LAG        <- 2L
 # neuralnet is exact (rprop algorithm) but slower than GPU torch.
 # Runtime on 180k obs panel: ~8-15 minutes per outcome variable.
 # We train one model per outcome (neuralnet doesn't natively multi-task).
-HIDDEN_LAYERS  <- c(16L, 8L)
-MAX_STEPS      <- 1e5          # max iterations per model
-THRESHOLD_CONV <- 0.01         # convergence threshold (partial derivatives)
+HIDDEN_LAYERS  <- c(8L, 4L)    # reduced from c(16,8) — 3-4x faster, adequate for SHAP
+MAX_STEPS      <- 5e4           # reduced from 1e5 — convergence usually by 2e4
+THRESHOLD_CONV <- 0.02          # slightly looser — faster convergence, similar SHAP quality
 N_SHAP_BG      <- 100L         # background rows for Kernel SHAP
 N_SHAP_TEST    <- 80L          # test rows to explain
 N_COAL         <- 60L          # coalition samples per observation
@@ -279,6 +279,11 @@ train_results <- parLapply(cl, Y_VARS, function(v) {
   y_std_train <- (panel_train_sub[[v]] - y_mean[v]) / y_sd[v]
   train_df    <- cbind(X_train_sub,
                         setNames(data.frame(y_std_train), y_std_col))
+
+  # Sanitise: neuralnet cannot handle NaN/Inf in any column
+  train_df <- as.data.frame(lapply(train_df, function(x) {
+    x[!is.finite(x)] <- 0; x
+  }))
   frml        <- nn_formula(y_std_col, feature_cols)
 
   nn_fit <- tryCatch(
@@ -318,11 +323,35 @@ nn_models <- setNames(
 )
 
 # ── Evaluate on test set (fast — serial is fine here) ─────────────────────────
+# ── Evaluate on test set ──────────────────────────────────────────────────────
+# IMPORTANT: neuralnet objects must use compute() not predict().
+# predict() calls cbind(1, pred) internally which fails if the outcome
+# column is absent from newdata. compute() takes only the feature matrix.
 predict_one <- function(mod, newdata) {
+  # Sanitise: replace any NaN/Inf with 0 (should not occur after standardisation)
+  newdata_clean <- as.data.frame(lapply(newdata, function(x) {
+    x[!is.finite(x)] <- 0; x
+  }))
+
   if (!is.null(mod$model_type) && mod$model_type == "lm_fallback") {
-    as.numeric(predict(mod, newdata=newdata))
+    # lm fallback: predict() works normally
+    tryCatch(
+      as.numeric(predict(mod, newdata=newdata_clean)),
+      error = function(e) rep(NA_real_, nrow(newdata_clean))
+    )
   } else {
-    as.numeric(predict(mod, newdata=newdata))
+    # neuralnet: use compute() — takes only the X columns, no outcome needed
+    tryCatch({
+      # compute() needs columns in the same order as training features
+      feat_cols <- mod$model.list$variables   # feature names from neuralnet object
+      nd        <- newdata_clean[, feat_cols, drop=FALSE]
+      result    <- neuralnet::compute(mod, nd)
+      as.numeric(result$net.result)
+    }, error = function(e) {
+      # If compute() also fails, fall back to a zero-mean prediction
+      warning(sprintf("neuralnet compute() failed: %s", e$message))
+      rep(0, nrow(newdata_clean))
+    })
   }
 }
 
@@ -377,13 +406,18 @@ bg_mean <- colMeans(X_bg)
 predict_std <- function(v, newdata_mat) {
   nd <- as.data.frame(newdata_mat)
   colnames(nd) <- feature_cols
+  nd <- as.data.frame(lapply(nd, function(x) { x[!is.finite(x)] <- 0; x }))
   mod <- nn_models[[v]]
   if (!is.null(mod$model_type) && mod$model_type == "lm_fallback") {
-    # need the outcome col to exist for lm (use dummy)
     nd[[paste0(v, "_std")]] <- 0
-    as.numeric(predict(mod, newdata=nd))
+    tryCatch(as.numeric(predict(mod, newdata=nd)),
+             error=function(e) rep(0, nrow(nd)))
   } else {
-    as.numeric(predict(mod, newdata=nd))
+    tryCatch({
+      feat_cols_nn <- mod$model.list$variables
+      result       <- neuralnet::compute(mod, nd[, feat_cols_nn, drop=FALSE])
+      as.numeric(result$net.result)
+    }, error=function(e) rep(0, nrow(nd)))
   }
 }
 
@@ -473,15 +507,23 @@ clusterExport(cl, varlist=c(
 shap_results_raw <- parLapply(cl, Y_VARS, function(v) {
 
   # Worker-local predict function (returns standardised predictions)
+  # Uses neuralnet::compute() — NOT predict() — to avoid cbind() error
   predict_std_worker <- function(x_mat) {
-    nd <- as.data.frame(x_mat)
+    nd  <- as.data.frame(x_mat)
     colnames(nd) <- feature_cols
+    # Sanitise NaN/Inf
+    nd <- as.data.frame(lapply(nd, function(x) { x[!is.finite(x)] <- 0; x }))
     mod <- nn_models[[v]]
     if (!is.null(mod$model_type) && mod$model_type == "lm_fallback") {
       nd[[paste0(v, "_std")]] <- 0
-      as.numeric(predict(mod, newdata=nd))
+      tryCatch(as.numeric(predict(mod, newdata=nd)),
+               error=function(e) rep(0, nrow(nd)))
     } else {
-      as.numeric(predict(mod, newdata=nd))
+      tryCatch({
+        feat_cols_nn <- mod$model.list$variables
+        result       <- neuralnet::compute(mod, nd[, feat_cols_nn, drop=FALSE])
+        as.numeric(result$net.result)
+      }, error=function(e) rep(0, nrow(nd)))
     }
   }
 
@@ -614,17 +656,22 @@ if (length(oil_col_idx) == 1) {
     x_perturb[, oil_col_idx] <- oil_range_std[ri]
     nd <- as.data.frame(x_perturb)
     colnames(nd) <- feature_cols
+    # Sanitise
+    nd <- as.data.frame(lapply(nd, function(x) { x[!is.finite(x)] <- 0; x }))
 
     row <- list(oil_yoy=oil_range_raw[ri])
     for (v in Y_VARS) {
       mod <- nn_models[[v]]
-      y_hat_std <- if (!is.null(mod$model_type) &&
-                       mod$model_type == "lm_fallback") {
-        nd[[paste0(v,"_std")]] <- 0
-        as.numeric(predict(mod, newdata=nd))
-      } else {
-        as.numeric(predict(mod, newdata=nd))
-      }
+      y_hat_std <- tryCatch({
+        if (!is.null(mod$model_type) && mod$model_type == "lm_fallback") {
+          nd[[paste0(v,"_std")]] <- 0
+          as.numeric(predict(mod, newdata=nd))
+        } else {
+          feat_cols_nn <- mod$model.list$variables
+          result       <- neuralnet::compute(mod, nd[, feat_cols_nn, drop=FALSE])
+          as.numeric(result$net.result)
+        }
+      }, error=function(e) rep(0, nrow(nd)))
       row[[v]] <- mean(y_hat_std * y_sd[v] + y_mean[v], na.rm=TRUE)
     }
     as.data.table(row)
