@@ -959,7 +959,8 @@ hm_dt <- pathway_agg[pathway!="Other" & !is.na(outcome_label)]
 hm_dt[, share := shap_abs / sum(shap_abs), by=outcome_label]
 hm_dt[, cell  := fifelse(share >= 0.03, sprintf("%.0f%%", share*100), "")]
 
-p_pol3 <- ggplot(hm_dt, aes(x=outcome_label, y=fct_rev(pathway), fill=share)) +
+hm_dt[, pathway_rev := factor(pathway, levels=rev(levels(pathway)))]
+p_pol3 <- ggplot(hm_dt, aes(x=outcome_label, y=pathway_rev, fill=share)) +
   geom_tile(colour="white", linewidth=0.6) +
   geom_text(aes(label=cell), size=2.8, fontface="bold",
             colour=ifelse(hm_dt$share > 0.35, "white", "#333")) +
