@@ -50,6 +50,11 @@ hdr <- function(x) cat("\n", strrep("=",70), "\n##", x, "\n",
 msg <- function(fmt, ...) cat(sprintf(paste0("  ", fmt, "\n"), ...))
 `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
 
+cat("\n  ╔══════════════════════════════════════════════════════════╗\n")
+cat("  ║  Script 04c — XGBoost + TreeSHAP  [v3 — evals fix]     ║\n")
+cat("  ║  If you see watchlist= errors you are running OLD file  ║\n")
+cat("  ╚══════════════════════════════════════════════════════════╝\n\n")
+
 dir.create("Models",  showWarnings=FALSE)
 dir.create("Results", showWarnings=FALSE)
 dir.create("Figures", showWarnings=FALSE)
@@ -205,8 +210,10 @@ grid_search_one <- function(v) {
   y_all  <- (panel_train[[v]] - y_mean[v]) / y_sd[v]
   y_all[!is.finite(y_all)] <- 0
 
-  dtrain <- xgb.DMatrix(X_train[idx_tr, ],  label=y_all[idx_tr])
-  dval   <- xgb.DMatrix(X_train[idx_val, ], label=y_all[idx_val])
+  dtrain <- xgb.DMatrix(X_train[idx_tr, ],  label=y_all[idx_tr],
+                         feature_names=feature_cols)
+  dval   <- xgb.DMatrix(X_train[idx_val, ], label=y_all[idx_val],
+                         feature_names=feature_cols)
 
   best_rmse    <- Inf
   best_row     <- 1L
@@ -239,16 +246,24 @@ grid_search_one <- function(v) {
       # best_score may be stored differently across xgboost versions
       # try $best_score first, fall back to reading evaluation log
       val_rmse <- tryCatch({
+        # Method 1: best_score (set by early stopping)
         s <- cv_fit$best_score
-        if (is.null(s) || length(s) == 0) {
-          # newer xgboost: read from evaluation log
-          log <- cv_fit$evaluation_log
-          if (!is.null(log) && "val_rmse" %in% names(log))
-            min(log$val_rmse, na.rm=TRUE)
-          else
-            NA_real_
-        } else {
+        if (!is.null(s) && length(s) == 1 && is.finite(s)) {
           as.numeric(s)
+        } else {
+          # Method 2: evaluation_log — column name = "{evals_key}_rmse"
+          # evals key is "val", so column is "val_rmse"
+          log <- cv_fit$evaluation_log
+          if (!is.null(log) && nrow(log) > 0) {
+            # Find any column ending in _rmse
+            rmse_col <- grep("_rmse$", names(log), value=TRUE)[1]
+            if (!is.na(rmse_col))
+              min(log[[rmse_col]], na.rm=TRUE)
+            else
+              NA_real_
+          } else {
+            NA_real_
+          }
         }
       }, error = function(e) NA_real_)
 
