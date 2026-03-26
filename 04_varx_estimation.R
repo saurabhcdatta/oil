@@ -1127,6 +1127,87 @@ msg("FEVD heatmap → Figures/04_fevd_h8.png")
 # +30% YoY is approximately 1 standard deviation of historical PBRENT YoY.
 # Results interpretable as: "effect of a +1 SD oil price increase"
 # =============================================================================
+
+# forecast_varx defined here (before Section 7.5 which calls it)
+forecast_varx <- function(var_model, macro_scenario_path, init_Y, p) {
+
+  k   <- ncol(init_Y)
+  h   <- nrow(macro_scenario_path)
+  nms <- colnames(init_Y)
+  fcst <- matrix(NA_real_, nrow=h, ncol=k, dimnames=list(NULL, nms))
+
+  # ── Companion-form AR coefficient matrices ───────────────────────────────
+  # vars::VAR stores each equation's coefficients separately.
+  # For lag l, the (k × k) matrix A_l has:
+  #   row i = equation for Y_i
+  #   col j = coefficient on Y_j at lag l
+  # sapply(...) produces a (k × k) matrix with equations as COLUMNS — transpose needed.
+  A_list <- lapply(1:p, function(lag) {
+    M <- sapply(var_model$varresult, function(eq) {
+      cf    <- coef(eq)
+      terms <- paste0(nms, ".l", lag)
+      # Return k coefficients in the same order as nms
+      vapply(terms, function(t) {
+        if (t %in% names(cf)) cf[[t]] else 0
+      }, numeric(1))
+    })
+    # M is k×k: rows=predictors, cols=equations → transpose to equations×predictors
+    t(M)
+  })
+
+  # Intercept vector (length k)
+  const <- vapply(var_model$varresult, function(eq) {
+    cf <- coef(eq)
+    if ("const" %in% names(cf)) cf[["const"]] else 0
+  }, numeric(1))
+
+  # ── Exogenous coefficient matrix B (k × n_exog) ──────────────────────────
+  exog_nms <- names(var_model$varresult[[1]]$model)
+  # Remove endogenous lags and intercept
+  lag_pattern <- paste0("^(", paste(nms, collapse="|"), ")\\.l")
+  exog_nms <- exog_nms[!grepl(lag_pattern, exog_nms) & exog_nms != "(Intercept)"]
+
+  if (length(exog_nms) > 0) {
+    B_exog <- t(sapply(var_model$varresult, function(eq) {
+      cf <- coef(eq)
+      vapply(exog_nms, function(nm) {
+        if (nm %in% names(cf)) cf[[nm]] else 0
+      }, numeric(1))
+    }))
+    # B_exog: k × n_exog after transpose
+  } else {
+    B_exog <- matrix(0, nrow=k, ncol=0)
+  }
+
+  Y_hist <- init_Y
+
+  for (t in 1:h) {
+    y_hat <- matrix(const, ncol=1)   # k × 1
+
+    for (lag in 1:p) {
+      idx <- nrow(Y_hist) - lag + 1
+      if (idx < 1) break
+      y_lag <- matrix(Y_hist[idx, ], ncol=1)   # k × 1 — force column vector
+      y_hat <- y_hat + A_list[[lag]] %*% y_lag
+    }
+
+    # Add exogenous contribution
+    if (length(exog_nms) > 0 && ncol(B_exog) > 0) {
+      z_nms <- intersect(exog_nms, names(macro_scenario_path))
+      if (length(z_nms) > 0) {
+        z_t   <- unlist(macro_scenario_path[t, ..z_nms])
+        z_mat <- matrix(z_t, ncol=1)
+        B_sub <- B_exog[, match(z_nms, exog_nms), drop=FALSE]
+        y_hat <- y_hat + B_sub %*% z_mat
+      }
+    }
+
+    fcst[t, ] <- as.numeric(y_hat)
+    Y_hist    <- rbind(Y_hist, t(y_hat))
+  }
+  fcst
+}
+
 hdr("SECTION 7.5: Oil Shock Simulation — CU Response to Oil Price Change")
 
 # ── Guard: Section 7.5 requires varx_full from Section 3 ─────────────────────
@@ -1410,29 +1491,6 @@ oil_proj_feb26   <- extract_proj_yoy(yoy_feb26)
 oil_proj_march   <- extract_proj_yoy(yoy_march)
 oil_proj_current <- extract_proj_yoy(yoy_current)
 oil_proj_recess  <- extract_proj_yoy(yoy_recess)
-
-# Print YoY paths for verification
-cat("\n  Moody's PBRENT YoY paths (2026Q1-2028Q4):\n")
-cat(sprintf("  %-22s : %s\n", "Feb 2026 Baseline",
-    paste(sprintf("%+.0f%%", oil_proj_feb26), collapse=", ")))
-cat(sprintf("  %-22s : %s\n", "Early March Baseline",
-    paste(sprintf("%+.0f%%", oil_proj_march), collapse=", ")))
-cat(sprintf("  %-22s : %s\n", "Current Baseline",
-    paste(sprintf("%+.0f%%", oil_proj_current), collapse=", ")))
-cat(sprintf("  %-22s : %s\n", "Recession Scenario",
-    paste(sprintf("%+.0f%%", oil_proj_recess), collapse=", ")))
-
-# ── Run simulations for each Moody's scenario + a flat-oil baseline ──────────
-# Flat baseline: oil YoY = 0% (neutral — to compute delta / marginal effect)
-oil_proj_flat <- rep(0, n_proj)
-
-SIM_HOR_PROJ <- n_proj   # 12 quarters
-
-sim_flat    <- simulate_oil_path(varx_full, init_Y_sim, oil_proj_flat,    agg_clean, z_var_names_sim, SIM_HOR_PROJ)
-sim_feb26   <- simulate_oil_path(varx_full, init_Y_sim, oil_proj_feb26,   agg_clean, z_var_names_sim, SIM_HOR_PROJ)
-sim_march   <- simulate_oil_path(varx_full, init_Y_sim, oil_proj_march,   agg_clean, z_var_names_sim, SIM_HOR_PROJ)
-sim_current <- simulate_oil_path(varx_full, init_Y_sim, oil_proj_current, agg_clean, z_var_names_sim, SIM_HOR_PROJ)
-sim_recess  <- simulate_oil_path(varx_full, init_Y_sim, oil_proj_recess,  agg_clean, z_var_names_sim, SIM_HOR_PROJ)
 
 if (!is.null(sim_flat) && !is.null(sim_current)) {
 
@@ -1730,84 +1788,6 @@ scenario_paths <- Filter(function(x) !is.null(x) && nrow(x) > 0,
 msg("CCAR scenarios available: %s", paste(names(scenario_paths), collapse=", "))
 
 # ── 8.2 Multi-step forecast function ─────────────────────────────────────────
-forecast_varx <- function(var_model, macro_scenario_path, init_Y, p) {
-
-  k   <- ncol(init_Y)
-  h   <- nrow(macro_scenario_path)
-  nms <- colnames(init_Y)
-  fcst <- matrix(NA_real_, nrow=h, ncol=k, dimnames=list(NULL, nms))
-
-  # ── Companion-form AR coefficient matrices ───────────────────────────────
-  # vars::VAR stores each equation's coefficients separately.
-  # For lag l, the (k × k) matrix A_l has:
-  #   row i = equation for Y_i
-  #   col j = coefficient on Y_j at lag l
-  # sapply(...) produces a (k × k) matrix with equations as COLUMNS — transpose needed.
-  A_list <- lapply(1:p, function(lag) {
-    M <- sapply(var_model$varresult, function(eq) {
-      cf    <- coef(eq)
-      terms <- paste0(nms, ".l", lag)
-      # Return k coefficients in the same order as nms
-      vapply(terms, function(t) {
-        if (t %in% names(cf)) cf[[t]] else 0
-      }, numeric(1))
-    })
-    # M is k×k: rows=predictors, cols=equations → transpose to equations×predictors
-    t(M)
-  })
-
-  # Intercept vector (length k)
-  const <- vapply(var_model$varresult, function(eq) {
-    cf <- coef(eq)
-    if ("const" %in% names(cf)) cf[["const"]] else 0
-  }, numeric(1))
-
-  # ── Exogenous coefficient matrix B (k × n_exog) ──────────────────────────
-  exog_nms <- names(var_model$varresult[[1]]$model)
-  # Remove endogenous lags and intercept
-  lag_pattern <- paste0("^(", paste(nms, collapse="|"), ")\\.l")
-  exog_nms <- exog_nms[!grepl(lag_pattern, exog_nms) & exog_nms != "(Intercept)"]
-
-  if (length(exog_nms) > 0) {
-    B_exog <- t(sapply(var_model$varresult, function(eq) {
-      cf <- coef(eq)
-      vapply(exog_nms, function(nm) {
-        if (nm %in% names(cf)) cf[[nm]] else 0
-      }, numeric(1))
-    }))
-    # B_exog: k × n_exog after transpose
-  } else {
-    B_exog <- matrix(0, nrow=k, ncol=0)
-  }
-
-  Y_hist <- init_Y
-
-  for (t in 1:h) {
-    y_hat <- matrix(const, ncol=1)   # k × 1
-
-    for (lag in 1:p) {
-      idx <- nrow(Y_hist) - lag + 1
-      if (idx < 1) break
-      y_lag <- matrix(Y_hist[idx, ], ncol=1)   # k × 1 — force column vector
-      y_hat <- y_hat + A_list[[lag]] %*% y_lag
-    }
-
-    # Add exogenous contribution
-    if (length(exog_nms) > 0 && ncol(B_exog) > 0) {
-      z_nms <- intersect(exog_nms, names(macro_scenario_path))
-      if (length(z_nms) > 0) {
-        z_t   <- unlist(macro_scenario_path[t, ..z_nms])
-        z_mat <- matrix(z_t, ncol=1)
-        B_sub <- B_exog[, match(z_nms, exog_nms), drop=FALSE]
-        y_hat <- y_hat + B_sub %*% z_mat
-      }
-    }
-
-    fcst[t, ] <- as.numeric(y_hat)
-    Y_hist    <- rbind(Y_hist, t(y_hat))
-  }
-  fcst
-}
 
 # ── 8.3 Run projections for each scenario ────────────────────────────────────
 y_cols_fcst <- intersect(Y_VARS, colnames(Y_chol))
