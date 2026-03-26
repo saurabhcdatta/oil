@@ -853,101 +853,155 @@ if (file.exists(varx_path)) {
 # =============================================================================
 # 9. OUTPUT MANIFEST
 # =============================================================================
-
 # =============================================================================
 # 8b. POLICY CHARTS — Direct vs Indirect Oil Transmission
 # =============================================================================
 hdr("SECTION 8b: Policy Charts — Direct vs Indirect Transmission")
 
-# ── Classify every feature into transmission pathway ─────────────────────────
-pathway_map <- data.table(feature=feature_cols, pathway="Other")
-pathway_map[feature == "macro_base_yoy_oil",                            pathway := "Direct oil price"]
-pathway_map[grepl("fomc_x_brent|post_x_oil|zirp_x_oil", feature),      pathway := "Interaction (oil x regime)"]
-pathway_map[grepl("macro_base_lurc", feature),                           pathway := "Indirect: Labour market"]
-pathway_map[grepl("macro_base_pcpi", feature),                           pathway := "Indirect: Inflation (CPI)"]
-pathway_map[grepl("macro_base_fomc_regime|macro_base_yield_curve|macro_base_rmtg", feature),
-                                                                         pathway := "Indirect: Rate channel"]
-pathway_map[grepl("hpi_yoy", feature),                                   pathway := "Indirect: Housing"]
-pathway_map[grepl("_lag", feature),                                      pathway := "Indirect: Balance sheet lags"]
+# ── Use short, safe column names — no special chars ──────────────────────────
+# Map pathway labels to short safe R column names for matrix operations
+PATHWAY_LABELS <- c(
+  D   = "Direct oil price",
+  INT = "Interaction (oil x regime)",
+  LAB = "Indirect: Labour market",
+  CPI = "Indirect: Inflation (CPI)",
+  RTE = "Indirect: Rate channel",
+  HPI = "Indirect: Housing",
+  BAL = "Indirect: Balance sheet lags",
+  OTH = "Other"
+)
+# Reverse lookup: label -> short code
+PATHWAY_CODE <- setNames(names(PATHWAY_LABELS), PATHWAY_LABELS)
 
 PATHWAY_COLS <- c(
-  "Direct oil price"              = "#b5470a",
-  "Interaction (oil x regime)"    = "#7a1a0a",
-  "Indirect: Labour market"       = "#2d7a4a",
-  "Indirect: Inflation (CPI)"     = "#c04828",
-  "Indirect: Rate channel"        = "#4a2080",
-  "Indirect: Housing"             = "#3B6D11",
-  "Indirect: Balance sheet lags"  = "#185FA5",
-  "Other"                         = "#aaaaaa"
+  "Direct oil price"             = "#b5470a",
+  "Interaction (oil x regime)"   = "#7a1a0a",
+  "Indirect: Labour market"      = "#2d7a4a",
+  "Indirect: Inflation (CPI)"    = "#c04828",
+  "Indirect: Rate channel"       = "#4a2080",
+  "Indirect: Housing"            = "#3B6D11",
+  "Indirect: Balance sheet lags" = "#185FA5",
+  "Other"                        = "#aaaaaa"
 )
 
-# Aggregate SHAP by pathway per outcome
-shap_pathway <- rbindlist(lapply(seq_along(Y_VARS), function(idx) {
-  v  <- Y_VARS[idx]
-  sv <- shap_results[[v]]
-  dt <- data.table(feature=colnames(sv), shap_mean=colMeans(sv, na.rm=TRUE))
-  dt <- merge(dt, pathway_map, by="feature")
-  dt[, outcome := v]
-  dt
-}))
+# Classify features into pathways
+pathway_map <- data.table(feature=feature_cols, pathway="Other")
+pathway_map[feature == "macro_base_yoy_oil",
+            pathway := "Direct oil price"]
+pathway_map[grepl("fomc_x_brent|post_x_oil|zirp_x_oil", feature),
+            pathway := "Interaction (oil x regime)"]
+pathway_map[grepl("macro_base_lurc", feature),
+            pathway := "Indirect: Labour market"]
+pathway_map[grepl("macro_base_pcpi", feature),
+            pathway := "Indirect: Inflation (CPI)"]
+pathway_map[grepl("macro_base_fomc_regime|macro_base_yield_curve|macro_base_rmtg", feature),
+            pathway := "Indirect: Rate channel"]
+pathway_map[grepl("hpi_yoy", feature),
+            pathway := "Indirect: Housing"]
+pathway_map[grepl("_lag", feature),
+            pathway := "Indirect: Balance sheet lags"]
 
-pathway_agg <- shap_pathway[,
-  .(shap_signed = sum(shap_mean, na.rm=TRUE),
-    shap_abs    = sum(abs(shap_mean), na.rm=TRUE)),
-  by=.(outcome, pathway)]
+# Verify classifications
+msg("Pathway feature counts:")
+print(pathway_map[, .N, by=pathway][order(-N)])
+
+# Build obs-level pathway totals using safe short codes
+# Returns a data.table with one col per pathway code per outcome variable
+build_pathway_dt <- function(v, obs_idx=NULL) {
+  sv <- shap_results[[v]]
+  if (!is.null(obs_idx)) sv <- sv[obs_idx, , drop=FALSE]
+  n  <- nrow(sv)
+  out <- data.table(outcome=v)
+  for (code in names(PATHWAY_LABELS)) {
+    lbl <- PATHWAY_LABELS[code]
+    fp  <- intersect(pathway_map[pathway==lbl, feature], colnames(sv))
+    if (length(fp) > 0)
+      out[[code]] <- rowSums(sv[, fp, drop=FALSE], na.rm=TRUE)
+    else
+      out[[code]] <- rep(0, n)
+  }
+  out
+}
+
+# Aggregate signed and absolute SHAP by pathway per outcome
+pathway_agg <- rbindlist(lapply(Y_VARS, function(v) {
+  dt <- build_pathway_dt(v)
+  # Melt to long
+  rbindlist(lapply(names(PATHWAY_LABELS), function(code) {
+    data.table(
+      outcome      = v,
+      pathway      = PATHWAY_LABELS[code],
+      shap_signed  = mean(dt[[code]], na.rm=TRUE),
+      shap_abs     = mean(abs(dt[[code]]), na.rm=TRUE)
+    )
+  }))
+}))
 pathway_agg[, outcome_label := factor(OUTCOME_LABELS[outcome], levels=OUTCOME_LABELS)]
 pathway_agg[, pathway       := factor(pathway, levels=names(PATHWAY_COLS))]
-
 fwrite(pathway_agg, "Results/04c_pathway_decomposition.csv")
-msg("Pathway decomposition saved")
+msg("Pathway decomposition saved -> Results/04c_pathway_decomposition.csv")
 
 # ── POLICY CHART 1: Signed SHAP decomposition ────────────────────────────────
 p_pol1 <- ggplot(pathway_agg[!is.na(pathway) & !is.na(outcome_label)],
                  aes(x=outcome_label, y=shap_signed, fill=pathway)) +
   geom_col(width=0.75, colour="white", linewidth=0.25) +
   geom_hline(yintercept=0, linewidth=0.5, colour="#333") +
-  scale_fill_manual(values=PATHWAY_COLS, name="Pathway") +
+  scale_fill_manual(values=PATHWAY_COLS, name="Pathway", drop=FALSE) +
   scale_x_discrete(guide=guide_axis(angle=35)) +
   scale_y_continuous(labels=function(x) sprintf("%+.3f", x)) +
   labs(
     title    = "POLICY FIG 1 \u2014 Signed SHAP: Direct vs Indirect Oil Transmission",
-    subtitle = "Positive = pushes outcome UP | Negative = dampens | Orange = direct price | Purple = rate channel",
+    subtitle = paste(
+      "Positive bars = pathway pushes outcome UP | Negative = dampens",
+      "\nOrange = direct price effect | Purple = rate channel | Blue = balance sheet propagation"
+    ),
     caption  = "Exact TreeSHAP | XGBoost | Full test set 2020Q1-2025Q4",
     x=NULL, y="Mean signed SHAP"
   ) +
   theme_minimal(base_size=10) +
   theme(plot.title=element_text(face="bold",size=11),
-        plot.subtitle=element_text(size=8.5,colour="#444"),
+        plot.subtitle=element_text(size=8.5,colour="#444",lineheight=1.3),
         plot.caption=element_text(size=7.5,colour="#888",hjust=0),
         panel.grid.minor=element_blank(), panel.grid.major.x=element_blank(),
-        legend.position="right", legend.text=element_text(size=8))
+        legend.position="right", legend.text=element_text(size=8),
+        legend.key.size=unit(0.4,"cm"))
 ggsave("Figures/04c_policy1_signed_decomp.png", p_pol1,
        width=14, height=7, dpi=300, bg="white")
 msg("Policy Chart 1 \u2192 Figures/04c_policy1_signed_decomp.png")
 
 # ── POLICY CHART 2: Amplification multiplier ─────────────────────────────────
-direct_tot <- shap_pathway[pathway=="Direct oil price", .(direct=sum(abs(shap_mean))), by=outcome]
-all_tot    <- shap_pathway[pathway!="Other",            .(total =sum(abs(shap_mean))), by=outcome]
+direct_tot <- pathway_agg[pathway=="Direct oil price",
+                           .(direct=shap_abs), by=outcome]
+all_tot    <- pathway_agg[pathway!="Other",
+                           .(total=sum(shap_abs)), by=outcome]
 ratio_dt   <- merge(direct_tot, all_tot, by="outcome")
 ratio_dt[, multiplier    := total / pmax(direct, 1e-8)]
 ratio_dt[, outcome_label := factor(OUTCOME_LABELS[outcome], levels=OUTCOME_LABELS)]
 ratio_dt[, mlabel        := sprintf("%.1fx", multiplier)]
 
-p_pol2 <- ggplot(ratio_dt, aes(x=outcome_label)) +
-  geom_col(aes(y=total),  fill="#dddddd", width=0.7) +
-  geom_col(aes(y=direct), fill="#b5470a", width=0.7, alpha=0.9) +
-  geom_text(aes(y=total, label=mlabel), vjust=-0.4, size=3.2, fontface="bold") +
+msg("Amplification multipliers:")
+print(ratio_dt[, .(outcome, direct=round(direct,4),
+                    total=round(total,4), multiplier=round(multiplier,2))])
+
+p_pol2 <- ggplot(ratio_dt[!is.na(outcome_label)], aes(x=outcome_label)) +
+  geom_col(aes(y=total),  fill="#cccccc", width=0.72) +
+  geom_col(aes(y=direct), fill="#b5470a", width=0.72, alpha=0.9) +
+  geom_text(aes(y=total, label=mlabel),
+            vjust=-0.4, size=3.2, fontface="bold", colour="#333") +
   scale_x_discrete(guide=guide_axis(angle=35)) +
-  scale_y_continuous(expand=expansion(mult=c(0,0.15))) +
+  scale_y_continuous(expand=expansion(mult=c(0, 0.18))) +
   labs(
     title    = "POLICY FIG 2 \u2014 Amplification Multiplier: Direct vs Total Oil Effect",
-    subtitle = "Orange = direct price SHAP | Grey = total through all channels | Label = amplification ratio",
-    caption  = "Ratio > 1 = indirect channels amplify the oil shock | Exact TreeSHAP",
+    subtitle = paste(
+      "Orange = pure direct oil price SHAP | Grey = total effect through all pathways",
+      "\nMultiplier label = how many times larger total effect is vs direct price alone"
+    ),
+    caption  = "Multiplier > 1 = indirect channels amplify the oil shock | Exact TreeSHAP",
     x=NULL, y="Mean |SHAP|"
   ) +
   theme_minimal(base_size=10) +
   theme(plot.title=element_text(face="bold",size=11),
-        plot.subtitle=element_text(size=8.5,colour="#444"),
+        plot.subtitle=element_text(size=8.5,colour="#444",lineheight=1.3),
         plot.caption=element_text(size=7.5,colour="#888",hjust=0),
         panel.grid.minor=element_blank(), panel.grid.major.x=element_blank())
 ggsave("Figures/04c_policy2_amplification.png", p_pol2,
@@ -955,170 +1009,169 @@ ggsave("Figures/04c_policy2_amplification.png", p_pol2,
 msg("Policy Chart 2 \u2192 Figures/04c_policy2_amplification.png")
 
 # ── POLICY CHART 3: Transmission matrix heatmap ──────────────────────────────
-hm_dt <- pathway_agg[pathway!="Other" & !is.na(outcome_label)]
+hm_dt <- pathway_agg[pathway != "Other" & !is.na(outcome_label)]
 hm_dt[, share := shap_abs / sum(shap_abs), by=outcome_label]
 hm_dt[, cell  := fifelse(share >= 0.03, sprintf("%.0f%%", share*100), "")]
-
 hm_dt[, pathway_rev := factor(pathway, levels=rev(levels(pathway)))]
+
 p_pol3 <- ggplot(hm_dt, aes(x=outcome_label, y=pathway_rev, fill=share)) +
   geom_tile(colour="white", linewidth=0.6) +
   geom_text(aes(label=cell), size=2.8, fontface="bold",
             colour=ifelse(hm_dt$share > 0.35, "white", "#333")) +
   scale_fill_gradient2(low="white", mid="#F4B183", high="#b5470a",
-                       midpoint=0.20, labels=percent_format(),
-                       name="Share of\ntotal effect") +
+                       midpoint=0.20, limits=c(0,NA),
+                       labels=percent_format(), name="Share of\ntotal effect") +
   scale_x_discrete(guide=guide_axis(angle=35)) +
   labs(
-    title    = "POLICY FIG 3 \u2014 Oil Transmission Matrix: Pathway x CU Outcome",
-    subtitle = "Cell = % of total attributable SHAP from each pathway | Darker = that pathway dominates",
-    caption  = "Exact TreeSHAP | Key: orange = direct, purple = rate, blue = balance sheet propagation",
+    title    = "POLICY FIG 3 \u2014 Oil Transmission Matrix: Pathway \u00d7 CU Outcome",
+    subtitle = "Cell = % of total SHAP from each pathway | Darker = that pathway dominates the transmission",
+    caption  = "Exact TreeSHAP | orange=direct, purple=rate, blue=balance sheet, green=labour/housing",
     x=NULL, y=NULL
   ) +
   theme_minimal(base_size=10) +
   theme(plot.title=element_text(face="bold",size=11),
         plot.subtitle=element_text(size=8.5,colour="#444"),
         plot.caption=element_text(size=7.5,colour="#888",hjust=0),
-        panel.grid=element_blank(), axis.text.y=element_text(size=9))
+        panel.grid=element_blank(), axis.text.y=element_text(size=9),
+        legend.position="right")
 ggsave("Figures/04c_policy3_transmission_matrix.png", p_pol3,
        width=14, height=8, dpi=300, bg="white")
 msg("Policy Chart 3 \u2192 Figures/04c_policy3_transmission_matrix.png")
 
-# ── POLICY CHART 4: Time-varying transmission ────────────────────────────────
-if ("yyyyqq" %in% names(panel_test)) {
-  tv_list <- lapply(c("dq_rate","pll_rate"), function(v) {
-    sv <- shap_results[[v]]
-    sv_dt <- as.data.table(sv)
-    sv_dt[, yyyyqq  := panel_test$yyyyqq]
-    sv_dt[, outcome := v]
-    for (pw in unique(pathway_map$pathway)) {
-      fp <- intersect(pathway_map[pathway==pw, feature], colnames(sv))
-      nm <- gsub("[: ()]","_", pw)
-      sv_dt[, (nm) := if (length(fp)>0) rowSums(.SD, na.rm=TRUE) else 0,
-            .SDcols=if (length(fp)>0) fp else character(0)]
-    }
-    pw_nms <- gsub("[: ()]","_", unique(pathway_map$pathway))
-    pw_nms <- intersect(pw_nms, names(sv_dt))
-    melt(sv_dt[, c("yyyyqq","outcome",pw_nms), with=FALSE],
-         id.vars=c("yyyyqq","outcome"), variable.name="pathway_nm",
-         value.name="shap_val")
-  })
-  tv_dt <- rbindlist(tv_list)
-  tv_agg <- tv_dt[, .(shap_mean=mean(shap_val, na.rm=TRUE)),
-                  by=.(yyyyqq, outcome, pathway_nm)]
-  tv_agg[, yr  := yyyyqq %/% 100L]
-  tv_agg[, qtr := yyyyqq %% 100L]
-  tv_agg[, date_num     := yr+(qtr-1)/4]
-  tv_agg[, outcome_label := factor(OUTCOME_LABELS[as.character(outcome)],
-                                    levels=OUTCOME_LABELS)]
+# ── POLICY CHART 4: Time-varying — use FULL panel (train+test) ───────────────
+# Test set only starts 2020Q1 so GFC/shale episodes would be empty.
+# We rebuild SHAP on the full panel using the trained models.
+msg("Policy Chart 4: computing SHAP on full panel for time-varying analysis ...")
+full_feat_mat <- as.matrix(panel_clean[, ..feature_cols])
+full_feat_mat[!is.finite(full_feat_mat)] <- 0
+dfull <- xgb.DMatrix(full_feat_mat, feature_names=feature_cols)
 
-  # Map pathway_nm back to colours (approximate)
-  tv_agg[, fill_col := fcase(
-    grepl("Direct",    pathway_nm), "#b5470a",
-    grepl("Rate",      pathway_nm), "#4a2080",
-    grepl("Labour",    pathway_nm), "#2d7a4a",
-    grepl("Inflation", pathway_nm), "#c04828",
-    grepl("Balance",   pathway_nm), "#185FA5",
-    grepl("Housing",   pathway_nm), "#3B6D11",
-    grepl("Interaction",pathway_nm),"#7a1a0a",
-    default="#aaaaaa"
-  )]
+tv_list <- lapply(c("dq_rate","pll_rate"), function(v) {
+  sv <- predict(xgb_models[[v]], dfull, predcontrib=TRUE)
+  sv <- sv[, colnames(sv) != "BIAS", drop=FALSE]
+  dt <- as.data.table(sv)
+  dt[, yyyyqq  := panel_clean$yyyyqq]
+  dt[, outcome := v]
+  # Sum SHAP within each pathway
+  rbindlist(lapply(names(PATHWAY_LABELS), function(code) {
+    lbl <- PATHWAY_LABELS[code]
+    fp  <- intersect(pathway_map[pathway==lbl, feature], colnames(sv))
+    data.table(
+      yyyyqq   = panel_clean$yyyyqq,
+      outcome  = v,
+      pathway  = lbl,
+      shap_val = if (length(fp)>0) rowSums(sv[, fp, drop=FALSE], na.rm=TRUE) else 0
+    )
+  }))
+})
+tv_dt  <- rbindlist(tv_list)
+tv_agg <- tv_dt[, .(shap_mean=mean(shap_val, na.rm=TRUE)),
+                by=.(yyyyqq, outcome, pathway)]
+tv_agg[, yr       := yyyyqq %/% 100L]
+tv_agg[, qtr      := yyyyqq %% 100L]
+tv_agg[, date_num := yr + (qtr-1)/4]
+tv_agg[, outcome_label := factor(OUTCOME_LABELS[as.character(outcome)],
+                                  levels=OUTCOME_LABELS)]
+tv_agg[, pathway := factor(pathway, levels=names(PATHWAY_COLS))]
 
-  episodes <- data.table(
-    xmin  = c(2008.5, 2015.0, 2020.0, 2022.0),
-    xmax  = c(2009.75,2016.0, 2021.25,2023.75),
-    label = c("GFC","Shale bust","COVID","Hike cycle")
-  )
+episodes <- data.table(
+  xmin  = c(2008.5, 2015.0, 2020.0, 2022.0),
+  xmax  = c(2009.75,2016.0, 2021.25,2023.75),
+  label = c("GFC","Shale bust","COVID","Hike cycle")
+)
 
-  p_pol4 <- ggplot(tv_agg[!is.na(outcome_label)],
-                   aes(x=date_num, y=shap_mean,
-                       group=pathway_nm, colour=fill_col)) +
-    geom_rect(data=episodes,
-              aes(xmin=xmin, xmax=xmax, ymin=-Inf, ymax=Inf),
-              fill="#f0f0f0", alpha=0.6, inherit.aes=FALSE) +
-    geom_text(data=episodes, aes(x=(xmin+xmax)/2, y=Inf, label=label),
-              vjust=1.4, size=2.5, colour="#888", inherit.aes=FALSE) +
-    geom_line(linewidth=0.7) +
-    geom_hline(yintercept=0, linewidth=0.35, colour="#555") +
-    scale_colour_identity() +
-    scale_x_continuous(breaks=seq(2020,2026,1),
-                       labels=function(x) paste0("'",substr(x,3,4))) +
-    facet_wrap(~outcome_label, scales="free_y", ncol=1) +
-    labs(
-      title    = "POLICY FIG 4 \u2014 Time-Varying Oil Transmission Channels",
-      subtitle = "Each line = one pathway | Episodes shaded | Orange=direct, Purple=rate, Green=labour",
-      caption  = "TreeSHAP aggregated quarterly | Negative = channel dampens outcome",
-      x=NULL, y="Mean SHAP"
-    ) +
-    theme_minimal(base_size=10) +
-    theme(plot.title=element_text(face="bold",size=11),
-          plot.subtitle=element_text(size=8.5,colour="#444"),
-          plot.caption=element_text(size=7.5,colour="#888",hjust=0),
-          strip.text=element_text(face="bold",size=9),
-          panel.grid.minor=element_blank(), legend.position="none")
-  ggsave("Figures/04c_policy4_time_varying.png", p_pol4,
-         width=13, height=9, dpi=300, bg="white")
-  msg("Policy Chart 4 \u2192 Figures/04c_policy4_time_varying.png")
-}
+p_pol4 <- ggplot(tv_agg[pathway != "Other" & !is.na(outcome_label)],
+                 aes(x=date_num, y=shap_mean, colour=pathway, group=pathway)) +
+  geom_rect(data=episodes,
+            aes(xmin=xmin, xmax=xmax, ymin=-Inf, ymax=Inf),
+            fill="#f0f0f0", alpha=0.7, inherit.aes=FALSE) +
+  geom_text(data=episodes,
+            aes(x=(xmin+xmax)/2, y=Inf, label=label),
+            vjust=1.4, size=2.5, colour="#666", inherit.aes=FALSE) +
+  geom_hline(yintercept=0, linewidth=0.35, colour="#555") +
+  geom_line(linewidth=0.75) +
+  scale_colour_manual(values=PATHWAY_COLS, name="Pathway", drop=FALSE) +
+  scale_x_continuous(breaks=seq(2006,2026,2),
+                     labels=function(x) paste0("'",substr(x,3,4))) +
+  facet_wrap(~outcome_label, scales="free_y", ncol=1) +
+  labs(
+    title    = "POLICY FIG 4 \u2014 Time-Varying Oil Transmission Channels (2005\u20132025)",
+    subtitle = paste(
+      "Each line = one pathway | Key episodes shaded",
+      "\nDid the rate channel (purple) dominate during 2022 hike cycle vs labour (green) during shale bust?"
+    ),
+    caption  = "TreeSHAP on full panel 2005Q1-2025Q4 | Mean quarterly SHAP | Negative = channel dampens outcome",
+    x=NULL, y="Mean SHAP"
+  ) +
+  theme_minimal(base_size=10) +
+  theme(plot.title=element_text(face="bold",size=11),
+        plot.subtitle=element_text(size=8.5,colour="#444",lineheight=1.3),
+        plot.caption=element_text(size=7.5,colour="#888",hjust=0),
+        strip.text=element_text(face="bold",size=9),
+        panel.grid.minor=element_blank(),
+        legend.position="right", legend.text=element_text(size=7.5),
+        legend.key.size=unit(0.35,"cm"))
+ggsave("Figures/04c_policy4_time_varying.png", p_pol4,
+       width=13, height=9, dpi=300, bg="white")
+msg("Policy Chart 4 \u2192 Figures/04c_policy4_time_varying.png")
 
 # ── POLICY CHART 5: Pathway by asset tier ────────────────────────────────────
 if ("asset_tier" %in% names(panel_test)) {
-  pw_focus <- c("Direct oil price","Indirect: Rate channel",
-                "Indirect: Labour market","Indirect: Inflation (CPI)",
-                "Indirect: Balance sheet lags")
+  # Focus pathways for tier comparison
+  pw_focus_codes <- c("D","RTE","LAB","CPI","BAL")
+  pw_focus_lbls  <- PATHWAY_LABELS[pw_focus_codes]
 
-  tier_list <- lapply(Y_VARS[1:4], function(v) {
+  tier_rows <- rbindlist(lapply(Y_VARS[1:4], function(v) {
     sv <- shap_results[[v]]
-    sv_dt <- as.data.table(sv)
-    sv_dt[, `:=`(tier=panel_test$asset_tier, outcome=v)]
-    for (pw in pw_focus) {
-      fp <- intersect(pathway_map[pathway==pw, feature], colnames(sv))
-      nm <- gsub("[: ()]","_", pw)
-      sv_dt[, (nm) := if (length(fp)>0) rowSums(abs(.SD), na.rm=TRUE) else 0,
-            .SDcols=if (length(fp)>0) fp else character(0)]
-    }
-    pw_nms <- gsub("[: ()]","_", pw_focus)
-    pw_nms <- intersect(pw_nms, names(sv_dt))
-    agg <- sv_dt[, lapply(.SD, mean, na.rm=TRUE), by=.(tier,outcome), .SDcols=pw_nms]
-    melt(agg, id.vars=c("tier","outcome"), variable.name="pw_nm", value.name="mean_abs")
-  })
-  tier_dt <- rbindlist(tier_list)
-  tier_dt[, outcome_label := factor(OUTCOME_LABELS[as.character(outcome)],
-                                     levels=OUTCOME_LABELS)]
-  tier_dt[, tier_label := paste0("T", tier)]
-  tier_dt[, pw_label := fcase(
-    grepl("Direct",    pw_nm), "Direct price",
-    grepl("Rate",      pw_nm), "Rate channel",
-    grepl("Labour",    pw_nm), "Labour market",
-    grepl("Inflation", pw_nm), "Inflation",
-    grepl("Balance",   pw_nm), "Balance sheet",
-    default=""
-  )]
-  T_COLS <- c("Direct price"="#b5470a","Rate channel"="#4a2080",
-              "Labour market"="#2d7a4a","Inflation"="#c04828","Balance sheet"="#185FA5")
-  tier_dt[, pw_label := factor(pw_label, levels=names(T_COLS))]
+    tier_vec <- panel_test$asset_tier
+    rbindlist(lapply(pw_focus_codes, function(code) {
+      lbl <- PATHWAY_LABELS[code]
+      fp  <- intersect(pathway_map[pathway==lbl, feature], colnames(sv))
+      vals <- if (length(fp)>0) rowSums(abs(sv[, fp, drop=FALSE]), na.rm=TRUE) else 0
+      data.table(outcome=v, tier=tier_vec, pathway=lbl, abs_shap=vals)
+    }))
+  }))
 
-  p_pol5 <- ggplot(tier_dt[!is.na(outcome_label) & pw_label!=""],
-                   aes(x=tier_label, y=mean_abs, fill=pw_label)) +
+  tier_agg <- tier_rows[, .(mean_abs=mean(abs_shap, na.rm=TRUE)),
+                         by=.(outcome, tier, pathway)]
+  tier_agg[, outcome_label := factor(OUTCOME_LABELS[as.character(outcome)],
+                                      levels=OUTCOME_LABELS)]
+  tier_agg[, tier_label := factor(
+    paste0("T", tier),
+    levels=paste0("T", sort(unique(tier_agg$tier)))
+  )]
+  tier_agg[, pathway := factor(pathway, levels=names(PATHWAY_COLS))]
+
+  T_COLS <- PATHWAY_COLS[pw_focus_lbls]
+
+  p_pol5 <- ggplot(tier_agg[!is.na(outcome_label) & !is.na(pathway)],
+                   aes(x=tier_label, y=mean_abs, fill=pathway)) +
     geom_col(width=0.72, position="stack", colour="white", linewidth=0.2) +
     facet_wrap(~outcome_label, scales="free_y", ncol=2) +
-    scale_fill_manual(values=T_COLS, name="Pathway") +
+    scale_fill_manual(values=T_COLS, name="Pathway", drop=FALSE) +
+    scale_x_discrete(drop=FALSE) +
     labs(
       title    = "POLICY FIG 5 \u2014 Oil Transmission Pathways by Asset Tier",
-      subtitle = "Small CUs (T1) = more direct income exposure | Large CUs (T4) = more rate/balance sheet exposure",
-      caption  = "Mean |TreeSHAP| per tier | T1 <$10M, T2 $10-100M, T3 $100M-$1B, T4 >$1B",
+      subtitle = paste(
+        "Does SIZE change HOW oil affects CUs, not just how much?",
+        "\nT1 <$10M | T2 $10-100M | T3 $100M-$1B | T4 >$1B"
+      ),
+      caption  = "Mean |TreeSHAP| per tier | Stacked = total attributable effect by pathway",
       x="Asset tier", y="Mean |SHAP|"
     ) +
     theme_minimal(base_size=10) +
     theme(plot.title=element_text(face="bold",size=11),
-          plot.subtitle=element_text(size=8.5,colour="#444"),
+          plot.subtitle=element_text(size=8.5,colour="#444",lineheight=1.3),
           plot.caption=element_text(size=7.5,colour="#888",hjust=0),
           strip.text=element_text(face="bold",size=9),
           strip.background=element_rect(fill="#f5f5f5",colour="#ccc"),
-          panel.grid.minor=element_blank(), legend.position="right")
+          panel.grid.minor=element_blank(),
+          legend.position="right", legend.text=element_text(size=8))
   ggsave("Figures/04c_policy5_tier_pathways.png", p_pol5,
          width=13, height=9, dpi=300, bg="white")
   msg("Policy Chart 5 \u2192 Figures/04c_policy5_tier_pathways.png")
 }
+
 
 
 hdr("SECTION 9: Output Manifest")
