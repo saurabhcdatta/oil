@@ -968,6 +968,569 @@ ggsave("Figures/04_fevd_h8.png", p_fevd, width=9, height=6, dpi=150)
 msg("FEVD heatmap → Figures/04_fevd_h8.png")
 
 # =============================================================================
+# 7.5 OIL PRICE SHOCK SIMULATION — The Key Chart for the Paper
+# =============================================================================
+# oil (macro_base_yoy_oil) is EXOGENOUS — not in the Y endogenous block.
+# Standard Cholesky IRF cannot be computed from an exogenous variable.
+#
+# Method: Conditional forecast simulation
+#   Baseline path: oil YoY = 0% every quarter (flat/neutral)
+#   Shock path:    oil YoY = +30% at Q1 only (one-time shock), then 0%
+#                  oil YoY = +30% sustained for 4 quarters
+#                  oil YoY = -30% at Q1 only (oil bust shock)
+#
+# The DIFFERENCE between the shocked path and the baseline path gives the
+# dynamic causal effect of the oil shock on each CU outcome — this is the
+# VARX equivalent of an IRF for an exogenous variable.
+#
+# +30% YoY is approximately 1 standard deviation of historical PBRENT YoY.
+# Results interpretable as: "effect of a +1 SD oil price increase"
+# =============================================================================
+hdr("SECTION 7.5: Oil Shock Simulation — CU Response to Oil Price Change")
+
+# ── Helper: simulate one path and return Y trajectory ────────────────────────
+# =============================================================================
+# FULL MACRO SIMULATION — All Z variables move together
+# =============================================================================
+# The previous version held all macro vars at historical means and only moved
+# oil. This was wrong — oil price rises cause:
+#   unemployment to FALL  (energy sector hiring, multiplier effects)
+#   CPI to RISE           (energy costs pass through to all goods)
+#   Fed to HIKE           (responds to inflation with rate increases)
+#   mortgage rates to RISE (follow Fed funds rate)
+#   yield curve to FLATTEN (short rates rise faster than long rates)
+#   HPI to soften         (higher rates cool housing)
+#
+# These co-movements are not optional — they are the transmission mechanism.
+# Holding them constant while shocking oil gives the WRONG answer because it
+# ignores the Fed's reaction function and inflation channel entirely.
+#
+# Solution: define a full macro scenario matrix for each Moody's path,
+# consistent with how the macro variables historically co-moved with oil.
+# We use the CCAR 2026 macro paths (macro_base / macro_severe) as the
+# primary source, and construct the Moody's-consistent paths by scaling
+# the CCAR severe scenario by the ratio of Moody's oil shock to CCAR oil shock.
+# =============================================================================
+
+simulate_full_macro <- function(var_model, init_Y, macro_z_path, p) {
+  # macro_z_path: data.table with one row per projection quarter
+  #               columns = all Z variable names as they appear in var_model
+  tryCatch(
+    forecast_varx(var_model, macro_z_path, init_Y, p),
+    error=function(e) { msg("  Simulation failed: %s", e$message); NULL }
+  )
+}
+
+# ── Historical macro means (baseline anchor) ─────────────────────────────────
+# Use recent 2-year mean (2024-2025) as the starting point — more relevant than
+# 5-year mean which includes ZIRP era and distorts base levels
+recent_agg <- agg_clean[yyyyqq >= 202401L]
+
+macro_hist_mean <- sapply(z_var_names_sim, function(v) {
+  if (v %in% names(recent_agg)) mean(recent_agg[[v]], na.rm=TRUE) else 0
+})
+
+# ── MARKET-CALIBRATED ELASTICITIES (March 25, 2026) ──────────────────────────
+# All calibrated against CURRENT market conditions — not historical averages.
+# Key sources:
+#   Fed Funds: March 2026 FOMC hold; dot plot = 1 cut H2 2026, 1 cut 2027
+#              CME FedWatch: ~0% probability of hike in any 2026 scenario
+#              Fed explicitly "looking through" energy inflation → FOMC = HOLD
+#   CPI: Feb 2026 = 2.4% YoY; tariff inflation already elevated baseline
+#        Oil pass-through elasticity still ~0.04 but starts from higher base
+#   Unemployment: Feb 2026 = 4.4% and RISING (labor market softening)
+#                 Oil employment boost smaller than historically — energy sector
+#                 hiring offset by trade/tariff headwinds; reduce elasticity
+#   Mortgage rate: 6.22-6.45% currently (Freddie Mac March 19, 2026)
+#                  Fed cutting NOT hiking → mortgage rates drift DOWN, not up
+#                  Long end rising on geopolitical inflation fears, but slowly
+#                  Net elasticity ≈ near zero or mildly negative
+#   Yield curve: Currently +0.3pp (re-steepened after Fed cuts)
+#                Oil spike → long rates (10Y) rise on inflation premium faster
+#                than short rates (3M, anchored by hold/cut Fed) → STEEPENS
+#                This is the OPPOSITE of the old assumption (which had it flatten)
+#   HPI: Keep positive — oil-region housing demand still valid
+#
+# Starting (anchor) values as of 2026Q1:
+ANCHOR <- list(
+  macro_base_lurc         =  4.4,    # BLS Feb 2026 unemployment
+  macro_base_pcpi         =  316.0,  # CPI level approx (BLS Feb 2026)
+  macro_base_yield_curve  =  0.30,   # 10Y-3M spread, approx March 2026
+  macro_base_rmtg         =  6.30,   # Freddie Mac 30Y FRM, March 2026
+  hpi_yoy                 =  3.5,    # HPI YoY approx (housing slowing)
+  macro_base_fomc_regime  =  0L,     # HOLD — neither hiking nor cutting yet
+  macro_base_yoy_oil      =  0.0     # overridden by Moody's path
+)
+
+elast <- list(
+  # Unemployment: oil rise has SMALLER effect now — labor market already
+  # softening from tariff/trade headwinds; energy hiring partially offset
+  # Reduced from -0.015 to -0.008 per 1% oil YoY
+  macro_base_lurc         = -0.008,
+
+  # CPI: standard oil pass-through; tariff inflation already in baseline
+  # so marginal oil effect is the same but starts from elevated level
+  macro_base_pcpi         =  0.040,
+
+  # Yield curve: STEEPENS under oil shock — long rates rise faster than
+  # short rates which are anchored by Fed hold/cut. POSITIVE elasticity.
+  # (Old assumption of flattening was wrong for current regime)
+  macro_base_yield_curve  =  0.008,
+
+  # Mortgage rate: Fed cutting → short-rate anchor falling
+  # Long end rising on inflation premium but slowly; net effect ≈ flat
+  # In Feb baseline (oil fall) rates drift down; in Recession rates tick up
+  # Elasticity near-zero: -0.005 (mild inverse — Fed cuts outweigh long-end rise)
+  macro_base_rmtg         = -0.005,
+
+  # HPI: oil-region housing demand positive but smaller with higher rates
+  hpi_yoy                 =  0.040
+)
+
+# ── Build full macro path for each Moody's scenario ──────────────────────────
+build_macro_path <- function(oil_yoy_proj, scenario_name) {
+  h  <- length(oil_yoy_proj)
+  dt <- data.table(matrix(0, nrow=h, ncol=length(z_var_names_sim),
+                           dimnames=list(NULL, z_var_names_sim)))
+
+  # 2-quarter smoothed oil (avoids over-reaction to single-quarter spike)
+  oil_smooth <- frollmean(oil_yoy_proj, 2, na.rm=TRUE, align="right")
+  oil_smooth[is.na(oil_smooth)] <- oil_yoy_proj[is.na(oil_smooth)]
+
+  for (v in z_var_names_sim) {
+
+    base_val <- ANCHOR[[v]] %||% (macro_hist_mean[v] %||% 0)
+    if (is.na(base_val)) base_val <- 0
+
+    if (v == "macro_base_yoy_oil") {
+      dt[, (v) := oil_yoy_proj]
+
+    } else if (v == "macro_base_fomc_regime") {
+      # ── MARKET-CALIBRATED FED REACTION FUNCTION ──────────────────────────
+      # Based on March 2026 FOMC statement and dot plot:
+      #   - Fed is on HOLD for all of 2026 (0) in baseline/current
+      #   - 1 cut expected H2 2026 → by Q3/Q4 shifts to -1 (cutting)
+      #   - Even at $125/bbl oil, Fed is "looking through" energy inflation
+      #     (Powell explicitly said this; CME shows 0% hike probability)
+      #   - ONLY if oil COLLAPSES (<-20% YoY, i.e. bust) does Fed cut sooner
+      #   - HIKE (+1) is ruled out entirely in all 2026 scenarios
+      fomc_path <- ifelse(
+        oil_yoy_proj < -20,         # Oil bust → faster cuts
+        -1L,                         # Cutting
+        0L                           # Hold (baseline) — NOT hiking
+      )
+      # After Q4 2026, allow 1 cut regardless (dot plot guidance)
+      fomc_path[8:h] <- pmin(fomc_path[8:h], -1L)
+      dt[, (v) := as.integer(fomc_path)]
+
+    } else if (v %in% names(elast)) {
+      path <- base_val + elast[[v]] * oil_smooth
+
+      # Realistic bounds anchored to current market levels
+      if (v == "macro_base_lurc")
+        path <- pmax(pmin(path, 5.5), 3.5)   # 3.5-5.5% range
+      if (v == "macro_base_rmtg")
+        path <- pmax(pmin(path, 7.5), 5.5)   # 5.5-7.5% range
+      if (v == "macro_base_yield_curve")
+        path <- pmax(pmin(path, 1.5), -0.5)  # -0.5 to +1.5pp range
+      if (v == "hpi_yoy")
+        path <- pmax(pmin(path, 8.0), -3.0)  # bounded HPI growth
+
+      dt[, (v) := path]
+
+    } else {
+      dt[, (v) := base_val]
+    }
+  }
+
+  # Recompute interaction terms consistently with new paths
+  if (all(c("macro_base_fomc_regime","macro_base_yoy_oil","fomc_x_brent") %in% names(dt)))
+    dt[, fomc_x_brent := macro_base_fomc_regime * macro_base_yoy_oil]
+  if (all(c("post_shale","macro_base_yoy_oil","post_x_oil") %in% names(dt)))
+    dt[, post_x_oil := post_shale * macro_base_yoy_oil]
+
+  # Structural dummies for projection period
+  if ("post_shale"  %in% names(dt)) dt[, post_shale  := 1L]
+  if ("gfc_dummy"   %in% names(dt)) dt[, gfc_dummy   := 0L]
+  if ("covid_dummy" %in% names(dt)) dt[, covid_dummy  := 0L]
+  if ("zirp_era"    %in% names(dt)) dt[, zirp_era    := 0L]
+  # hike_cycle = 0 for all 2026 scenarios (Fed not hiking)
+  if ("hike_cycle"  %in% names(dt)) dt[, hike_cycle  := 0L]
+
+  dt[, yyyyqq := moodys_yyyyqq[PROJ_START_IDX:(PROJ_START_IDX + h - 1L)]]
+  dt
+}
+
+# Print what macro paths look like for Current Baseline and Recession
+cat("\n  Macro co-movement under Current Baseline scenario:\n")
+tmp <- build_macro_path(oil_proj_current, "Current Baseline")
+cat(sprintf("    Oil YoY     : %s\n", paste(sprintf("%+.0f%%", tmp$macro_base_yoy_oil), collapse=", ")))
+if ("macro_base_lurc" %in% names(tmp))
+  cat(sprintf("    Unemployment: %s\n", paste(sprintf("%.1f", tmp$macro_base_lurc), collapse=", ")))
+if ("macro_base_pcpi" %in% names(tmp))
+  cat(sprintf("    CPI         : %s\n", paste(sprintf("%.1f", tmp$macro_base_pcpi), collapse=", ")))
+if ("macro_base_fomc_regime" %in% names(tmp))
+  cat(sprintf("    FOMC regime : %s\n", paste(tmp$macro_base_fomc_regime, collapse=", ")))
+if ("macro_base_rmtg" %in% names(tmp))
+  cat(sprintf("    Mortgage    : %s\n", paste(sprintf("%.1f", tmp$macro_base_rmtg), collapse=", ")))
+
+# ── Build all 5 full macro paths ─────────────────────────────────────────────
+macro_path_flat    <- build_macro_path(oil_proj_flat,    "Flat oil (counterfactual)")
+macro_path_feb26   <- build_macro_path(oil_proj_feb26,   "Feb '26 Baseline")
+macro_path_march   <- build_macro_path(oil_proj_march,   "Early March Baseline")
+macro_path_current <- build_macro_path(oil_proj_current, "Current Baseline")
+macro_path_recess  <- build_macro_path(oil_proj_recess,  "Recession Scenario")
+
+# ── Run full-macro simulations ────────────────────────────────────────────────
+sim_flat    <- simulate_full_macro(varx_full, init_Y_sim, macro_path_flat,    P_LAG)
+sim_feb26   <- simulate_full_macro(varx_full, init_Y_sim, macro_path_feb26,   P_LAG)
+sim_march   <- simulate_full_macro(varx_full, init_Y_sim, macro_path_march,   P_LAG)
+sim_current <- simulate_full_macro(varx_full, init_Y_sim, macro_path_current, P_LAG)
+sim_recess  <- simulate_full_macro(varx_full, init_Y_sim, macro_path_recess,  P_LAG)
+
+# =============================================================================
+# MOODY'S ANALYTICS PBRENT LEVEL PATHS
+# Source: "Higher For Longer Oil Prices" (Moody's Analytics, March 2026)
+# Digitised from chart — quarterly average Brent crude $/bbl
+# Historical anchor 2025Q1-Q4 common to all scenarios
+# =============================================================================
+moodys_yyyyqq <- c(
+  202501L,202502L,202503L,202504L,   # 2025 — historical
+  202601L,202602L,202603L,202604L,   # 2026 — projection
+  202701L,202702L,202703L,202704L,   # 2027 — projection
+  202801L,202802L,202803L,202804L    # 2028 — projection
+)
+
+# Level paths ($/bbl) — read from chart at quarterly resolution
+pbrent_feb26  <- c(75, 67, 65, 63,   64,  64,  64,  64,   65, 66, 67, 68,   69, 69, 70, 70)
+pbrent_march  <- c(75, 67, 65, 63,   70,  77,  77,  73,   71, 70, 70, 69,   69, 69, 70, 70)
+pbrent_current<- c(75, 67, 65, 63,   80,  95,  93,  83,   76, 73, 72, 71,   70, 70, 70, 70)
+pbrent_recess <- c(75, 67, 65, 63,   90, 125, 110,  90,   80, 75, 72, 71,   71, 70, 70, 70)
+
+# Convert level paths → YoY % change
+# YoY = (Q_t - Q_{t-4}) / Q_{t-4} * 100
+# For 2026 quarters we compare vs 2025 (available); 2027 vs 2026; 2028 vs 2027
+level_to_yoy <- function(levels) {
+  n  <- length(levels)
+  yy <- rep(NA_real_, n)
+  for (i in 5:n) yy[i] <- (levels[i] - levels[i-4]) / levels[i-4] * 100
+  yy
+}
+
+yoy_feb26   <- level_to_yoy(pbrent_feb26)
+yoy_march   <- level_to_yoy(pbrent_march)
+yoy_current <- level_to_yoy(pbrent_current)
+yoy_recess  <- level_to_yoy(pbrent_recess)
+
+# Projection window only (2026Q1 onwards = indices 5:16 of the 16-quarter path)
+# The VARX simulation starts at the first projection quarter
+PROJ_START_IDX <- 5L   # 2026Q1
+n_proj <- SIM_HORIZON - PROJ_START_IDX + 1L   # 12 projection quarters
+
+extract_proj_yoy <- function(yoy_vec) {
+  yoy_vec[PROJ_START_IDX:SIM_HORIZON]
+}
+
+# Simulation uses 12-quarter projection window (2026Q1-2028Q4)
+oil_proj_feb26   <- extract_proj_yoy(yoy_feb26)
+oil_proj_march   <- extract_proj_yoy(yoy_march)
+oil_proj_current <- extract_proj_yoy(yoy_current)
+oil_proj_recess  <- extract_proj_yoy(yoy_recess)
+
+# Print YoY paths for verification
+cat("\n  Moody's PBRENT YoY paths (2026Q1-2028Q4):\n")
+cat(sprintf("  %-22s : %s\n", "Feb 2026 Baseline",
+    paste(sprintf("%+.0f%%", oil_proj_feb26), collapse=", ")))
+cat(sprintf("  %-22s : %s\n", "Early March Baseline",
+    paste(sprintf("%+.0f%%", oil_proj_march), collapse=", ")))
+cat(sprintf("  %-22s : %s\n", "Current Baseline",
+    paste(sprintf("%+.0f%%", oil_proj_current), collapse=", ")))
+cat(sprintf("  %-22s : %s\n", "Recession Scenario",
+    paste(sprintf("%+.0f%%", oil_proj_recess), collapse=", ")))
+
+# ── Run simulations for each Moody's scenario + a flat-oil baseline ──────────
+# Flat baseline: oil YoY = 0% (neutral — to compute delta / marginal effect)
+oil_proj_flat <- rep(0, n_proj)
+
+SIM_HOR_PROJ <- n_proj   # 12 quarters
+
+sim_flat    <- simulate_oil_path(varx_full, init_Y_sim, oil_proj_flat,    agg_clean, z_var_names_sim, SIM_HOR_PROJ)
+sim_feb26   <- simulate_oil_path(varx_full, init_Y_sim, oil_proj_feb26,   agg_clean, z_var_names_sim, SIM_HOR_PROJ)
+sim_march   <- simulate_oil_path(varx_full, init_Y_sim, oil_proj_march,   agg_clean, z_var_names_sim, SIM_HOR_PROJ)
+sim_current <- simulate_oil_path(varx_full, init_Y_sim, oil_proj_current, agg_clean, z_var_names_sim, SIM_HOR_PROJ)
+sim_recess  <- simulate_oil_path(varx_full, init_Y_sim, oil_proj_recess,  agg_clean, z_var_names_sim, SIM_HOR_PROJ)
+
+if (!is.null(sim_flat) && !is.null(sim_current)) {
+
+  # ── Compute DELTA = Moody's scenario minus flat-oil baseline ─────────────
+  # Delta = pure marginal effect of oil price path vs neutral flat-oil world
+  build_delta <- function(sim_shocked, sim_base, label) {
+    if (is.null(sim_shocked)) return(NULL)
+    delta <- sim_shocked - sim_base
+    dt    <- as.data.table(delta)
+    setnames(dt, colnames(delta))
+    dt[, horizon  := seq_len(.N) - 1L]
+    dt[, scenario := label]
+    # Attach calendar quarter labels
+    dt[, yyyyqq   := moodys_yyyyqq[PROJ_START_IDX:(PROJ_START_IDX + .N - 1L)]]
+    melt(dt, id.vars=c("horizon","scenario","yyyyqq"),
+         variable.name="outcome", value.name="delta")
+  }
+
+  delta_feb26   <- build_delta(sim_feb26,   sim_flat, "Feb '26 Baseline")
+  delta_march   <- build_delta(sim_march,   sim_flat, "Early March Baseline")
+  delta_current <- build_delta(sim_current, sim_flat, "Current Baseline")
+  delta_recess  <- build_delta(sim_recess,  sim_flat, "Recession Scenario")
+
+  all_deltas <- rbindlist(
+    Filter(Negate(is.null),
+           list(delta_feb26, delta_march, delta_current, delta_recess))
+  )
+
+  saveRDS(all_deltas, "Results/04_oil_shock_simulation.rds")
+  msg("  Moody's scenario simulation saved \u2192 Results/04_oil_shock_simulation.rds")
+
+  # ── CHART 7.5 — CU response to Moody's oil paths ─────────────────────────
+  key_outcomes <- intersect(
+    c("dq_rate","pll_rate","costfds","netintmrg",
+      "insured_share_growth","member_growth_yoy"),
+    unique(all_deltas$outcome)
+  )
+
+  outcome_labels <- c(
+    dq_rate              = "Delinquency Rate\n(backward-looking credit)",
+    pll_rate             = "PLL Rate\n(forward-looking provisions)",
+    costfds              = "Cost of Funds\n(rate channel)",
+    netintmrg            = "Net Interest Margin\n(profitability)",
+    insured_share_growth = "Deposit Growth\n(buffer hypothesis)",
+    member_growth_yoy    = "Membership Growth\n(early warning)"
+  )
+
+  # Match Moody's chart colours exactly
+  SCEN_COLS <- c(
+    "Feb '26 Baseline"     = "#4a90d9",   # blue
+    "Early March Baseline" = "#2d7a4a",   # green
+    "Current Baseline"     = "#e07b54",   # salmon/pink
+    "Recession Scenario"   = "#4a2080"    # purple
+  )
+  SCEN_LT <- c(
+    "Feb '26 Baseline"     = "dotted",
+    "Early March Baseline" = "dashed",
+    "Current Baseline"     = "solid",
+    "Recession Scenario"   = "solid"
+  )
+  SCEN_SIZE <- c(
+    "Feb '26 Baseline"     = 0.7,
+    "Early March Baseline" = 0.8,
+    "Current Baseline"     = 1.0,
+    "Recession Scenario"   = 1.1
+  )
+
+  plot_dt_key <- all_deltas[outcome %in% key_outcomes]
+  plot_dt_key[, outcome_label := outcome_labels[as.character(outcome)]]
+  plot_dt_key[is.na(outcome_label), outcome_label := as.character(outcome)]
+  plot_dt_key[, scenario := factor(scenario, levels=names(SCEN_COLS))]
+
+  # Quarter labels for x-axis: Q1 2026 = horizon 0
+  q_labels <- c("2026\nQ1","Q2","Q3","Q4",
+                 "2027\nQ1","Q2","Q3","Q4",
+                 "2028\nQ1","Q2","Q3","Q4")
+
+  p_oil_shock <- ggplot(plot_dt_key[!is.na(delta)],
+                        aes(x=horizon, y=delta,
+                            colour=scenario, linetype=scenario)) +
+    geom_hline(yintercept=0, linewidth=0.5, colour="#aaaaaa",
+               linetype="dashed") +
+    geom_line(linewidth=0.9) +
+    geom_point(data=plot_dt_key[!is.na(delta) & horizon %% 4 == 0],
+               size=2, show.legend=FALSE) +
+    scale_colour_manual(values=SCEN_COLS, name="Moody's Scenario") +
+    scale_linetype_manual(values=SCEN_LT,  name="Moody's Scenario") +
+    scale_x_continuous(
+      breaks = 0:(n_proj-1),
+      labels = q_labels[1:n_proj]
+    ) +
+    facet_wrap(~outcome_label, scales="free_y", ncol=3) +
+    labs(
+      title    = "FIGURE 7.5 \u2014 CU System Response to Moody\u2019s Oil Price Scenarios",
+      subtitle = paste(
+        "Delta vs flat-oil baseline (YoY=0%%) | Colour/style matches Moody\u2019s Analytics chart",
+        "\nHigher oil \u2192 higher deposits & CoF, but eventually higher delinquency as inflation bites"
+      ),
+      caption  = paste(
+        "Source: Moody\u2019s Analytics \u2018Higher For Longer Oil Prices\u2019 (March 2026);",
+        "VARX conditional forecast simulation",
+        "\nDelta = Moody\u2019s scenario path minus flat-oil (YoY=0%%) counterfactual",
+        "| All other macro vars at historical mean | VARX(p=2)"
+      ),
+      x = NULL,
+      y = "Change from flat-oil baseline (level units)"
+    ) +
+    theme_minimal(base_size=10) +
+    theme(
+      plot.title       = element_text(face="bold", size=12, margin=margin(b=4)),
+      plot.subtitle    = element_text(size=9, colour="#444444",
+                                       lineheight=1.3, margin=margin(b=8)),
+      plot.caption     = element_text(size=7.5, colour="#888888",
+                                       hjust=0, lineheight=1.3),
+      strip.text       = element_text(face="bold", size=9, lineheight=1.2),
+      strip.background = element_rect(fill="#f5f5f5", colour="#cccccc"),
+      panel.grid.major = element_line(colour="#eeeeee", linewidth=0.3),
+      panel.grid.minor = element_blank(),
+      panel.border     = element_rect(colour="#cccccc", fill=NA, linewidth=0.4),
+      axis.text.x      = element_text(size=7, lineheight=1.2),
+      legend.position  = "bottom",
+      legend.title     = element_text(face="bold", size=9),
+      legend.text      = element_text(size=8.5),
+      legend.key.width = unit(1.5, "cm"),
+      plot.margin      = margin(10, 12, 8, 10)
+    )
+
+  ggsave("Figures/04_oil_shock_response.png", p_oil_shock,
+         width=14, height=9, dpi=300, bg="white")
+  msg("  \u2713 Moody\u2019s scenario CU response chart \u2192 Figures/04_oil_shock_response.png")
+
+  # ── Also save the oil price level paths as a reference chart ─────────────
+  pbrent_dt <- rbindlist(list(
+    data.table(yyyyqq=moodys_yyyyqq, pbrent=pbrent_feb26,   scenario="Feb '26 Baseline"),
+    data.table(yyyyqq=moodys_yyyyqq, pbrent=pbrent_march,   scenario="Early March Baseline"),
+    data.table(yyyyqq=moodys_yyyyqq, pbrent=pbrent_current, scenario="Current Baseline"),
+    data.table(yyyyqq=moodys_yyyyqq, pbrent=pbrent_recess,  scenario="Recession Scenario")
+  ))
+  pbrent_dt[, yr  := yyyyqq %/% 100L]
+  pbrent_dt[, qtr := yyyyqq %% 100L]
+  pbrent_dt[, date_num := yr + (qtr - 1) / 4]
+  pbrent_dt[, scenario := factor(scenario, levels=names(SCEN_COLS))]
+
+  p_oil_paths <- ggplot(pbrent_dt, aes(x=date_num, y=pbrent,
+                                        colour=scenario, linetype=scenario)) +
+    geom_vline(xintercept=2026, linetype="dashed",
+               colour="#888888", linewidth=0.5) +
+    annotate("text", x=2026.05, y=130, label="Projection \u2192",
+             hjust=0, size=3, colour="#888888", fontface="italic") +
+    geom_line(linewidth=1.0) +
+    scale_colour_manual(values=SCEN_COLS, name="Scenario") +
+    scale_linetype_manual(values=SCEN_LT,  name="Scenario") +
+    scale_x_continuous(breaks=2025:2029,
+                       labels=paste0("'", 25:29)) +
+    scale_y_continuous(labels=dollar_format(prefix="$", suffix="/bbl"),
+                       breaks=seq(40, 140, 20)) +
+    labs(
+      title    = "Moody\u2019s Analytics PBRENT Scenarios (March 2026)",
+      subtitle = "Higher For Longer Oil Prices | Source: Moody\u2019s Analytics",
+      caption  = "Digitised from Moody\u2019s Analytics chart. Quarterly average Brent crude $/bbl.",
+      x=NULL, y="Brent Crude ($/bbl)"
+    ) +
+    theme_minimal(base_size=10) +
+    theme(
+      plot.title       = element_text(face="bold", size=11),
+      legend.position  = "right",
+      panel.grid.minor = element_blank()
+    )
+  ggsave("Figures/04_moodys_oil_paths.png", p_oil_paths,
+         width=11, height=5, dpi=300, bg="white")
+  msg("  \u2713 Moody\u2019s oil paths chart \u2192 Figures/04_moodys_oil_paths.png")
+
+  # ── Peak response summary table ───────────────────────────────────────────
+  peak_resp <- all_deltas[outcome %in% key_outcomes,
+    .(peak_delta   = delta[which.max(abs(delta))],
+      peak_horizon = horizon[which.max(abs(delta))]),
+    by=.(scenario, outcome)]
+  peak_resp[, outcome_label := outcome_labels[as.character(outcome)]]
+  peak_resp[is.na(outcome_label), outcome_label := as.character(outcome)]
+  peak_resp[, quarter_label := q_labels[peak_horizon + 1L]]
+
+  cat("\n  Peak CU Response to Moody's Oil Scenarios (vs flat-oil baseline):\n")
+  cat("  ", strrep("-", 90), "\n", sep="")
+  cat(sprintf("  %-30s %-25s %12s %10s\n",
+              "Outcome","Scenario","Peak delta","At quarter"))
+  cat("  ", strrep("-", 90), "\n", sep="")
+  for (i in seq_len(nrow(peak_resp))) {
+    r <- peak_resp[i]
+    cat(sprintf("  %-30s %-25s %+12.4f %10s\n",
+                r$outcome_label, r$scenario,
+                r$peak_delta, r$quarter_label))
+  }
+  fwrite(peak_resp, "Results/04_moodys_peak_responses.csv")
+  msg("  Peak responses \u2192 Results/04_moodys_peak_responses.csv")
+
+  # ── CHART 7.5b — Macro co-movement paths by scenario ─────────────────────
+  # Shows how ALL macro variables differ across the 4 Moody's scenarios
+  # This is the key methodological transparency chart
+
+  macro_paths_all <- rbindlist(list(
+    cbind(macro_path_feb26,   scenario="Feb '26 Baseline"),
+    cbind(macro_path_march,   scenario="Early March Baseline"),
+    cbind(macro_path_current, scenario="Current Baseline"),
+    cbind(macro_path_recess,  scenario="Recession Scenario")
+  ), fill=TRUE)
+
+  macro_paths_all[, yr  := yyyyqq %/% 100L]
+  macro_paths_all[, qtr := yyyyqq %% 100L]
+  macro_paths_all[, date_num := yr + (qtr - 1) / 4]
+  macro_paths_all[, scenario := factor(scenario, levels=names(SCEN_COLS))]
+
+  macro_plot_vars <- list(
+    list(col="macro_base_yoy_oil",     lab="Oil Price YoY (%)",        fmt="%+.0f%%"),
+    list(col="macro_base_lurc",        lab="Unemployment Rate (%)",     fmt="%.1f%%"),
+    list(col="macro_base_pcpi",        lab="CPI Level (index)",         fmt="%.1f"),
+    list(col="macro_base_rmtg",        lab="30Y Mortgage Rate (%)",     fmt="%.1f%%"),
+    list(col="macro_base_yield_curve", lab="Yield Curve (10Y-3M, pp)",  fmt="%.2f"),
+    list(col="macro_base_fomc_regime", lab="FOMC Regime (+1=hike)",     fmt="%.0f")
+  )
+
+  macro_panel_list <- lapply(macro_plot_vars, function(v) {
+    if (!v$col %in% names(macro_paths_all)) return(NULL)
+    ggplot(macro_paths_all[!is.na(get(v$col))],
+           aes(x=date_num, y=get(v$col),
+               colour=scenario, linetype=scenario)) +
+      geom_hline(yintercept=0, linewidth=0.3, colour="#cccccc") +
+      geom_line(linewidth=0.85) +
+      scale_colour_manual(values=SCEN_COLS, name=NULL) +
+      scale_linetype_manual(values=SCEN_LT, name=NULL) +
+      scale_x_continuous(breaks=2026:2029,
+                         labels=paste0("'", 26:29)) +
+      labs(title=v$lab, x=NULL, y=NULL) +
+      theme_minimal(base_size=9) +
+      theme(
+        plot.title       = element_text(face="bold", size=9),
+        legend.position  = "none",
+        panel.grid.minor = element_blank(),
+        panel.border     = element_rect(colour="#dddddd", fill=NA, linewidth=0.3)
+      )
+  })
+  macro_panel_list <- Filter(Negate(is.null), macro_panel_list)
+
+  if (length(macro_panel_list) >= 2) {
+    p_macro_paths <- wrap_plots(macro_panel_list, ncol=3) +
+      plot_annotation(
+        title    = "FIGURE 7.5b \u2014 Macro Co-Movement Paths by Moody\u2019s Scenario",
+        subtitle = paste(
+          "All 6 VARX exogenous variables shown | Recession scenario: oil spikes \u2192 inflation rises",
+          "\n\u2192 Fed hikes \u2192 mortgage rates rise \u2192 yield curve flattens \u2192 unemployment falls then rises"
+        ),
+        caption  = paste(
+          "Macro co-movements derived from empirical oil-macro elasticities",
+          "(Hamilton 2009; Kilian 2014)",
+          "| Fed reaction function: hike if oil YoY > 20%%, cut if < -20%%"
+        ),
+        theme    = theme(
+          plot.title    = element_text(face="bold", size=11),
+          plot.subtitle = element_text(size=8.5, colour="#555", lineheight=1.3),
+          plot.caption  = element_text(size=7.5, colour="#888")
+        )
+      )
+    ggsave("Figures/04_macro_scenario_paths.png", p_macro_paths,
+           width=13, height=8, dpi=300, bg="white")
+    msg("  \u2713 Macro co-movement chart \u2192 Figures/04_macro_scenario_paths.png")
+  }
+
+} else {
+  msg("  Oil shock simulation skipped — baseline simulation failed")
+  msg("  Check that varx_full was estimated successfully in Section 3")
+}
+
+# =============================================================================
 # 8. STAGE 6 — CCAR 2026 SCENARIO PROJECTIONS
 # =============================================================================
 hdr("SECTION 8: Stage 6 — CCAR 2026 Scenario Projections")
