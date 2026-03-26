@@ -208,8 +208,9 @@ grid_search_one <- function(v) {
   dtrain <- xgb.DMatrix(X_train[idx_tr, ],  label=y_all[idx_tr])
   dval   <- xgb.DMatrix(X_train[idx_val, ], label=y_all[idx_val])
 
-  best_rmse <- Inf
-  best_row  <- 1L
+  best_rmse    <- Inf
+  best_row     <- 1L
+  best_nrounds <- 100L   # initialise here — avoids scoping issue if all fits fail
 
   for (i in seq_len(nrow(GRID))) {
     params <- list(
@@ -225,27 +226,50 @@ grid_search_one <- function(v) {
     )
     cv_fit <- tryCatch(
       xgb.train(
-        params    = params,
-        data      = dtrain,
-        nrounds   = NROUNDS_MAX,
-        watchlist = list(val=dval),
+        params                = params,
+        data                  = dtrain,
+        nrounds               = NROUNDS_MAX,
+        evals                 = list(val=dval),   # watchlist → evals (xgboost >= 1.7)
         early_stopping_rounds = EARLY_STOP_ROUNDS,
-        verbose   = 0L
+        verbose               = 0L
       ),
       error = function(e) NULL
     )
     if (!is.null(cv_fit)) {
-      val_rmse <- cv_fit$best_score
-      if (!is.na(val_rmse) && val_rmse < best_rmse) {
-        best_rmse <- val_rmse
-        best_row  <- i
+      # best_score may be stored differently across xgboost versions
+      # try $best_score first, fall back to reading evaluation log
+      val_rmse <- tryCatch({
+        s <- cv_fit$best_score
+        if (is.null(s) || length(s) == 0) {
+          # newer xgboost: read from evaluation log
+          log <- cv_fit$evaluation_log
+          if (!is.null(log) && "val_rmse" %in% names(log))
+            min(log$val_rmse, na.rm=TRUE)
+          else
+            NA_real_
+        } else {
+          as.numeric(s)
+        }
+      }, error = function(e) NA_real_)
+
+      if (!is.null(val_rmse) && length(val_rmse) == 1 &&
+          is.finite(val_rmse) && val_rmse < best_rmse) {
+        best_rmse    <- val_rmse
+        best_row     <- i
+        best_nrounds <- tryCatch(
+          as.integer(cv_fit$best_iteration),
+          error = function(e) NROUNDS_MAX
+        )
+        if (is.na(best_nrounds) || best_nrounds < 1L)
+          best_nrounds <- 100L
       }
     }
   }
 
-  list(best_row=best_row, best_rmse=best_rmse,
-       best_params=GRID[best_row, ],
-       best_nrounds=if (!is.null(cv_fit)) cv_fit$best_iteration else 100L)
+  list(best_row     = best_row,
+       best_rmse    = best_rmse,
+       best_params  = GRID[best_row, ],
+       best_nrounds = best_nrounds)
 }
 
 # Run grid search for all outcomes
