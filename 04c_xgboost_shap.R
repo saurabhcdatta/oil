@@ -888,22 +888,31 @@ PATHWAY_COLS <- c(
 pathway_map <- data.table(feature=feature_cols, pathway="Other")
 pathway_map[feature == "macro_base_yoy_oil",
             pathway := "Direct oil price"]
-pathway_map[grepl("fomc_x_brent|post_x_oil|zirp_x_oil", feature),
+pathway_map[grepl("fomc_x_brent|post_x_oil|zirp_x_oil|oil_x_|x_oil", feature),
             pathway := "Interaction (oil x regime)"]
-pathway_map[grepl("macro_base_lurc", feature),
+pathway_map[grepl("lurc|unemp|unemploy", feature, ignore.case=TRUE),
             pathway := "Indirect: Labour market"]
-pathway_map[grepl("macro_base_pcpi", feature),
+pathway_map[grepl("pcpi|cpi|inflation", feature, ignore.case=TRUE),
             pathway := "Indirect: Inflation (CPI)"]
-pathway_map[grepl("macro_base_fomc_regime|macro_base_yield_curve|macro_base_rmtg", feature),
+pathway_map[grepl("fomc|yield_curve|rmtg|mortgage|fed_funds|rate_regime", feature,
+                   ignore.case=TRUE),
             pathway := "Indirect: Rate channel"]
-pathway_map[grepl("hpi_yoy", feature),
+pathway_map[grepl("hpi|house_price|home_price", feature, ignore.case=TRUE),
             pathway := "Indirect: Housing"]
 pathway_map[grepl("_lag", feature),
             pathway := "Indirect: Balance sheet lags"]
 
-# Verify classifications
+# Diagnostic: show what matched where
 msg("Pathway feature counts:")
 print(pathway_map[, .N, by=pathway][order(-N)])
+msg("Direct oil features: %s",
+    paste(pathway_map[pathway=="Direct oil price", feature], collapse=", "))
+msg("Rate channel features: %s",
+    paste(pathway_map[pathway=="Indirect: Rate channel", feature], collapse=", "))
+msg("Labour features: %s",
+    paste(pathway_map[pathway=="Indirect: Labour market", feature], collapse=", "))
+msg("CPI features: %s",
+    paste(pathway_map[pathway=="Indirect: Inflation (CPI)", feature], collapse=", "))
 
 # Build obs-level pathway totals using safe short codes
 # Returns a data.table with one col per pathway code per outcome variable
@@ -911,14 +920,15 @@ build_pathway_dt <- function(v, obs_idx=NULL) {
   sv <- shap_results[[v]]
   if (!is.null(obs_idx)) sv <- sv[obs_idx, , drop=FALSE]
   n  <- nrow(sv)
-  out <- data.table(outcome=v)
+  # Initialise with n rows — one column per pathway code
+  out <- data.table(outcome = rep(v, n))
   for (code in names(PATHWAY_LABELS)) {
     lbl <- PATHWAY_LABELS[code]
-    fp  <- intersect(pathway_map[pathway==lbl, feature], colnames(sv))
-    if (length(fp) > 0)
-      out[[code]] <- rowSums(sv[, fp, drop=FALSE], na.rm=TRUE)
+    fp  <- intersect(pathway_map[pathway == lbl, feature], colnames(sv))
+    out[[code]] <- if (length(fp) > 0)
+      rowSums(sv[, fp, drop=FALSE], na.rm=TRUE)
     else
-      out[[code]] <- rep(0, n)
+      rep(0, n)
   }
   out
 }
