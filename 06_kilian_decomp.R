@@ -363,22 +363,37 @@ msg("Non-missing shocks: %s", paste(
   sapply(shock_cols, function(s) sum(!is.na(panel[[s]]))),
   collapse=", "))
 
-# ── CRITICAL: Sanitize panel — remove any non-atomic columns ─────────────────
-# A fixest object from a prior session can be stored as a panel column.
-# lm()/sandwich() calls round_any() during model fitting and fail on non-numeric.
+# ── CRITICAL: Sanitize panel — strip Stata labels and non-atomic columns ─────
+# Panel loaded from .rds may retain haven_labelled columns from read_dta()
+# as.double() fails on haven_labelled; must zap labels first.
+# Also removes any fixest/lm objects that leaked into columns.
+
+# Step 1: Strip haven labels from all columns
+if (requireNamespace("haven", quietly=TRUE)) {
+  panel <- haven::zap_labels(panel)
+  panel <- haven::zap_formats(panel)
+}
+
+# Step 2: Drop any remaining non-atomic columns
 bad_cols <- names(panel)[sapply(names(panel), function(cn) {
   x <- panel[[cn]]
-  !is.atomic(x) || inherits(x, "fixest") || inherits(x, "lm") ||
-  is.list(x) && !is.data.frame(x)
+  !is.atomic(x) || inherits(x, "fixest") || inherits(x, "lm")
 })]
 if (length(bad_cols) > 0) {
-  msg("Dropping %d non-atomic panel columns: %s",
+  msg("Dropping %d non-atomic columns: %s",
       length(bad_cols), paste(bad_cols, collapse=", "))
   panel[, (bad_cols) := NULL]
 }
-# Force all numeric columns to plain double
-num_cols <- names(panel)[sapply(panel, is.numeric)]
-for (cn in num_cols) set(panel, j=cn, value=as.double(panel[[cn]]))
+
+# Step 3: Force all numeric-ish columns to plain double
+for (cn in names(panel)) {
+  x <- panel[[cn]]
+  if (is.numeric(x) || inherits(x, "haven_labelled")) {
+    tryCatch(
+      set(panel, j=cn, value=as.double(x)),
+      error=function(e) NULL)   # skip if conversion fails
+  }
+}
 
 # ── 4.1 Regression helper (same as 04d pattern) ──────────────────────────────
 run_shock_reg <- function(y, shock_var, data) {
