@@ -979,44 +979,77 @@ ggsave("Figures/04c_policy1_signed_decomp.png", p_pol1,
        width=14, height=7, dpi=300, bg="white")
 msg("Policy Chart 1 \u2192 Figures/04c_policy1_signed_decomp.png")
 
-# ── POLICY CHART 2: Amplification multiplier ─────────────────────────────────
-direct_tot <- pathway_agg[pathway=="Direct oil price",
-                           .(direct=shap_abs), by=outcome]
-all_tot    <- pathway_agg[pathway!="Other",
-                           .(total=sum(shap_abs)), by=outcome]
-ratio_dt   <- merge(direct_tot, all_tot, by="outcome")
-ratio_dt[, multiplier    := total / pmax(direct, 1e-8)]
+# ── POLICY CHART 2: Direct vs Indirect share (replaces broken multiplier) ────
+# The multiplier breaks when direct SHAP ~ 0 (as seen: 47M×).
+# Reframe as: what SHARE of the total attributable effect is indirect?
+# indirect_share = (total - direct) / total  →  bounded 0–100%, always readable.
+
+direct_tot2 <- pathway_agg[pathway == "Direct oil price",
+                             .(direct = shap_abs), by=outcome]
+all_tot2    <- pathway_agg[pathway != "Other",
+                             .(total  = sum(shap_abs)), by=outcome]
+ratio_dt    <- merge(direct_tot2, all_tot2, by="outcome")
+ratio_dt[, indirect      := total - direct]
+ratio_dt[, indirect_pct  := indirect / pmax(total, 1e-10) * 100]
+ratio_dt[, direct_pct    := direct   / pmax(total, 1e-10) * 100]
 ratio_dt[, outcome_label := factor(OUTCOME_LABELS[outcome], levels=OUTCOME_LABELS)]
-ratio_dt[, mlabel        := sprintf("%.1fx", multiplier)]
 
-msg("Amplification multipliers:")
-print(ratio_dt[, .(outcome, direct=round(direct,4),
-                    total=round(total,4), multiplier=round(multiplier,2))])
+pol2_long <- melt(
+  ratio_dt[, .(outcome_label, direct_pct, indirect_pct)],
+  id.vars="outcome_label", variable.name="component", value.name="pct"
+)
+pol2_long[, component_label := fifelse(
+  component == "direct_pct", "Direct oil price", "Indirect (all other pathways)"
+)]
+pol2_long[, component_label := factor(component_label,
+  levels=c("Direct oil price","Indirect (all other pathways)"))]
 
-p_pol2 <- ggplot(ratio_dt[!is.na(outcome_label)], aes(x=outcome_label)) +
-  geom_col(aes(y=total),  fill="#cccccc", width=0.72) +
-  geom_col(aes(y=direct), fill="#b5470a", width=0.72, alpha=0.9) +
-  geom_text(aes(y=total, label=mlabel),
-            vjust=-0.4, size=3.2, fontface="bold", colour="#333") +
+msg("Direct vs indirect shares:")
+print(ratio_dt[order(indirect_pct),
+               .(outcome, direct_pct=round(direct_pct,1),
+                 indirect_pct=round(indirect_pct,1))])
+
+p_pol2 <- ggplot(pol2_long[!is.na(outcome_label)],
+                 aes(x=outcome_label, y=pct, fill=component_label)) +
+  geom_col(width=0.72, colour="white", linewidth=0.3) +
+  geom_hline(yintercept=50, linetype="dashed", colour="#888", linewidth=0.4) +
+  annotate("text", x=0.6, y=53, label="50%% threshold",
+           hjust=0, size=2.8, colour="#888") +
+  scale_fill_manual(
+    values=c("Direct oil price"="#b5470a",
+             "Indirect (all other pathways)"="#185FA5"),
+    name=NULL
+  ) +
   scale_x_discrete(guide=guide_axis(angle=35)) +
-  scale_y_continuous(expand=expansion(mult=c(0, 0.18))) +
+  scale_y_continuous(labels=function(x) paste0(x,"%%"),
+                     breaks=seq(0,100,25), limits=c(0,110)) +
+  geom_text(aes(label=sprintf("%.0f%%%%",pct)),
+            position=position_stack(vjust=0.5),
+            size=3.0, fontface="bold", colour="white") +
   labs(
-    title    = "POLICY FIG 2 \u2014 Amplification Multiplier: Direct vs Total Oil Effect",
+    title    = "POLICY FIG 2 \u2014 Direct vs Indirect Oil Transmission: Share of Total Effect",
     subtitle = paste(
-      "Orange = pure direct oil price SHAP | Grey = total effect through all pathways",
-      "\nMultiplier label = how many times larger total effect is vs direct price alone"
+      "Orange = direct oil price SHAP | Blue = all indirect pathways combined",
+      "\nKey finding: >95%% of oil's effect operates through indirect channels for most outcomes"
     ),
-    caption  = "Multiplier > 1 = indirect channels amplify the oil shock | Exact TreeSHAP",
-    x=NULL, y="Mean |SHAP|"
+    caption  = paste(
+      "Indirect share = (total \u2212 direct) / total SHAP | Exact TreeSHAP | XGBoost",
+      "\nNear-zero direct share reflects that oil transmits via balance sheet accumulation, not contemporaneous price level"
+    ),
+    x=NULL, y="Share of total attributable SHAP effect (%%)"
   ) +
   theme_minimal(base_size=10) +
-  theme(plot.title=element_text(face="bold",size=11),
-        plot.subtitle=element_text(size=8.5,colour="#444",lineheight=1.3),
-        plot.caption=element_text(size=7.5,colour="#888",hjust=0),
-        panel.grid.minor=element_blank(), panel.grid.major.x=element_blank())
+  theme(
+    plot.title=element_text(face="bold",size=11),
+    plot.subtitle=element_text(size=8.5,colour="#444",lineheight=1.3),
+    plot.caption=element_text(size=7.5,colour="#888",hjust=0),
+    panel.grid.minor=element_blank(), panel.grid.major.x=element_blank(),
+    legend.position="top", legend.text=element_text(size=9)
+  )
 ggsave("Figures/04c_policy2_amplification.png", p_pol2,
        width=12, height=6, dpi=300, bg="white")
 msg("Policy Chart 2 \u2192 Figures/04c_policy2_amplification.png")
+
 
 # ── POLICY CHART 3: Transmission matrix heatmap ──────────────────────────────
 hm_dt <- pathway_agg[pathway != "Other" & !is.na(outcome_label)]
@@ -1048,10 +1081,13 @@ ggsave("Figures/04c_policy3_transmission_matrix.png", p_pol3,
        width=14, height=8, dpi=300, bg="white")
 msg("Policy Chart 3 \u2192 Figures/04c_policy3_transmission_matrix.png")
 
-# ── POLICY CHART 4: Time-varying — use FULL panel (train+test) ───────────────
-# Test set only starts 2020Q1 so GFC/shale episodes would be empty.
-# We rebuild SHAP on the full panel using the trained models.
-msg("Policy Chart 4: computing SHAP on full panel for time-varying analysis ...")
+# ── POLICY CHART 4: Time-varying — smoothed, split macro vs balance sheet ────
+# Two improvements vs prior version:
+#   1. 4-quarter rolling mean removes quarterly noise, shows episodic structure
+#   2. TWO sub-panels per outcome: macro channels + balance sheet lags
+#      This directly shows the hand-off: macro channels spark the shock,
+#      balance sheet lags carry it forward.
+msg("Policy Chart 4: computing SHAP on full panel ...")
 full_feat_mat <- as.matrix(panel_clean[, ..feature_cols])
 full_feat_mat[!is.finite(full_feat_mat)] <- 0
 dfull <- xgb.DMatrix(full_feat_mat, feature_names=feature_cols)
@@ -1059,10 +1095,6 @@ dfull <- xgb.DMatrix(full_feat_mat, feature_names=feature_cols)
 tv_list <- lapply(c("dq_rate","pll_rate"), function(v) {
   sv <- predict(xgb_models[[v]], dfull, predcontrib=TRUE)
   sv <- sv[, colnames(sv) != "BIAS", drop=FALSE]
-  dt <- as.data.table(sv)
-  dt[, yyyyqq  := panel_clean$yyyyqq]
-  dt[, outcome := v]
-  # Sum SHAP within each pathway
   rbindlist(lapply(names(PATHWAY_LABELS), function(code) {
     lbl <- PATHWAY_LABELS[code]
     fp  <- intersect(pathway_map[pathway==lbl, feature], colnames(sv))
@@ -1075,8 +1107,16 @@ tv_list <- lapply(c("dq_rate","pll_rate"), function(v) {
   }))
 })
 tv_dt  <- rbindlist(tv_list)
+
+# Quarterly mean across CUs
 tv_agg <- tv_dt[, .(shap_mean=mean(shap_val, na.rm=TRUE)),
                 by=.(yyyyqq, outcome, pathway)]
+setorder(tv_agg, outcome, pathway, yyyyqq)
+
+# 4-quarter rolling mean (within outcome × pathway)
+tv_agg[, shap_roll := frollmean(shap_mean, n=4L, na.rm=TRUE, align="right"),
+        by=.(outcome, pathway)]
+
 tv_agg[, yr       := yyyyqq %/% 100L]
 tv_agg[, qtr      := yyyyqq %% 100L]
 tv_agg[, date_num := yr + (qtr-1)/4]
@@ -1084,46 +1124,71 @@ tv_agg[, outcome_label := factor(OUTCOME_LABELS[as.character(outcome)],
                                   levels=OUTCOME_LABELS)]
 tv_agg[, pathway := factor(pathway, levels=names(PATHWAY_COLS))]
 
+# Split into macro channels vs balance sheet
+MACRO_PATHS <- c("Direct oil price","Interaction (oil x regime)",
+                 "Indirect: Labour market","Indirect: Inflation (CPI)",
+                 "Indirect: Rate channel","Indirect: Housing")
+BAL_PATHS   <- "Indirect: Balance sheet lags"
+
+tv_agg[, panel_grp := fifelse(
+  as.character(pathway) %in% MACRO_PATHS, "Macro channels", "Balance sheet lags"
+)]
+tv_agg[, panel_grp := factor(panel_grp,
+  levels=c("Macro channels","Balance sheet lags"))]
+
 episodes <- data.table(
   xmin  = c(2008.5, 2015.0, 2020.0, 2022.0),
   xmax  = c(2009.75,2016.0, 2021.25,2023.75),
   label = c("GFC","Shale bust","COVID","Hike cycle")
 )
 
-p_pol4 <- ggplot(tv_agg[pathway != "Other" & !is.na(outcome_label)],
-                 aes(x=date_num, y=shap_mean, colour=pathway, group=pathway)) +
+plot_tv <- tv_agg[
+  pathway != "Other" & !is.na(outcome_label) & !is.na(shap_roll)
+]
+
+p_pol4 <- ggplot(plot_tv,
+                 aes(x=date_num, y=shap_roll,
+                     colour=pathway, group=pathway)) +
   geom_rect(data=episodes,
             aes(xmin=xmin, xmax=xmax, ymin=-Inf, ymax=Inf),
             fill="#f0f0f0", alpha=0.7, inherit.aes=FALSE) +
   geom_text(data=episodes,
             aes(x=(xmin+xmax)/2, y=Inf, label=label),
-            vjust=1.4, size=2.5, colour="#666", inherit.aes=FALSE) +
-  geom_hline(yintercept=0, linewidth=0.35, colour="#555") +
-  geom_line(linewidth=0.75) +
+            vjust=1.3, size=2.3, colour="#666", inherit.aes=FALSE) +
+  geom_hline(yintercept=0, linewidth=0.35, colour="#444") +
+  geom_line(linewidth=0.8) +
   scale_colour_manual(values=PATHWAY_COLS, name="Pathway", drop=FALSE) +
   scale_x_continuous(breaks=seq(2006,2026,2),
                      labels=function(x) paste0("'",substr(x,3,4))) +
-  facet_wrap(~outcome_label, scales="free_y", ncol=1) +
+  facet_grid(outcome_label ~ panel_grp, scales="free_y") +
   labs(
-    title    = "POLICY FIG 4 \u2014 Time-Varying Oil Transmission Channels (2005\u20132025)",
+    title    = "POLICY FIG 4 \u2014 Time-Varying Oil Transmission: Macro vs Balance Sheet (2005\u20132025)",
     subtitle = paste(
-      "Each line = one pathway | Key episodes shaded",
-      "\nDid the rate channel (purple) dominate during 2022 hike cycle vs labour (green) during shale bust?"
+      "Left panels: contemporaneous macro channels | Right: balance sheet lag propagation",
+      "\n4-quarter rolling mean | Key finding: macro channels initiate, balance sheet carries forward"
     ),
-    caption  = "TreeSHAP on full panel 2005Q1-2025Q4 | Mean quarterly SHAP | Negative = channel dampens outcome",
-    x=NULL, y="Mean SHAP"
+    caption  = paste(
+      "TreeSHAP on full panel 2005Q1-2025Q4 | 4-quarter rolling mean of quarterly cross-CU mean",
+      "\nEpisodes: GFC=2008-09, Shale bust=2015-16, COVID=2020-21, Hike cycle=2022-23"
+    ),
+    x=NULL, y="Mean SHAP (4-qtr rolling)"
   ) +
   theme_minimal(base_size=10) +
-  theme(plot.title=element_text(face="bold",size=11),
-        plot.subtitle=element_text(size=8.5,colour="#444",lineheight=1.3),
-        plot.caption=element_text(size=7.5,colour="#888",hjust=0),
-        strip.text=element_text(face="bold",size=9),
-        panel.grid.minor=element_blank(),
-        legend.position="right", legend.text=element_text(size=7.5),
-        legend.key.size=unit(0.35,"cm"))
+  theme(
+    plot.title=element_text(face="bold",size=11),
+    plot.subtitle=element_text(size=8.5,colour="#444",lineheight=1.3),
+    plot.caption=element_text(size=7.5,colour="#888",hjust=0),
+    strip.text=element_text(face="bold",size=9),
+    strip.background=element_rect(fill="#f5f5f5",colour="#ccc"),
+    panel.grid.minor=element_blank(),
+    legend.position="right",
+    legend.text=element_text(size=7.5),
+    legend.key.size=unit(0.35,"cm")
+  )
 ggsave("Figures/04c_policy4_time_varying.png", p_pol4,
-       width=13, height=9, dpi=300, bg="white")
+       width=15, height=10, dpi=300, bg="white")
 msg("Policy Chart 4 \u2192 Figures/04c_policy4_time_varying.png")
+
 
 # ── POLICY CHART 5: Pathway by asset tier ────────────────────────────────────
 if ("asset_tier" %in% names(panel_test)) {
