@@ -84,6 +84,13 @@ SVAR_LAGS <- 4L      # lags for the Kilian SVAR (quarterly)
 IRAN_SHOCK_PP  <- 60.3   # +60pp YoY — Moody's $125 from $78
 IRAN_GEO_SHARE <- 1.0    # 100% geopolitical (conservative assumption)
 
+# Shock type labels — defined here unconditionally so always available
+shock_labels <- c(
+  shock_supply = "Supply Disruption",
+  shock_demand = "Aggregate Demand",
+  shock_geo    = "Geopolitical/Precautionary"
+)
+
 # =============================================================================
 # 1. LOAD DATA
 # =============================================================================
@@ -324,11 +331,6 @@ if (!is.null(var_fit)) {
   struct_shocks[, shock_demand := (1 - supply_disruption) * dlog_real_oil]
   struct_shocks[, shock_supply := supply_disruption]
 
-  shock_labels <- c(
-    shock_supply = "Supply Disruption",
-    shock_demand = "Aggregate Demand",
-    shock_geo    = "Geopolitical/Precautionary"
-  )
   fwrite(struct_shocks, "Results/06_shock_decomp.csv")
 }
 
