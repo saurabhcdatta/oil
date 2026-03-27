@@ -117,14 +117,26 @@ for (v in intersect(Y_VARS, names(panel))) {
 }
 
 # Parse yyyyqq to date  (format: "2010.2" → 2010-04-01)
+# Bulletproof: handles NA, empty strings, and unexpected formats
 parse_q <- function(x) {
-  p    <- str_split_fixed(as.character(x), "\\.", 2)
-  yr   <- as.integer(p[, 1])          # plain integer vector
-  qtr  <- as.integer(p[, 2])          # plain integer vector
-  mo   <- (qtr - 1L) * 3L + 1L
-  as.Date(sprintf("%04d-%02d-01", yr, mo))
+  x <- as.character(x)
+  result <- rep(as.Date(NA), length(x))
+  valid  <- grepl("^[0-9]{4}\\.[1-4]$", x)   # must match YYYY.Q exactly
+  if (any(valid)) {
+    p            <- str_split_fixed(x[valid], "\\.", 2)
+    yr           <- as.integer(p[, 1])
+    qtr          <- as.integer(p[, 2])
+    mo           <- (qtr - 1L) * 3L + 1L
+    result[valid] <- as.Date(sprintf("%04d-%02d-01", yr, mo))
+  }
+  result
 }
 panel[, date := parse_q(yyyyqq)]
+
+# Diagnostic: show sample yyyyqq values and date conversion result
+msg("yyyyqq sample: %s", paste(head(unique(panel$yyyyqq), 6), collapse=", "))
+msg("date sample:   %s", paste(head(unique(panel$date),   6), collapse=", "))
+msg("date NAs:      %d of %d", sum(is.na(panel$date)), nrow(panel))
 
 msg("Panel: %s obs | %s CUs | %s quarters",
     format(nrow(panel),big.mark=","),
