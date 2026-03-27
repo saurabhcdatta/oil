@@ -139,24 +139,40 @@ panel <- merge(panel, macro_base[, ..macro_cols], by="yyyyqq", all.x=TRUE)
 
 # Build lagged variables on panel
 setorder(panel, join_number, yyyyqq)
+vars_found <- c(); vars_missing <- c()
 for (v in c(Y_VARS, MACRO_VARS, OIL_VAR)) {
   if (v %in% names(panel)) {
+    vars_found <- c(vars_found, v)
     for (k in 1:P_LAG) {
       nm <- paste0(v, "_lag", k)
       panel[, (nm) := shift(.SD[[v]], k, type="lag"),
              by=join_number, .SDcols=v]
     }
+  } else {
+    vars_missing <- c(vars_missing, v)
   }
 }
+if (length(vars_missing) > 0)
+  msg("WARNING — variables not found in panel (no lags built): %s",
+      paste(vars_missing, collapse=", "))
+msg("Lag columns built for %d variables", length(vars_found))
 
 # Aggregate to quarterly time series for Link 1 (oil → macro)
 # Use cross-sectional mean — macro vars are common to all CUs
+# Guard: only include columns that actually exist after lag construction
+agg_ts_cols <- intersect(
+  c(OIL_VAR, MACRO_VARS,
+    paste0(OIL_VAR, "_lag", 1:P_LAG),
+    unlist(lapply(MACRO_VARS, function(v) paste0(v, "_lag", 1:P_LAG)))),
+  names(panel)
+)
+msg("agg_ts columns available: %d of %d requested",
+    length(agg_ts_cols),
+    length(c(OIL_VAR, MACRO_VARS)) + P_LAG * (1 + length(MACRO_VARS)))
+
 agg_ts <- panel[, lapply(.SD, mean, na.rm=TRUE),
                  by=yyyyqq,
-                 .SDcols=c(OIL_VAR, MACRO_VARS,
-                            paste0(OIL_VAR, "_lag", 1:P_LAG),
-                            unlist(lapply(MACRO_VARS,
-                                          function(v) paste0(v,"_lag",1:P_LAG))))]
+                 .SDcols=agg_ts_cols]
 setorder(agg_ts, yyyyqq)
 
 # Panel data for Links 2 & 3
