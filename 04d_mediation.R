@@ -21,7 +21,12 @@ dir.create("Figures", showWarnings=FALSE)
 set.seed(20260101L)
 t0 <- proc.time()
 
-cat("\n  Script 04d — Mediation Analysis [v2 — clean rewrite]\n\n")
+cat("\n")
+cat("  ██████████████████████████████████████████████████████████\n")
+cat("  ██  Script 04d — Mediation Analysis [v4 — 2026-03-27]  ██\n")
+cat("  ██  If you do NOT see this banner — WRONG FILE          ██\n")
+cat("  ██████████████████████████████████████████████████████████\n")
+cat("\n")
 
 # =============================================================================
 # 0. CONFIGURATION — explicit, no auto-detection
@@ -335,13 +340,30 @@ link3 <- rbindlist(lapply(Y_VARS, function(y) {
   fit <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
   if (is.null(fit)) return(NULL)
   cf   <- coef(summary(fit))
-  l1   <- paste0(y,"_lag1"); l2 <- paste0(y,"_lag2")
+
+  # Diagnostic for first outcome only
+  if (y == Y_VARS[1])
+    msg("  Link3 coef names sample: %s",
+        paste(head(rownames(cf), 5), collapse=", "))
+
+  # feols sometimes uses backtick-quoted names — search flexibly
+  find_coef <- function(cf, name, col) {
+    # exact match first
+    if (name %in% rownames(cf)) return(cf[name, col])
+    # try with backticks stripped
+    clean_names <- gsub("`","", rownames(cf))
+    idx <- which(clean_names == name)
+    if (length(idx) > 0) return(cf[idx[1], col])
+    return(NA_real_)
+  }
+
+  l1 <- paste0(y,"_lag1"); l2 <- paste0(y,"_lag2")
   data.table(
     outcome   = y,
-    ar1_coef  = safe_cf(cf, l1, "Estimate"),
-    ar1_p     = safe_cf(cf, l1, "Pr(>|t|)"),
-    ar2_coef  = safe_cf(cf, l2, "Estimate"),
-    ar2_p     = safe_cf(cf, l2, "Pr(>|t|)"),
+    ar1_coef  = find_coef(cf, l1, "Estimate"),
+    ar1_p     = find_coef(cf, l1, "Pr(>|t|)"),
+    ar2_coef  = find_coef(cf, l2, "Estimate"),
+    ar2_p     = find_coef(cf, l2, "Pr(>|t|)"),
     r2_within = safe_r2(fit),
     n_obs     = nobs(fit)
   )
