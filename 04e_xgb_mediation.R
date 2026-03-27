@@ -222,6 +222,55 @@ fwrite(link1_xgb, "Results/04e_link1_xgb.csv")
 msg("Link 1 XGBoost: %d macro vars", nrow(link1_xgb))
 
 # =============================================================================
+# 3b. DIRECT LINK — OIL → CU OUTCOMES (XGBoost, panel level)
+#     Uses oil var + its lags directly as features predicting CU outcomes
+#     This is the direct channel from 04d (path c') — non-parametric version
+# =============================================================================
+hdr("SECTION 3b: Direct Link XGBoost — Oil → CU Outcomes")
+
+oil_lag_cols <- intersect(
+  c(OIL_VAR, paste0(OIL_VAR,"_lag",1:P_LAG)),
+  names(panel))
+
+direct_xgb <- rbindlist(lapply(Y_VARS, function(y) {
+  if (!y %in% names(panel) || length(oil_lag_cols) == 0) return(NULL)
+
+  X  <- panel[, ..oil_lag_cols]
+  yv <- panel[[y]]
+
+  res <- train_xgb(X, yv, label=paste0("D_", y))
+  if (is.null(res)) return(NULL)
+
+  imp <- shap_importance(res$shap)
+
+  # Contemporaneous oil SHAP (direct Q0 effect)
+  oil_shap_abs    <- imp[feature == OIL_VAR, mean_shap]
+  oil_shap_signed <- if (OIL_VAR %in% colnames(res$shap))
+                       mean(res$shap[, OIL_VAR]) else NA_real_
+  total_shap      <- sum(imp$mean_shap)
+  pct_contemp     <- if (length(oil_shap_abs)>0 && total_shap>0)
+                       oil_shap_abs / total_shap * 100 else NA_real_
+
+  msg("%-30s : oil_shap=%+.5f  pct_contemp=%.1f%%  RMSE=%.4f",
+      OUTCOME_LABELS[y], oil_shap_signed %||% NA_real_,
+      pct_contemp %||% NA_real_, res$rmse %||% NA_real_)
+
+  data.table(
+    outcome         = y,
+    outcome_label   = OUTCOME_LABELS[y],
+    oil_shap_signed = oil_shap_signed,
+    oil_shap_abs    = if (length(oil_shap_abs)>0) oil_shap_abs else NA_real_,
+    pct_contemp     = pct_contemp,
+    total_shap      = total_shap,
+    rmse            = res$rmse,
+    n               = res$n
+  )
+}))
+
+fwrite(direct_xgb, "Results/04e_direct_oil_cu_xgb.csv")
+msg("Direct Oil → CU XGBoost: %d outcomes", nrow(direct_xgb))
+
+# =============================================================================
 # 4. LINK 2 — MACRO → CU OUTCOMES (XGBoost, panel level)
 # =============================================================================
 hdr("SECTION 4: Link 2 XGBoost — Macro Variables → CU Outcomes")
@@ -448,10 +497,10 @@ if (ok(link3_xgb)) {
   msg("Chart 3 saved")
 }
 
-# ── Chart 4: Side-by-side 04d vs 04e validation ───────────────────────────────
+# ── Chart 4: 2×2 validation quad — all four panels ───────────────────────────
 if (ok(link1_xgb) && ok(link2_xgb) && ok(link3_xgb)) {
 
-  # Panel A: Link 1 direction match
+  # Panel A: Link 1 — Oil → Macro
   p4a <- ggplot(link1_xgb,
                 aes(x=reorder(macro_label, mean_shap_abs),
                     y=mean_shap_abs, fill=macro_label)) +
@@ -459,10 +508,10 @@ if (ok(link1_xgb) && ok(link2_xgb) && ok(link3_xgb)) {
     coord_flip() +
     scale_fill_brewer(palette="Set2") +
     labs(title="Link 1: Oil → Macro",
-         subtitle="XGBoost |SHAP|",
+         subtitle="XGBoost |SHAP| per macro channel",
          x=NULL, y="Mean |SHAP|") + THEME
 
-  # Panel B: Link 2 top channel per outcome
+  # Panel B: Link 2 — Macro → CU (top channel per outcome)
   top_per_out <- link2_xgb[shap_rank==1]
   p4b <- ggplot(top_per_out,
                 aes(x=reorder(outcome_label, mean_shap_abs),
@@ -474,29 +523,53 @@ if (ok(link1_xgb) && ok(link2_xgb) && ok(link3_xgb)) {
          subtitle="Top SHAP channel per outcome",
          x=NULL, y="Mean |SHAP|") + THEME
 
-  # Panel C: Link 3 persistence
+  # Panel C: Link 3 — AR Persistence
   p4c <- ggplot(link3_xgb,
                 aes(x=reorder(outcome_label, pct_own_lag),
                     y=pct_own_lag)) +
     geom_col(fill="#005f73", width=0.65) +
     geom_hline(yintercept=59, linetype="dashed",
                colour="#ae2012", linewidth=0.7) +
+    annotate("text", x=0.7, y=61, label="OLS AR=0.59",
+             colour="#ae2012", size=2.8, hjust=0, fontface="bold") +
     coord_flip() +
     scale_y_continuous(labels=function(x) paste0(x,"%")) +
     labs(title="Link 3: AR Persistence",
-         subtitle="Own-lag SHAP % | Red=OLS AR1",
+         subtitle="Own-lag SHAP % | Red dashed = OLS AR1",
          x=NULL, y="% own-lag SHAP") + THEME
 
-  p4 <- p4a | p4b | p4c
+  # Panel D: Direct Oil → CU (NEW)
+  p4d <- if (ok(direct_xgb) && any(!is.na(direct_xgb$oil_shap_signed))) {
+    ggplot(direct_xgb[!is.na(oil_shap_signed)],
+           aes(x=reorder(outcome_label, abs(oil_shap_signed)),
+               y=oil_shap_signed,
+               fill=oil_shap_signed > 0)) +
+      geom_col(width=0.65) +
+      geom_hline(yintercept=0, linewidth=0.4, colour="#555") +
+      coord_flip() +
+      scale_fill_manual(values=c("TRUE"="#0a9396","FALSE"="#ae2012"),
+                        guide="none") +
+      scale_y_continuous(labels=function(x) sprintf("%+.5f", x)) +
+      labs(title="Direct: Oil → CU Outcomes",
+           subtitle="Signed SHAP of oil on CU outcomes (no macro intermediary)",
+           x=NULL, y="Mean signed SHAP") + THEME
+  } else {
+    ggplot() +
+      annotate("text", x=0.5, y=0.5, label="Direct XGBoost\nnot available",
+               size=4, colour="#888") +
+      theme_void()
+  }
+
+  p4 <- (p4a | p4b) / (p4c | p4d)
   p4 <- p4 + plot_annotation(
-    title="04e VALIDATION — XGBoost Replicates 04d Mediation (All Three Links)",
-    subtitle="Non-parametric TreeSHAP confirms OLS/Panel FE findings",
-    caption="Baron-Kenny (04d) vs XGBoost TreeSHAP (04e) | Same data, different methods",
-    theme=theme(plot.title=element_text(face="bold",size=12))
+    title    = "04e VALIDATION — XGBoost Replicates 04d Mediation (All Four Pathways)",
+    subtitle = "Non-parametric TreeSHAP confirms OLS/Panel FE findings",
+    caption  = "Baron-Kenny (04d) vs XGBoost TreeSHAP (04e) | Same data, different methods",
+    theme    = theme(plot.title=element_text(face="bold",size=12))
   )
-  ggsave("Figures/04e_validation_tripanel.png", p4, width=16, height=7,
+  ggsave("Figures/04e_validation_quadpanel.png", p4, width=16, height=12,
          dpi=300, bg="white")
-  msg("Chart 4 (validation tripanel) saved")
+  msg("Chart 4 (validation quadpanel) saved")
 }
 
 # =============================================================================
