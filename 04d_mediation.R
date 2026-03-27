@@ -298,7 +298,7 @@ link2 <- rbindlist(lapply(Y_VARS, function(y) {
     # If collinear (fixest drops the macro var), fall back to pooled OLS
     if (!is.null(fit)) {
       cf <- get_fixest_cf(fit)
-      if (!m %in% gsub("`","",rownames(cf))) fit <- NULL  # var was dropped — collinear
+      if (!m %in% gsub("`","",rownames(cf))) fit <- NULL   # var was dropped — collinear
     }
 
     # Try 2: pooled OLS with clustered SE (no FE — macro var retained)
@@ -312,7 +312,6 @@ link2 <- rbindlist(lapply(Y_VARS, function(y) {
 
     if (is.null(fit)) return(NULL)
     cf <- get_fixest_cf(fit)
-    # Strip backticks from rownames before lookup (feols may quote col names)
     rownames(cf) <- gsub("`","", rownames(cf))
     if (!m %in% rownames(cf)) return(NULL)
 
