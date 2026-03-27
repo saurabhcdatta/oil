@@ -133,9 +133,75 @@ panel      <- readRDS("Data/panel_model.rds")
 macro_base <- readRDS("Data/macro_base.rds")
 setDT(panel); setDT(macro_base)
 
+# ── Auto-detect actual macro column names ─────────────────────────────────────
+# The hardcoded MACRO_VARS may not match actual column names in macro_base.
+# Strategy: for each intended variable, find the best matching column name
+# using grepl pattern matching on the actual macro_base column names.
+# This makes the script robust to naming variants (e.g. "lurc" vs "macro_base_lurc")
+
+macro_base_cols <- names(macro_base)
+msg("macro_base columns (%d): %s",
+    length(macro_base_cols),
+    paste(head(macro_base_cols, 15), collapse=", "))
+
+# Pattern → label mapping for auto-detection
+MACRO_PATTERNS <- list(
+  list(pattern="lurc|unemp",        label="Unemployment rate"),
+  list(pattern="pcpi|cpi",          label="CPI level"),
+  list(pattern="yield_curve|spread",label="Yield curve (10Y-3M)"),
+  list(pattern="rmtg|mortgage",     label="Mortgage rate"),
+  list(pattern="hpi",               label="HPI growth YoY")
+)
+
+OIL_PATTERN <- "yoy_oil|oil_yoy|pbrent_yoy"
+
+# Find actual oil column
+oil_match <- grep(OIL_PATTERN, macro_base_cols, value=TRUE, ignore.case=TRUE)
+if (length(oil_match) == 0) {
+  # Try panel directly
+  oil_match <- grep(OIL_PATTERN, names(panel), value=TRUE, ignore.case=TRUE)
+}
+OIL_VAR <- if (length(oil_match) > 0) oil_match[1] else "macro_base_yoy_oil"
+msg("Oil variable detected: %s", OIL_VAR)
+
+# Find actual macro columns
+MACRO_VARS_DETECTED   <- character(0)
+MACRO_LABELS_DETECTED <- character(0)
+
+for (pat in MACRO_PATTERNS) {
+  # Search in macro_base first, then panel
+  matches <- grep(pat$pattern, macro_base_cols, value=TRUE, ignore.case=TRUE)
+  if (length(matches) == 0)
+    matches <- grep(pat$pattern, names(panel), value=TRUE, ignore.case=TRUE)
+  # Take first non-lag match
+  matches <- matches[!grepl("_lag", matches)]
+  if (length(matches) > 0) {
+    MACRO_VARS_DETECTED   <- c(MACRO_VARS_DETECTED, matches[1])
+    MACRO_LABELS_DETECTED <- c(MACRO_LABELS_DETECTED, pat$label)
+    msg("  %-30s -> %s", pat$label, matches[1])
+  } else {
+    msg("  %-30s -> NOT FOUND (will be skipped)", pat$label)
+  }
+}
+
+# Override hardcoded vars with detected ones
+if (length(MACRO_VARS_DETECTED) > 0) {
+  MACRO_VARS   <- MACRO_VARS_DETECTED
+  MACRO_LABELS <- setNames(MACRO_LABELS_DETECTED, MACRO_VARS_DETECTED)
+  msg("Using %d detected macro vars: %s",
+      length(MACRO_VARS), paste(MACRO_VARS, collapse=", "))
+} else {
+  msg("WARNING: No macro vars detected — check macro_base column names above")
+}
+
 # Merge macro onto panel
 macro_cols <- intersect(c("yyyyqq", OIL_VAR, MACRO_VARS), names(macro_base))
-panel <- merge(panel, macro_base[, ..macro_cols], by="yyyyqq", all.x=TRUE)
+if (length(macro_cols) > 1) {
+  panel <- merge(panel, macro_base[, ..macro_cols], by="yyyyqq", all.x=TRUE)
+  msg("Merged %d macro columns onto panel", length(macro_cols) - 1)
+} else {
+  msg("WARNING: macro vars already in panel or macro_base merge skipped")
+}
 
 # Build lagged variables on panel
 setorder(panel, join_number, yyyyqq)
@@ -231,8 +297,11 @@ link1_results <- rbindlist(lapply(MACRO_VARS, function(m) {
   n   <- nobs(fit)
   r2  <- summary(fit)$r.squared
 
-  # Extract oil coefficients
-  oil_rows <- cf[grepl("yoy_oil", rownames(cf)), , drop=FALSE]
+  # Extract oil coefficients — match on actual OIL_VAR name
+  oil_rows <- cf[grepl(OIL_VAR, rownames(cf), fixed=TRUE), , drop=FALSE]
+  # Also try the base name without prefix in case colname differs
+  if (nrow(oil_rows) == 0)
+    oil_rows <- cf[rownames(cf) == OIL_VAR, , drop=FALSE]
 
   if (nrow(oil_rows) == 0) return(NULL)
 
@@ -266,9 +335,23 @@ link1_results <- rbindlist(lapply(MACRO_VARS, function(m) {
 
 fwrite(link1_results, "Results/04d_link1_oil_macro.csv")
 cat("\n  LINK 1: Oil YoY → Macro Variables\n\n")
-print(link1_results[, .(macro_label, beta_contemp=round(beta_contemp,4),
-                          se=round(se_contemp,4), p=round(p_contemp,4),
-                          sig, lr_mult=round(lr_mult,3), r2=round(r2,3))])
+if (!is.null(link1_results) && nrow(link1_results) > 0) {
+  cat("\n  LINK 1: Oil YoY → Macro Variables\n\n")
+  print(link1_results[, .(macro_label, beta_contemp=round(beta_contemp,4),
+                            se=round(se_contemp,4), p=round(p_contemp,4),
+                            sig, lr_mult=round(lr_mult,3), r2=round(r2,3))])
+} else {
+  msg("WARNING: Link 1 produced no results.")
+  msg("Check that OIL_VAR ('%s') appears in agg_ts columns:", OIL_VAR)
+  msg("  agg_ts columns: %s", paste(names(agg_ts), collapse=", "))
+  # Create empty placeholder so downstream code doesn't crash
+  link1_results <- data.table(
+    macro_var=MACRO_VARS, macro_label=MACRO_LABELS[MACRO_VARS],
+    beta_contemp=NA_real_, se_contemp=NA_real_, p_contemp=NA_real_,
+    beta_cum=NA_real_, lr_mult=NA_real_, r2=NA_real_,
+    n_obs=NA_integer_, sig=""
+  )
+}
 
 # =============================================================================
 # 3. LINK 2 — MACRO VARIABLES → CU OUTCOMES
