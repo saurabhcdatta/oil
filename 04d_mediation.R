@@ -264,6 +264,29 @@ msg("Panel (clean)        : %s obs | %s CUs",
     format(nrow(panel_clean), big.mark=","),
     format(uniqueN(panel_clean$join_number), big.mark=","))
 
+# Diagnostic: confirm which macro vars made it into panel_clean
+macro_in_panel  <- intersect(MACRO_VARS, names(panel_clean))
+macro_missing   <- setdiff(MACRO_VARS, names(panel_clean))
+msg("Macro vars in panel_clean (%d): %s",
+    length(macro_in_panel), paste(macro_in_panel, collapse=", "))
+if (length(macro_missing) > 0)
+  msg("MISSING from panel_clean: %s", paste(macro_missing, collapse=", "))
+
+# If macro vars are missing, try to pull them from macro_base directly
+if (length(macro_missing) > 0) {
+  msg("Attempting emergency merge of missing vars from macro_base ...")
+  still_missing <- setdiff(macro_missing, names(macro_base))
+  can_merge     <- intersect(macro_missing, names(macro_base))
+  if (length(can_merge) > 0) {
+    mc <- c("yyyyqq", can_merge)
+    panel_clean <- merge(panel_clean, macro_base[, ..mc], by="yyyyqq", all.x=TRUE)
+    msg("Merged %d vars: %s", length(can_merge), paste(can_merge, collapse=", "))
+  }
+  if (length(still_missing) > 0)
+    msg("Still missing (not in macro_base either): %s",
+        paste(still_missing, collapse=", "))
+}
+
 # =============================================================================
 # 2. LINK 1 — OIL → MACRO VARIABLES
 # =============================================================================
@@ -367,6 +390,18 @@ if (!is.null(link1_results) && nrow(link1_results) > 0) {
 # =============================================================================
 hdr("SECTION 3: Link 2 — Macro Variables → CU Balance Sheet")
 
+# Final check: which macro vars are actually usable
+usable_macro <- intersect(MACRO_VARS, names(panel_clean))
+if (length(usable_macro) == 0) {
+  msg("ERROR: No macro variables found in panel_clean.")
+  msg("panel_clean has %d columns. First 20:", length(names(panel_clean)))
+  msg("  %s", paste(head(names(panel_clean), 20), collapse=", "))
+  msg("Skipping Link 2 — cannot estimate macro -> CU regressions")
+  link2_results <- data.table()
+} else {
+  msg("Running Link 2 with %d macro vars: %s",
+      length(usable_macro), paste(usable_macro, collapse=", "))
+
 # Panel FE regression with CU fixed effects:
 #   Y_it = α_i + Σ_m β_m·M_t + Σ_k γ_k·Y_{i,t-k} + ε_it
 #
@@ -403,7 +438,8 @@ link2_results <- rbindlist(lapply(Y_VARS, function(y) {
       beta         = cf[m, "Estimate"],
       se           = cf[m, "Std. Error"],
       p            = cf[m, "Pr(>|t|)"],
-      r2           = r2(fit, type="within"),
+      r2           = tryCatch(r2(fit, type="within"),
+                               error=function(e) r2(fit, type="r2")),
       n_obs        = nobs(fit),
       sig          = fcase(
         cf[m, "Pr(>|t|)"] < 0.01, "***",
@@ -431,6 +467,8 @@ if (!is.null(link2_results) && nrow(link2_results) > 0 &&
 } else {
   msg("link2_results is empty — check MACRO_VARS are in panel_clean")
 }
+
+} # end usable_macro guard
 
 # =============================================================================
 # 4. LINK 3 — LAGGED BALANCE SHEET → CURRENT OUTCOMES
@@ -467,7 +505,10 @@ link3_results <- rbindlist(lapply(Y_VARS, function(y) {
     ar1_p        = if (own_l1 %in% rownames(cf)) cf[own_l1,"Pr(>|t|)"] else NA,
     ar2_coef     = if (own_l2 %in% rownames(cf)) cf[own_l2,"Estimate"] else NA,
     ar2_p        = if (own_l2 %in% rownames(cf)) cf[own_l2,"Pr(>|t|)"] else NA,
-    r2_within    = r2(fit, type="within"),
+    r2_within    = tryCatch(r2(fit, type="within"),
+                             error=function(e)
+                               tryCatch(r2(fit, type="r2"),
+                                        error=function(e2) NA_real_)),
     n_obs        = nobs(fit)
   )
 }))
