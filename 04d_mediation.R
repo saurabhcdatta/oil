@@ -219,16 +219,46 @@ if (nrow(link1) > 0)
 # 4. LINK 2 — MACRO → CU OUTCOMES (panel FE)
 # =============================================================================
 hdr("SECTION 4: Link 2 — Macro Variables → CU Outcomes")
+# NOTE: Macro vars (unemployment, CPI etc.) are cross-sectionally constant
+# within each quarter — they vary only over time, not across CUs.
+# CU fixed effects would absorb all their variation (collinearity).
+# Correct specification: CU FE + lagged Y for autocorrelation,
+# BUT use the macro var as a time-varying regressor WITHOUT absorbing
+# time variation via quarter FE. This estimates the within-CU response
+# to aggregate macro conditions, controlling for CU-level heterogeneity.
+# Alternative: pooled OLS with clustered SE (no FE) gives same macro coef
+# but without controlling for CU heterogeneity.
+# We use: Y ~ macro + lag_Y | join_number  with se="twoway" (CU + time cluster)
+# If that collinears out, fall back to: Y ~ macro + lag_Y (clustered by CU)
 
 link2 <- rbindlist(lapply(Y_VARS, function(y) {
   rbindlist(lapply(MACRO_VARS, function(m) {
     if (!all(c(y,m) %in% names(panel_clean))) return(NULL)
     lag_y <- intersect(paste0(y,"_lag",1:P_LAG), names(panel_clean))
     rhs   <- paste(c(m, lag_y), collapse=" + ")
-    fit   <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
+
+    # Try 1: CU fixed effects (ideal if macro var has residual variation)
+    fit <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
+
+    # If collinear (fixest drops the macro var), fall back to pooled OLS
+    if (!is.null(fit)) {
+      cf <- coef(summary(fit))
+      if (!m %in% rownames(cf)) fit <- NULL   # var was dropped — collinear
+    }
+
+    # Try 2: pooled OLS with clustered SE (no FE — macro var retained)
+    if (is.null(fit)) {
+      fit <- tryCatch(
+        feols(as.formula(paste0(y," ~ ",rhs)),
+              data=panel_clean, se="cluster",
+              cluster=~join_number, notes=FALSE),
+        error=function(e) NULL)
+    }
+
     if (is.null(fit)) return(NULL)
-    cf    <- coef(summary(fit))
+    cf <- coef(summary(fit))
     if (!m %in% rownames(cf)) return(NULL)
+
     data.table(outcome=y, macro_var=m,
                b_path=cf[m,"Estimate"], b_se=cf[m,"Std. Error"],
                b_p=cf[m,"Pr(>|t|)"], r2=safe_r2(fit), n_obs=nobs(fit),
@@ -285,22 +315,28 @@ if (nrow(link3) > 0)
 # 6. TOTAL EFFECTS — OIL → CU (path c)
 # =============================================================================
 hdr("SECTION 6: Total Effects (Path c)")
+# Oil var is time-varying but cross-sectionally constant.
+# CU FE absorbs it — fall back to pooled OLS with clustered SE if needed.
 
 total_eff <- rbindlist(lapply(Y_VARS, function(y) {
-  if (!OIL_VAR %in% names(panel_clean)) {
-    msg("OIL_VAR '%s' not in panel_clean — cannot estimate path c", OIL_VAR)
-    return(NULL)
-  }
+  if (!OIL_VAR %in% names(panel_clean)) return(NULL)
   lag_y <- intersect(paste0(y,"_lag",1:P_LAG), names(panel_clean))
   rhs   <- paste(c(OIL_VAR, lag_y), collapse=" + ")
   fit   <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
+  if (!is.null(fit)) {
+    cf_tmp <- coef(summary(fit))
+    if (!OIL_VAR %in% rownames(cf_tmp)) fit <- NULL
+  }
+  if (is.null(fit))
+    fit <- tryCatch(feols(as.formula(paste0(y," ~ ",rhs)),
+                          data=panel_clean, se="cluster",
+                          cluster=~join_number, notes=FALSE),
+                    error=function(e) NULL)
   if (is.null(fit)) return(NULL)
-  cf    <- coef(summary(fit))
+  cf <- coef(summary(fit))
   if (!OIL_VAR %in% rownames(cf)) return(NULL)
-  data.table(outcome=y,
-             c_total=cf[OIL_VAR,"Estimate"],
-             c_se=cf[OIL_VAR,"Std. Error"],
-             c_p=cf[OIL_VAR,"Pr(>|t|)"])
+  data.table(outcome=y, c_total=cf[OIL_VAR,"Estimate"],
+             c_se=cf[OIL_VAR,"Std. Error"], c_p=cf[OIL_VAR,"Pr(>|t|)"])
 }))
 
 msg("Total effects: %d outcomes", nrow(total_eff))
@@ -309,18 +345,26 @@ if (nrow(total_eff) > 0)
                        c=round(c_total,5), p=round(c_p,4))])
 
 # =============================================================================
-# 7. DIRECT EFFECTS — OIL + MACRO → CU (path c')
-# =============================================================================
 hdr("SECTION 7: Direct Effects (Path c')")
+# Same fallback approach for direct effects
 
 direct_eff <- rbindlist(lapply(Y_VARS, function(y) {
   rbindlist(lapply(MACRO_VARS, function(m) {
-    if (!all(c(y, m, OIL_VAR) %in% names(panel_clean))) return(NULL)
+    if (!all(c(y,m,OIL_VAR) %in% names(panel_clean))) return(NULL)
     lag_y <- intersect(paste0(y,"_lag",1:P_LAG), names(panel_clean))
     rhs   <- paste(c(OIL_VAR, m, lag_y), collapse=" + ")
     fit   <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
+    if (!is.null(fit)) {
+      cf_tmp <- coef(summary(fit))
+      if (!OIL_VAR %in% rownames(cf_tmp) || !m %in% rownames(cf_tmp)) fit <- NULL
+    }
+    if (is.null(fit))
+      fit <- tryCatch(feols(as.formula(paste0(y," ~ ",rhs)),
+                            data=panel_clean, se="cluster",
+                            cluster=~join_number, notes=FALSE),
+                      error=function(e) NULL)
     if (is.null(fit)) return(NULL)
-    cf    <- coef(summary(fit))
+    cf <- coef(summary(fit))
     data.table(outcome=y, macro_var=m,
                c_prime=safe_cf(cf, OIL_VAR, "Estimate"),
                b_path =safe_cf(cf, m, "Estimate"),
@@ -328,11 +372,9 @@ direct_eff <- rbindlist(lapply(Y_VARS, function(y) {
   }))
 }))
 
-msg("Direct effects: %d (outcome × macro) pairs", nrow(direct_eff))
+msg("Direct effects: %d pairs", nrow(direct_eff))
 
-# =============================================================================
-# 8. MEDIATION DECOMPOSITION (Baron-Kenny)
-# =============================================================================
+
 hdr("SECTION 8: Mediation Decomposition")
 
 if (nrow(link1) == 0 || nrow(direct_eff) == 0 || nrow(total_eff) == 0) {
