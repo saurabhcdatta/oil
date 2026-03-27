@@ -35,6 +35,9 @@
 #   Figures/06_fig3_iran_scenario.png
 # =============================================================================
 
+# Clear ALL objects from any prior session — prevents fixest object contamination
+rm(list = ls())
+
 suppressPackageStartupMessages({
   library(data.table)
   library(fixest)
@@ -360,61 +363,61 @@ msg("Non-missing shocks: %s", paste(
   sapply(shock_cols, function(s) sum(!is.na(panel[[s]]))),
   collapse=", "))
 
+# ── CRITICAL: Sanitize panel — remove any non-atomic columns ─────────────────
+# A fixest object from a prior session can be stored as a panel column.
+# lm()/sandwich() calls round_any() during model fitting and fail on non-numeric.
+bad_cols <- names(panel)[sapply(names(panel), function(cn) {
+  x <- panel[[cn]]
+  !is.atomic(x) || inherits(x, "fixest") || inherits(x, "lm") ||
+  is.list(x) && !is.data.frame(x)
+})]
+if (length(bad_cols) > 0) {
+  msg("Dropping %d non-atomic panel columns: %s",
+      length(bad_cols), paste(bad_cols, collapse=", "))
+  panel[, (bad_cols) := NULL]
+}
+# Force all numeric columns to plain double
+num_cols <- names(panel)[sapply(panel, is.numeric)]
+for (cn in num_cols) set(panel, j=cn, value=as.double(panel[[cn]]))
+
 # ── 4.1 Regression helper (same as 04d pattern) ──────────────────────────────
 run_shock_reg <- function(y, shock_var, data) {
   if (!all(c(y, shock_var) %in% names(data))) return(NULL)
-  lag_y  <- intersect(paste0(y,"_lag",1:P_LAG), names(data))
-  lag_sh <- intersect(paste0(shock_var,"_lag",1:P_LAG), names(data))
-  rhs    <- paste(c(shock_var, lag_y), collapse=" + ")
+  lag_y <- intersect(paste0(y, "_lag", 1:P_LAG), names(data))
+  rhs   <- paste(c(shock_var, lag_y), collapse = " + ")
+  fml   <- as.formula(paste0(y, " ~ ", rhs))
 
-  # Try panel FE first
-  fit <- tryCatch(
-    feols(as.formula(paste0(y," ~ ",rhs," | join_number")),
-          data=data[!is.na(get(shock_var))],
-          se="cluster", cluster=~join_number, notes=FALSE),
-    error=function(e) NULL)
+  # Use lm() only — shock vars are time-varying but cross-sectionally constant
+  # so feols with CU FE absorbs them. lm() + clustered SE is correct here.
+  df_fit <- data[!is.na(get(shock_var)) & !is.na(get(y))]
+  if (nrow(df_fit) < 100L) return(NULL)
 
-  cf <- if (!is.null(fit)) {
-    b  <- coef(fit); se_ <- se(fit); pv <- pvalue(fit)
-    rn <- gsub("`","", names(b))
-    df <- data.frame(Estimate=as.numeric(b), SE=as.numeric(se_),
-                     p=as.numeric(pv), row.names=rn, check.names=FALSE)
-    df
-  } else data.frame()
+  fit_lm <- tryCatch(lm(fml, data = df_fit), error = function(e) NULL)
+  if (is.null(fit_lm)) return(NULL)
 
-  # Fallback lm if shock_var dropped
-  if (nrow(cf)==0 || !shock_var %in% rownames(cf)) {
-    fit_lm <- tryCatch(
-      lm(as.formula(paste0(y," ~ ",rhs)),
-         data=data[!is.na(get(shock_var))]),
-      error=function(e) NULL)
-    if (!is.null(fit_lm)) {
-      vcl <- tryCatch(sandwich::vcovCL(fit_lm, cluster=~join_number),
-                      error=function(e) vcov(fit_lm))
-      ct  <- lmtest::coeftest(fit_lm, vcov=vcl)
-      cf  <- data.frame(Estimate=ct[,1], SE=ct[,2], p=ct[,4],
-                        row.names=rownames(ct), check.names=FALSE)
-    }
-  }
+  # Clustered SE — pass cluster as plain vector, NOT formula
+  # vcovCL with formula cluster= internally calls round_any on panel objects
+  cl_vec <- as.integer(factor(df_fit$join_number))
+  vcl <- tryCatch(
+    sandwich::vcovCL(fit_lm, cluster = cl_vec),
+    error = function(e) vcov(fit_lm))
+  ct <- lmtest::coeftest(fit_lm, vcov = vcl)
 
-  if (nrow(cf)==0 || !shock_var %in% rownames(cf)) return(NULL)
+  # ct is a plain matrix — extract safely by position
+  rn <- rownames(ct)
+  rn <- gsub("`", "", rn)
+  idx <- which(rn == shock_var)
+  if (length(idx) == 0) return(NULL)
 
-  # Safe scalar extraction — force numeric, guard against row returning vector
-  get_cf_val <- function(cf, rn, col) {
-    idx <- which(rownames(cf) == rn)
-    if (length(idx) == 0) return(NA_real_)
-    as.numeric(cf[idx[1], col])
-  }
+  beta_val <- as.double(ct[idx[1L], 1L])
+  se_val   <- as.double(ct[idx[1L], 2L])
+  pval_val <- as.double(ct[idx[1L], 4L])
 
-  beta_val <- get_cf_val(cf, shock_var, "Estimate")
-  se_val   <- get_cf_val(cf, shock_var, "SE")
-  pval_val <- get_cf_val(cf, shock_var, "p")
-
-  if (is.na(beta_val)) return(NULL)
+  if (!is.finite(beta_val)) return(NULL)
 
   data.table(
-    outcome    = y,
-    shock_type = shock_var,
+    outcome    = as.character(y),
+    shock_type = as.character(shock_var),
     beta       = beta_val,
     se         = se_val,
     pval       = pval_val,
