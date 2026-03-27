@@ -140,67 +140,76 @@ setDT(panel); setDT(macro_base)
 # This makes the script robust to naming variants (e.g. "lurc" vs "macro_base_lurc")
 
 macro_base_cols <- names(macro_base)
+panel_cols      <- names(panel)
 msg("macro_base columns (%d): %s",
     length(macro_base_cols),
     paste(head(macro_base_cols, 15), collapse=", "))
+msg("panel columns      (%d total)", length(panel_cols))
 
 # Pattern → label mapping for auto-detection
 MACRO_PATTERNS <- list(
-  list(pattern="lurc|unemp",        label="Unemployment rate"),
-  list(pattern="pcpi|cpi",          label="CPI level"),
-  list(pattern="yield_curve|spread",label="Yield curve (10Y-3M)"),
-  list(pattern="rmtg|mortgage",     label="Mortgage rate"),
-  list(pattern="hpi",               label="HPI growth YoY")
+  list(pattern="lurc|unemp",         label="Unemployment rate"),
+  list(pattern="pcpi|cpi",           label="CPI level"),
+  list(pattern="yield_curve|spread", label="Yield curve (10Y-3M)"),
+  list(pattern="rmtg|mortgage",      label="Mortgage rate"),
+  list(pattern="hpi",                label="HPI growth YoY")
 )
-
 OIL_PATTERN <- "yoy_oil|oil_yoy|pbrent_yoy"
 
-# Find actual oil column
-oil_match <- grep(OIL_PATTERN, macro_base_cols, value=TRUE, ignore.case=TRUE)
-if (length(oil_match) == 0) {
-  # Try panel directly
-  oil_match <- grep(OIL_PATTERN, names(panel), value=TRUE, ignore.case=TRUE)
+# Search panel FIRST (macro vars are often already merged in panel_model.rds)
+# then fall back to macro_base
+find_col <- function(pattern, prefer_cols, fallback_cols) {
+  # Non-lag matches in preferred source
+  m <- grep(pattern, prefer_cols, value=TRUE, ignore.case=TRUE)
+  m <- m[!grepl("_lag", m)]
+  if (length(m) > 0) return(m[1])
+  m <- grep(pattern, fallback_cols, value=TRUE, ignore.case=TRUE)
+  m <- m[!grepl("_lag", m)]
+  if (length(m) > 0) return(m[1])
+  return(NULL)
 }
-OIL_VAR <- if (length(oil_match) > 0) oil_match[1] else "macro_base_yoy_oil"
-msg("Oil variable detected: %s", OIL_VAR)
 
-# Find actual macro columns
+OIL_VAR <- find_col(OIL_PATTERN, panel_cols, macro_base_cols) %||%
+             "macro_base_yoy_oil"
+msg("Oil variable: %s (in panel: %s)", OIL_VAR,
+    as.character(OIL_VAR %in% panel_cols))
+
 MACRO_VARS_DETECTED   <- character(0)
 MACRO_LABELS_DETECTED <- character(0)
-
 for (pat in MACRO_PATTERNS) {
-  # Search in macro_base first, then panel
-  matches <- grep(pat$pattern, macro_base_cols, value=TRUE, ignore.case=TRUE)
-  if (length(matches) == 0)
-    matches <- grep(pat$pattern, names(panel), value=TRUE, ignore.case=TRUE)
-  # Take first non-lag match
-  matches <- matches[!grepl("_lag", matches)]
-  if (length(matches) > 0) {
-    MACRO_VARS_DETECTED   <- c(MACRO_VARS_DETECTED, matches[1])
+  col <- find_col(pat$pattern, panel_cols, macro_base_cols)
+  if (!is.null(col)) {
+    MACRO_VARS_DETECTED   <- c(MACRO_VARS_DETECTED, col)
     MACRO_LABELS_DETECTED <- c(MACRO_LABELS_DETECTED, pat$label)
-    msg("  %-30s -> %s", pat$label, matches[1])
+    in_panel <- col %in% panel_cols
+    msg("  %-30s -> %-35s [in panel: %s]",
+        pat$label, col, as.character(in_panel))
   } else {
-    msg("  %-30s -> NOT FOUND (will be skipped)", pat$label)
+    msg("  %-30s -> NOT FOUND", pat$label)
   }
 }
 
-# Override hardcoded vars with detected ones
 if (length(MACRO_VARS_DETECTED) > 0) {
   MACRO_VARS   <- MACRO_VARS_DETECTED
   MACRO_LABELS <- setNames(MACRO_LABELS_DETECTED, MACRO_VARS_DETECTED)
-  msg("Using %d detected macro vars: %s",
-      length(MACRO_VARS), paste(MACRO_VARS, collapse=", "))
+  msg("Using %d macro vars: %s", length(MACRO_VARS),
+      paste(MACRO_VARS, collapse=", "))
 } else {
-  msg("WARNING: No macro vars detected — check macro_base column names above")
+  msg("WARNING: No macro vars detected — check column names above")
 }
 
-# Merge macro onto panel
-macro_cols <- intersect(c("yyyyqq", OIL_VAR, MACRO_VARS), names(macro_base))
-if (length(macro_cols) > 1) {
-  panel <- merge(panel, macro_base[, ..macro_cols], by="yyyyqq", all.x=TRUE)
-  msg("Merged %d macro columns onto panel", length(macro_cols) - 1)
+# Only merge macro_base vars that aren't already in panel
+vars_to_merge <- setdiff(
+  intersect(c(OIL_VAR, MACRO_VARS), macro_base_cols),
+  panel_cols
+)
+if (length(vars_to_merge) > 0) {
+  merge_cols <- c("yyyyqq", vars_to_merge)
+  panel <- merge(panel, macro_base[, ..merge_cols], by="yyyyqq", all.x=TRUE)
+  msg("Merged %d new macro columns from macro_base: %s",
+      length(vars_to_merge), paste(vars_to_merge, collapse=", "))
 } else {
-  msg("WARNING: macro vars already in panel or macro_base merge skipped")
+  msg("All macro vars already in panel — merge skipped")
 }
 
 # Build lagged variables on panel
@@ -409,9 +418,19 @@ link2_results <- rbindlist(lapply(Y_VARS, function(y) {
 fwrite(link2_results, "Results/04d_link2_macro_cu.csv")
 msg("Link 2 regressions: %d completed", nrow(link2_results))
 cat("\n  Significant macro → CU relationships (p < 0.10):\n\n")
-print(link2_results[p < 0.10,
-  .(outcome=OUTCOME_LABELS[outcome], macro=MACRO_LABELS[macro_var],
-    beta=round(beta,5), p=round(p,4), sig)])
+if (!is.null(link2_results) && nrow(link2_results) > 0 &&
+    "p" %in% names(link2_results)) {
+  sig_rows <- link2_results[p < 0.10]
+  if (nrow(sig_rows) > 0) {
+    print(sig_rows[, .(outcome=OUTCOME_LABELS[outcome],
+                        macro=MACRO_LABELS[macro_var],
+                        beta=round(beta,5), p=round(p,4), sig)])
+  } else {
+    msg("No significant relationships at p < 0.10")
+  }
+} else {
+  msg("link2_results is empty — check MACRO_VARS are in panel_clean")
+}
 
 # =============================================================================
 # 4. LINK 3 — LAGGED BALANCE SHEET → CURRENT OUTCOMES
@@ -455,9 +474,13 @@ link3_results <- rbindlist(lapply(Y_VARS, function(y) {
 
 fwrite(link3_results, "Results/04d_link3_lag_cu.csv")
 cat("\n  LINK 3: Balance sheet persistence (AR coefficients)\n\n")
-print(link3_results[, .(outcome=OUTCOME_LABELS[outcome],
-                          ar1=round(ar1_coef,3), ar1_p=round(ar1_p,4),
-                          ar2=round(ar2_coef,3), r2=round(r2_within,3))])
+if (!is.null(link3_results) && nrow(link3_results) > 0) {
+  print(link3_results[, .(outcome=OUTCOME_LABELS[outcome],
+                            ar1=round(ar1_coef,3), ar1_p=round(ar1_p,4),
+                            ar2=round(ar2_coef,3), r2=round(r2_within,3))])
+} else {
+  msg("link3_results is empty — check Y_VARS lags are in panel_clean")
+}
 
 # =============================================================================
 # 5. MEDIATION DECOMPOSITION (Baron-Kenny + Bootstrapped Sobel)
@@ -560,8 +583,13 @@ prop_summary[, outcome_label := OUTCOME_LABELS[outcome]]
 fwrite(prop_summary, "Results/04d_proportion_mediated.csv")
 
 cat("\n  Mediation summary (% of total oil effect that is indirect):\n\n")
-print(prop_summary[order(-total_indirect_pct),
-  .(outcome_label, pct_indirect=round(total_indirect_pct,1), n_sig_paths)])
+if (!is.null(prop_summary) && nrow(prop_summary) > 0 &&
+    "total_indirect_pct" %in% names(prop_summary)) {
+  print(prop_summary[order(-total_indirect_pct),
+    .(outcome_label, pct_indirect=round(total_indirect_pct,1), n_sig_paths)])
+} else {
+  msg("Mediation summary empty — check Link 1 and Link 2 completed successfully")
+}
 
 # =============================================================================
 # 6. CHARTS
@@ -576,8 +604,16 @@ LINK_COLS <- c(
   "HPI growth YoY"      = "#3B6D11"
 )
 
-# ── Chart 1: Link 1 elasticities — oil → macro ────────────────────────────────
-p_link1 <- ggplot(link1_results[!is.na(beta_contemp)],
+# Helper: only build chart if data has rows
+chart_guard <- function(dt, name) {
+  if (is.null(dt) || nrow(dt) == 0) {
+    msg("Skipping %s — no data", name); return(FALSE)
+  }
+  TRUE
+}
+
+# ── Chart 1: Link 1 elasticities ─────────────────────────────────────────────
+if (chart_guard(link1_results[!is.na(beta_contemp)], "Chart 1")) {
                   aes(x=reorder(macro_label, abs(beta_contemp)),
                       y=beta_contemp,
                       fill=macro_label)) +
@@ -613,7 +649,9 @@ p_link1 <- ggplot(link1_results[!is.na(beta_contemp)],
 ggsave("Figures/04d_link1_elasticities.png", p_link1,
        width=12, height=6, dpi=300, bg="white")
 msg("Chart 1 \u2192 Figures/04d_link1_elasticities.png")
+}
 
+if (chart_guard(link2_results[!is.na(outcome_label)], "Chart 2")) {
 # ── Chart 2: Link 2 heatmap — macro → CU outcomes ────────────────────────────
 link2_results[, outcome_label := factor(OUTCOME_LABELS[outcome],
                                          levels=OUTCOME_LABELS)]
@@ -652,7 +690,9 @@ p_link2 <- ggplot(link2_results[!is.na(outcome_label) & !is.na(macro_label)],
 ggsave("Figures/04d_link2_macro_heatmap.png", p_link2,
        width=13, height=7, dpi=300, bg="white")
 msg("Chart 2 \u2192 Figures/04d_link2_macro_heatmap.png")
+}
 
+if (chart_guard(med_long[!is.na(outcome_label)], "Chart 3")) {
 # ── Chart 3: Mediation waterfall — direct vs indirect per outcome ──────────────
 # Show total, direct, and indirect effects side by side
 med_plot <- med_dt[is.finite(indirect_ab) & is.finite(c_prime)]
@@ -707,7 +747,9 @@ p_med <- ggplot(med_long[!is.na(outcome_label)],
 ggsave("Figures/04d_mediation_waterfall.png", p_med,
        width=13, height=7, dpi=300, bg="white")
 msg("Chart 3 \u2192 Figures/04d_mediation_waterfall.png")
+}
 
+if (chart_guard(prop_plot[!is.na(outcome_label)], "Chart 4")) {
 # ── Chart 4: Proportion mediated bar chart ────────────────────────────────────
 # Shows what % of oil's total effect passes through the macro channel
 prop_plot <- merge(prop_summary,
@@ -756,7 +798,9 @@ p_prop <- ggplot(prop_plot[!is.na(outcome_label)],
 ggsave("Figures/04d_proportion_mediated.png", p_prop,
        width=12, height=7, dpi=300, bg="white")
 msg("Chart 4 \u2192 Figures/04d_proportion_mediated.png")
+}
 
+if (chart_guard(data.table(x=1), "Chart 5")) {
 # ── Chart 5: Causal chain summary diagram ─────────────────────────────────────
 # Visual summary of the three-link chain with estimated coefficients
 # Built as a ggplot annotation diagram (no external diagramming package needed)
@@ -838,6 +882,7 @@ p_chain <- ggplot() +
 ggsave("Figures/04d_causal_chain.png", p_chain,
        width=14, height=7, dpi=300, bg="white")
 msg("Chart 5 \u2192 Figures/04d_causal_chain.png")
+}
 
 # =============================================================================
 # 7. OUTPUT MANIFEST
