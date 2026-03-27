@@ -145,14 +145,18 @@ train_xgb <- function(X, y, label="model") {
     return(NULL)
   }
 
-  X_mat <- as.matrix(X[complete_idx,])
-  y_vec <- y[complete_idx]
+  X_mat <- as.matrix(X[complete_idx,, drop=FALSE])
+  # Ensure matrix even if single column (xgb.DMatrix rejects plain vectors)
+  if (!is.matrix(X_mat)) X_mat <- matrix(X_mat, ncol=1,
+                                          dimnames=list(NULL, names(X)[1]))
+  storage.mode(X_mat) <- "double"   # xgb requires double, not integer
+  y_vec <- as.double(y[complete_idx])
 
   # Time-ordered split: last 20% as validation
   n_val  <- max(10L, floor(length(complete_idx) * 0.2))
   n_tr   <- length(complete_idx) - n_val
-  dtrain <- xgb.DMatrix(X_mat[1:n_tr,],     label=y_vec[1:n_tr])
-  dval   <- xgb.DMatrix(X_mat[(n_tr+1):nrow(X_mat),], label=y_vec[(n_tr+1):length(y_vec)])
+  dtrain <- xgb.DMatrix(X_mat[1:n_tr,     , drop=FALSE], label=y_vec[1:n_tr])
+  dval   <- xgb.DMatrix(X_mat[(n_tr+1):nrow(X_mat),, drop=FALSE], label=y_vec[(n_tr+1):length(y_vec)])
   dfull  <- xgb.DMatrix(X_mat, label=y_vec)
 
   fit <- xgb.train(
