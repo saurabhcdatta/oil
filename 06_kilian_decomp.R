@@ -528,43 +528,53 @@ THEME <- theme_minimal(base_size=10) +
 ok <- function(dt) !is.null(dt) && is.data.table(dt) && nrow(dt)>0
 
 # ── Chart 1: Shock decomposition time series ─────────────────────────────────
-if (ok(struct_shocks) && "date" %in% names(struct_shocks)) {
-  sh_long <- melt(struct_shocks[!is.na(date)],
-                  id.vars=c("yyyyqq","date"),
-                  measure.vars=intersect(shock_cols, names(struct_shocks)),
+if (ok(struct_shocks) && length(shock_cols) > 0) {
+
+  # Use yyyyqq directly — date may be NA if parse_q failed
+  # Convert yyyyqq to a sortable numeric for x-axis
+  sc_plot <- copy(struct_shocks)
+  if (all(is.na(sc_plot$date))) {
+    # Fallback: create numeric quarter index from yyyyqq
+    sc_plot[, qtr_idx := as.numeric(factor(yyyyqq, levels=sort(unique(yyyyqq))))]
+    x_var <- "qtr_idx"
+  } else {
+    sc_plot <- sc_plot[!is.na(date)]
+    x_var <- "date"
+  }
+
+  sh_long <- melt(sc_plot,
+                  id.vars=c("yyyyqq", x_var),
+                  measure.vars=intersect(shock_cols, names(sc_plot)),
                   variable.name="shock", value.name="value")
+
   sh_long[, shock_lbl := {
     lbl <- SHOCK_LBL[as.character(shock)]
-    # Fallback: if lookup returns NA, use the raw column name
     ifelse(is.na(lbl), as.character(shock), lbl)
   }]
-  # Only keep rows where shock_lbl has a valid value
   sh_long <- sh_long[!is.na(shock_lbl) & nchar(shock_lbl) > 0]
-  sh_long[, shock_lbl := factor(shock_lbl,
-    levels=unique(sh_long$shock_lbl))]
+  sh_long[, shock_lbl := factor(shock_lbl, levels=unique(sh_long$shock_lbl))]
 
-  # Mark Iran war period
-  iran_start <- as.Date("2025-10-01")
+  msg("sh_long: %d rows | shocks: %s | x_var: %s",
+      nrow(sh_long), paste(unique(sh_long$shock_lbl), collapse=", "), x_var)
+
+  if (nrow(sh_long) > 0 && nlevels(sh_long$shock_lbl) > 0) {
 
   p1 <- ggplot(sh_long[!is.na(value)],
-               aes(x=date, y=value, fill=value>0)) +
-    geom_col(width=60, show.legend=FALSE) +
-    geom_vline(xintercept=iran_start, linetype="dashed",
-               colour="#ae2012", linewidth=0.8) +
-    annotate("label", x=iran_start, y=Inf,
-             label="Iran War\nShock", vjust=1.2,
-             size=2.8, fill="#ae2012", colour="white", fontface="bold") +
+               aes(x=get(x_var), y=value, fill=value>0)) +
+    geom_col(width=if(x_var=="date") 60 else 0.7, show.legend=FALSE) +
     scale_fill_manual(values=c("TRUE"="#0a9396","FALSE"="#ae2012")) +
-    scale_x_date(date_breaks="2 years", date_labels="%Y") +
     facet_wrap(~shock_lbl, ncol=1, scales="free_y") +
-    labs(title="Figure 6.1 — Kilian Structural Oil Shock Decomposition",
-         subtitle="Three shock types identified via Cholesky SVAR | Red = Iran war period",
+    labs(title="Figure 6.1 - Kilian Structural Oil Shock Decomposition",
+         subtitle="Three shock types via Cholesky SVAR | Iran war shock = geopolitical type",
          x=NULL, y="Structural shock magnitude",
-         caption="Kilian (2009) AER methodology | Cholesky ordering: Supply → Demand → Price") +
+         caption="Kilian (2009) AER methodology | Cholesky ordering: Supply - Demand - Price") +
     THEME
   ggsave("Figures/06_fig1_shock_decomp.png", p1,
          width=12, height=10, dpi=300, bg="white")
   msg("Chart 1 saved")
+  } else {
+    msg("Chart 1 skipped - sh_long empty")
+  }
 }
 
 # ── Chart 2: Full-sample vs geopolitical transmission coefficients ────────────
