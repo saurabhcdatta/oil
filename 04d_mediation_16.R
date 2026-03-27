@@ -185,7 +185,7 @@ get_fixest_cf <- function(fit) {
     b  <- coef(fit)
     se <- se(fit)
     pv <- pvalue(fit)
-    rn <- gsub("`", "", names(b))   # strip backticks fixest adds
+    rn <- gsub("`", "", names(b))
     data.frame(
       Estimate       = as.numeric(b),
       `Std. Error`   = as.numeric(se),
@@ -193,7 +193,20 @@ get_fixest_cf <- function(fit) {
       row.names      = rn,
       check.names    = FALSE
     )
-  }, error = function(e) data.frame())
+  }, error = function(e) {
+    # fallback: summary()$coeftable (always populated in fixest)
+    tryCatch({
+      ct <- summary(fit)$coeftable
+      rn <- gsub("`", "", rownames(ct))
+      data.frame(
+        Estimate       = ct[,1],
+        `Std. Error`   = ct[,2],
+        `Pr(>|t|)`     = ct[,4],
+        row.names      = rn,
+        check.names    = FALSE
+      )
+    }, error = function(e2) data.frame())
+  })
 }
 
 safe_cf <- function(cf, name, col) {
@@ -294,34 +307,28 @@ link2 <- rbindlist(lapply(Y_VARS, function(y) {
     # Try 1: CU fixed effects
     fit <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
     cf  <- if (!is.null(fit)) get_fixest_cf(fit) else data.frame()
-    # If macro var was absorbed by CU FE (dropped), fall back
     if (nrow(cf) == 0 || !m %in% rownames(cf)) fit <- NULL
 
-    # Try 2: pooled lm() — never drops regressors due to FE collinearity
-    # Macro vars vary over time so lm identifies them; cluster SE via sandwich
+    # Try 2: pooled lm() — macro vars vary over time so OLS identifies them
     if (is.null(fit)) {
       fit <- tryCatch(
         lm(as.formula(paste0(y," ~ ",rhs)), data=panel_clean),
         error=function(e) NULL)
       if (!is.null(fit)) {
-        # Re-wrap as a pseudo cf using sandwich clustered SE
-        require(sandwich); require(lmtest)
         vcov_cl <- tryCatch(
           sandwich::vcovCL(fit, cluster=~join_number),
           error=function(e) vcov(fit))
         ct <- lmtest::coeftest(fit, vcov=vcov_cl)
         cf <- data.frame(
-          Estimate     = ct[,1],
-          `Std. Error` = ct[,2],
-          `Pr(>|t|)`   = ct[,4],
-          row.names    = rownames(ct),
-          check.names  = FALSE)
+          Estimate       = ct[,1],
+          `Std. Error`   = ct[,2],
+          `Pr(>|t|)`     = ct[,4],
+          row.names      = rownames(ct),
+          check.names    = FALSE)
       }
     }
 
-    if (is.null(fit) || nrow(cf) == 0) return(NULL)
-    if (!m %in% rownames(cf)) return(NULL)
-
+    if (is.null(fit) || nrow(cf) == 0 || !m %in% rownames(cf)) return(NULL)
     r2v <- tryCatch(summary(fit)$r.squared, error=function(e) safe_r2(fit))
     data.table(outcome=y, macro_var=m,
                b_path=cf[m,"Estimate"], b_se=cf[m,"Std. Error"],
@@ -419,18 +426,12 @@ total_eff <- rbindlist(lapply(Y_VARS, function(y) {
   if (!OIL_VAR %in% names(panel_clean)) return(NULL)
   lag_y <- intersect(paste0(y,"_lag",1:P_LAG), names(panel_clean))
   rhs   <- paste(c(OIL_VAR, lag_y), collapse=" + ")
-
-  # Try 1: CU FE
-  fit <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
-  cf  <- if (!is.null(fit)) get_fixest_cf(fit) else data.frame()
-  if (nrow(cf) == 0 || !OIL_VAR %in% rownames(cf)) fit <- NULL
-
-  # Try 2: lm pooled
-  if (is.null(fit)) {
+  fit   <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
+  cf    <- if (!is.null(fit)) get_fixest_cf(fit) else data.frame()
+  if (nrow(cf) == 0 || !OIL_VAR %in% rownames(cf)) {
     fit <- tryCatch(lm(as.formula(paste0(y," ~ ",rhs)), data=panel_clean),
                    error=function(e) NULL)
     if (!is.null(fit)) {
-      require(sandwich); require(lmtest)
       vcov_cl <- tryCatch(sandwich::vcovCL(fit, cluster=~join_number),
                           error=function(e) vcov(fit))
       ct <- lmtest::coeftest(fit, vcov=vcov_cl)
@@ -439,8 +440,7 @@ total_eff <- rbindlist(lapply(Y_VARS, function(y) {
                        check.names=FALSE)
     }
   }
-
-  if (is.null(fit) || nrow(cf) == 0 || !OIL_VAR %in% rownames(cf)) return(NULL)
+  if (is.null(fit) || nrow(cf)==0 || !OIL_VAR %in% rownames(cf)) return(NULL)
   data.table(outcome=y, c_total=cf[OIL_VAR,"Estimate"],
              c_se=cf[OIL_VAR,"Std. Error"], c_p=cf[OIL_VAR,"Pr(>|t|)"])
 }))
@@ -459,19 +459,12 @@ direct_eff <- rbindlist(lapply(Y_VARS, function(y) {
     if (!all(c(y,m,OIL_VAR) %in% names(panel_clean))) return(NULL)
     lag_y <- intersect(paste0(y,"_lag",1:P_LAG), names(panel_clean))
     rhs   <- paste(c(OIL_VAR, m, lag_y), collapse=" + ")
-
-    # Try 1: CU FE
-    fit <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
-    cf  <- if (!is.null(fit)) get_fixest_cf(fit) else data.frame()
-    if (nrow(cf) == 0 || !OIL_VAR %in% rownames(cf) || !m %in% rownames(cf))
-      fit <- NULL
-
-    # Try 2: lm pooled
-    if (is.null(fit)) {
+    fit   <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
+    cf    <- if (!is.null(fit)) get_fixest_cf(fit) else data.frame()
+    if (nrow(cf)==0 || !OIL_VAR %in% rownames(cf) || !m %in% rownames(cf)) {
       fit <- tryCatch(lm(as.formula(paste0(y," ~ ",rhs)), data=panel_clean),
                      error=function(e) NULL)
       if (!is.null(fit)) {
-        require(sandwich); require(lmtest)
         vcov_cl <- tryCatch(sandwich::vcovCL(fit, cluster=~join_number),
                             error=function(e) vcov(fit))
         ct <- lmtest::coeftest(fit, vcov=vcov_cl)
@@ -480,8 +473,7 @@ direct_eff <- rbindlist(lapply(Y_VARS, function(y) {
                          check.names=FALSE)
       }
     }
-
-    if (is.null(fit) || nrow(cf) == 0) return(NULL)
+    if (is.null(fit) || nrow(cf)==0) return(NULL)
     data.table(outcome=y, macro_var=m,
                c_prime=safe_cf(cf, OIL_VAR, "Estimate"),
                b_path =safe_cf(cf, m, "Estimate"),
@@ -711,13 +703,13 @@ p5 <- ggplot() +
            size=2.8,colour="#b5470a",fontface="bold") +
   annotate("label",x=1.75,y=2.35,
            label=sprintf("Link 1\na=%.4f",if(!is.na(mean_a)) mean_a else 0),
-           size=2.8,fill="white",colour="#333",label.size=0.2,fontface="bold") +
+           size=2.8,fill="white",colour="#333",fontface="bold") +
   annotate("label",x=3.2,y=2.35,
            label=sprintf("Link 2\nb=%.4f",if(!is.na(mean_b)) mean_b else 0),
-           size=2.8,fill="white",colour="#333",label.size=0.2,fontface="bold") +
+           size=2.8,fill="white",colour="#333",fontface="bold") +
   annotate("label",x=3.95,y=2.35,
            label=sprintf("Link 3\nAR=%.2f",if(!is.na(mean_ar)) mean_ar else 0),
-           size=2.8,fill="white",colour="#333",label.size=0.2,fontface="bold") +
+           size=2.8,fill="white",colour="#333",fontface="bold") +
   geom_tile(data=nodes, aes(x=x,y=y,fill=col),
             width=0.9,height=0.55,colour="white",linewidth=1.2) +
   scale_fill_identity() +
