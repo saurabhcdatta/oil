@@ -116,10 +116,13 @@ for (v in intersect(Y_VARS, names(panel))) {
   }
 }
 
-# Parse yyyyqq to date
+# Parse yyyyqq to date  (format: "2010.2" → 2010-04-01)
 parse_q <- function(x) {
-  p <- str_split_fixed(as.character(x),"\\.",2)
-  as.Date(sprintf("%s-%02d-01", p[,1], (as.integer(p[,2])-1)*3+1))
+  p    <- str_split_fixed(as.character(x), "\\.", 2)
+  yr   <- as.integer(p[, 1])          # plain integer vector
+  qtr  <- as.integer(p[, 2])          # plain integer vector
+  mo   <- (qtr - 1L) * 3L + 1L
+  as.Date(sprintf("%04d-%02d-01", yr, mo))
 }
 panel[, date := parse_q(yyyyqq)]
 
