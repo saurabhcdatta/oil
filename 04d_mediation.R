@@ -1,38 +1,8 @@
 # =============================================================================
-# SCRIPT 04d — MEDIATION ANALYSIS: OIL → MACRO → CU BALANCE SHEET → OUTCOMES
-# Version 5 | 2026-03-27
-# Project: Oil Price Shock × Credit Union Research
-# Working Dir: S:/Projects/Oil_Price_Shock_2026/
-#
-# PURPOSE:
-#   Formally establish the three-link Baron-Kenny causal chain:
-#     Link 1: Oil (PBRENT) → Macro variables (time-series OLS)
-#     Link 2: Macro variables → CU balance sheet (panel FE, pooled fallback)
-#     Link 3: CU balance sheet → CU outcomes (AR persistence, panel FE)
-#   Sobel standard errors for indirect effects.
-#   Causal chain diagram output in ggplot2.
-#
-# CRITICAL FIXEST RULE (enforced throughout):
-#   NEVER use coef(summary(fit)) — returns empty matrix for feols objects.
-#   ALWAYS use: coef(fit), se(fit), pvalue(fit)   [fixest native API]
-#
-# INPUTS:
-#   Models/panel_model.rds        — CU panel with macro vars ALREADY merged
-#   Results/04d_link1_oil_macro.csv  — if Link 1 was saved in a prior run
-#
-# OUTPUTS:
-#   Results/04d_link1_oil_macro.csv
-#   Results/04d_link2_macro_cu.csv
-#   Results/04d_link3_ar_persistence.csv
-#   Results/04d_sobel_indirect.csv
-#   Figures/04d_link1_elasticities.png
-#   Figures/04d_link2_macro_cu.png
-#   Figures/04d_causal_chain_diagram.png
+# Script 04d — Mediation Analysis: Oil → Macro → CU Balance Sheet → Outcomes
+# Baron-Kenny three-link causal chain
 # =============================================================================
 
-cat(sprintf("\n=== 04d_mediation.R | v5 | %s ===\n\n", Sys.time()))
-
-# ── 0. Packages ───────────────────────────────────────────────────────────────
 suppressPackageStartupMessages({
   library(data.table)
   library(fixest)
@@ -42,562 +12,716 @@ suppressPackageStartupMessages({
   library(stringr)
 })
 
-# ── 0.1 Utility: extract coefficients from ANY model (fixest or lm) ──────────
-# REASON THIS EXISTS: coef(summary(feols_object)) returns an empty named matrix.
-# The correct fixest API is coef(), se(), pvalue().
-# This helper unifies feols + lm into one interface.
-get_cf <- function(fit) {
-  if (is.null(fit)) return(NULL)
-  if (inherits(fit, "fixest")) {
-    # fixest native API — the ONLY safe way
-    cf  <- coef(fit)
-    se_ <- se(fit)
-    pv  <- pvalue(fit)
-    terms_ <- names(cf)
-    data.table(
-      term     = terms_,
-      estimate = as.numeric(cf),
-      std_err  = as.numeric(se_),
-      p_value  = as.numeric(pv)
-    )
-  } else {
-    # lm / standard model
-    sm <- summary(fit)$coefficients
-    data.table(
-      term     = rownames(sm),
-      estimate = sm[, 1L],
-      std_err  = sm[, 2L],
-      p_value  = sm[, 4L]
-    )
-  }
-}
+hdr <- function(x) cat("\n", strrep("=",70), "\n##", x, "\n", strrep("=",70), "\n")
+msg <- function(fmt, ...) cat(sprintf(paste0("  ", fmt, "\n"), ...))
 
-# Helper: find a coefficient row by partial name match (strips backticks)
-find_coef <- function(cf_dt, pattern) {
-  if (is.null(cf_dt) || nrow(cf_dt) == 0L) return(NULL)
-  terms_clean <- gsub("`", "", cf_dt$term)
-  idx <- grep(pattern, terms_clean, fixed = TRUE)
-  if (length(idx) == 0L) idx <- grep(pattern, terms_clean)
-  if (length(idx) == 0L) return(NULL)
-  cf_dt[idx[1L]]
-}
+dir.create("Results", showWarnings=FALSE)
+dir.create("Figures", showWarnings=FALSE)
 
-# msg helper
-msg <- function(...) cat(sprintf(...), "\n")
+set.seed(20260101L)
+t0 <- proc.time()
 
-# ── 1. Load panel ─────────────────────────────────────────────────────────────
-msg("[04d] Loading panel_model.rds...")
-panel_model <- readRDS("Models/panel_model.rds")
-setDT(panel_model)
+cat("\n")
+cat("  ██████████████████████████████████████████████████████████\n")
+cat("  ██  Script 04d — Mediation Analysis [v4 — 2026-03-27]  ██\n")
+cat("  ██  If you do NOT see this banner — WRONG FILE          ██\n")
+cat("  ██████████████████████████████████████████████████████████\n")
+cat("\n")
 
-msg("  Rows: %s | CUs: %s | Quarters: %s",
-    format(nrow(panel_model), big.mark = ","),
-    format(uniqueN(panel_model$join_number), big.mark = ","),
-    format(uniqueN(panel_model$yyyyqq), big.mark = ","))
+# =============================================================================
+# 0. CONFIGURATION — explicit, no auto-detection
+# =============================================================================
+hdr("SECTION 0: Configuration")
 
-# ── 1.1 Confirm macro vars are present in panel ───────────────────────────────
-MACRO_VARS <- c("macro_base_lurc",    # unemployment
-                "macro_base_pcpi",    # CPI
-                "macro_base_yield_curve",
-                "macro_base_rmtg",    # mortgage rate
-                "hpi_yoy")            # HPI
+Y_VARS <- c("dq_rate","pll_rate","netintmrg","insured_share_growth",
+            "member_growth_yoy","costfds","loan_to_share","pcanetworth")
 
-present_macros <- intersect(MACRO_VARS, names(panel_model))
-missing_macros <- setdiff(MACRO_VARS, names(panel_model))
-
-if (length(missing_macros) > 0) {
-  warning("MACRO_VARS missing from panel_model: ",
-          paste(missing_macros, collapse = ", "),
-          "\n  → Check that macro_base.rds merge happened in Script 02/03.")
-}
-msg("  Macro vars present in panel: %s / %s",
-    length(present_macros), length(MACRO_VARS))
-
-# Key outcome variables (CU balance sheet)
-OUTCOME_VARS <- c("nim_ratio", "delinq_rate", "chgoff_rate",
-                  "nw_ratio", "loan_to_share", "cost_of_funds")
-present_outcomes <- intersect(OUTCOME_VARS, names(panel_model))
-
-# Oil variable
-OIL_VAR <- "macro_base_yoy_oil"   # YoY % change in PBRENT, from FRB CCAR
-if (!OIL_VAR %in% names(panel_model))
-  stop("Oil variable '", OIL_VAR, "' not found in panel_model. Check merge.")
-
-# ── 1.2 Build a QUARTER-LEVEL time series for Links 1 & aggregate checks ─────
-# Macro vars are constant within quarter → one row per quarter suffices for
-# Link 1 (oil → macro). We also need it to confirm constant-within-quarter.
-quarter_ts <- panel_model[,
-  .(
-    macro_base_yoy_oil    = first(macro_base_yoy_oil),
-    macro_base_lurc       = first(get(intersect("macro_base_lurc",    names(panel_model))[1], .SD)),
-    macro_base_pcpi       = first(get(intersect("macro_base_pcpi",    names(panel_model))[1], .SD)),
-    macro_base_yield_curve = first(get(intersect("macro_base_yield_curve", names(panel_model))[1], .SD)),
-    macro_base_rmtg       = first(get(intersect("macro_base_rmtg",    names(panel_model))[1], .SD)),
-    hpi_yoy               = if ("hpi_yoy" %in% names(panel_model))
-                               first(hpi_yoy) else NA_real_
-  ),
-  keyby = yyyyqq
-]
-
-# Safer version without using `first(get(...))` which can fail:
-quarter_ts <- unique(
-  panel_model[, c("yyyyqq", OIL_VAR, present_macros), with = FALSE],
-  by = "yyyyqq"
+OUTCOME_LABELS <- c(
+  dq_rate="Delinquency Rate", pll_rate="PLL Rate",
+  netintmrg="Net Interest Margin", insured_share_growth="Deposit Growth",
+  member_growth_yoy="Membership Growth", costfds="Cost of Funds",
+  loan_to_share="Loan-to-Share", pcanetworth="Net Worth Ratio"
 )
-setkey(quarter_ts, yyyyqq)
 
-msg("  Quarter time-series: %d quarters", nrow(quarter_ts))
+# These will be resolved against actual data after loading
+# Candidates listed in order of preference
+OIL_CANDIDATES   <- c("macro_base_yoy_oil","yoy_oil","oil_yoy","pbrent_yoy")
+MACRO_CANDIDATES <- list(
+  unemp  = c("macro_base_lurc","lurc","unemployment"),
+  cpi    = c("macro_base_pcpi","pcpi","cpi_level"),
+  yield  = c("macro_base_yield_curve","yield_curve","term_spread"),
+  mtg    = c("macro_base_rmtg","rmtg","mortgage_rate"),
+  hpi    = c("hpi_yoy","hpi","house_price_yoy")
+)
+MACRO_NICE <- c(unemp="Unemployment",cpi="CPI Level",
+                yield="Yield Curve",mtg="Mortgage Rate",hpi="HPI YoY")
+
+P_LAG <- 2L
 
 # =============================================================================
-# LINK 1: OIL → MACRO VARIABLES (time-series OLS)
-# y_t = α + β · oil_t + ε_t
-# where oil_t = macro_base_yoy_oil (YoY % PBRENT from FRB CCAR)
-# Dynamic spec: add lag(y, 1) to control for persistence
+# 1. LOAD DATA
 # =============================================================================
-msg("\n[04d] LINK 1: Oil → Macro variables (time-series OLS)...")
+hdr("SECTION 1: Load Data")
 
-link1_results <- rbindlist(lapply(present_macros, function(mv) {
-  df1 <- quarter_ts[!is.na(get(OIL_VAR)) & !is.na(get(mv))]
+panel      <- readRDS("Data/panel_model.rds")
+macro_base <- readRDS("Data/macro_base.rds")
+setDT(panel); setDT(macro_base)
 
-  # Add lag of dependent variable for AR(1) correction
-  df1[, y_lag := shift(get(mv), 1L)]
-  df1 <- df1[!is.na(y_lag)]
+# Print available columns for diagnosis
+msg("panel columns (%d): %s ...", length(names(panel)),
+    paste(head(names(panel), 20), collapse=", "))
+msg("macro_base columns (%d): %s ...", length(names(macro_base)),
+    paste(head(names(macro_base), 20), collapse=", "))
 
-  if (nrow(df1) < 20L) {
-    msg("  %-35s : too few obs (%d), skipping", mv, nrow(df1))
-    return(NULL)
+# ── Resolve column names against actual data ──────────────────────────────────
+resolve_col <- function(candidates, data_names, label) {
+  found <- intersect(candidates, data_names)
+  if (length(found) > 0) {
+    msg("  %-20s -> %s", label, found[1])
+    return(found[1])
   }
-
-  fml <- as.formula(sprintf("`%s` ~ `%s` + y_lag", mv, OIL_VAR))
-  fit <- tryCatch(lm(fml, data = df1), error = function(e) NULL)
-  cf  <- get_cf(fit)
-  row <- find_coef(cf, OIL_VAR)
-
-  if (is.null(row)) {
-    msg("  %-35s : OLS ran but oil coef not found", mv)
-    return(data.table(macro_var = mv, beta = NA_real_,
-                      se = NA_real_, pval = NA_real_, n = nrow(df1)))
-  }
-
-  sig <- dplyr::case_when(
-    row$p_value < 0.001 ~ "***",
-    row$p_value < 0.01  ~ "** ",
-    row$p_value < 0.05  ~ "*  ",
-    row$p_value < 0.10  ~ ".  ",
-    TRUE                 ~ "   "
-  )
-  msg("  %-35s : β=%+.4f  SE=%.4f  p=%.3f %s",
-      mv, row$estimate, row$std_err, row$p_value, sig)
-
-  data.table(macro_var = mv,
-             beta      = row$estimate,
-             se        = row$std_err,
-             pval      = row$p_value,
-             stars     = trimws(sig),
-             n         = nrow(df1))
-}))
-
-fwrite(link1_results, "Results/04d_link1_oil_macro.csv")
-msg("  Link 1 → Results/04d_link1_oil_macro.csv")
-
-# Link 1 plot
-if (!is.null(link1_results) && nrow(link1_results) > 0 &&
-    any(!is.na(link1_results$beta))) {
-
-  p_link1 <- link1_results[!is.na(beta)] |>
-    ggplot(aes(x = reorder(macro_var, beta),
-               y = beta, fill = beta > 0)) +
-    geom_col(width = 0.6, show.legend = FALSE) +
-    geom_errorbar(aes(ymin = beta - 1.96 * se,
-                      ymax = beta + 1.96 * se), width = 0.25) +
-    geom_text(aes(label = paste0(round(beta, 3), " ", stars),
-                  y = beta + sign(beta) * 0.002),
-              size = 3.2, hjust = 0.5, vjust = -0.4) +
-    coord_flip() +
-    scale_fill_manual(values = c("TRUE" = "#0a9396", "FALSE" = "#ae2012")) +
-    labs(title    = "Link 1: Oil Price → Macro Variables",
-         subtitle = "OLS with AR(1) correction | Dep var = FRB CCAR macro | *** p<0.001",
-         x = NULL, y = "β (effect of YoY PBRENT change)") +
-    theme_minimal(base_size = 11) +
-    theme(panel.grid.minor = element_blank(),
-          plot.title = element_text(face = "bold"))
-
-  ggsave("Figures/04d_link1_elasticities.png", p_link1,
-         width = 9, height = 5, dpi = 150, bg = "white")
-  msg("  Link 1 plot → Figures/04d_link1_elasticities.png")
+  msg("  %-20s -> NOT FOUND in %s", label, deparse(substitute(data_names)))
+  return(NULL)
 }
 
-# =============================================================================
-# LINK 2: MACRO → CU BALANCE SHEET
-#
-# IDENTIFICATION PROBLEM:
-#   Macro vars (unemployment, CPI, etc.) are CROSS-SECTIONALLY CONSTANT —
-#   the same value for every CU in a given quarter.
-#   CU fixed effects (| join_number) absorb all within-CU time variation,
-#   but quarter FE (| yyyyqq) would absorb the macro vars entirely.
-#
-# SOLUTION:
-#   Use TWO-WAY FE = CU FE + quarter FE is impossible with pure time-series
-#   macro regressors. Instead:
-#   (a) feols with CU FE only (| join_number), NO quarter FE
-#       → macro vars vary over time, CU FE absorbs time-invariant CU traits
-#   (b) Pooled OLS with clustered SE as robustness
-#   The CU FE-only spec is the primary (it removes omitted CU heterogeneity
-#   without absorbing the time-varying macro signal).
-# =============================================================================
-msg("\n[04d] LINK 2: Macro → CU balance sheet (CU FE, no quarter FE)...")
+# Search both panel AND macro_base for each variable
+all_cols <- unique(c(names(panel), names(macro_base)))
 
-link2_results <- rbindlist(lapply(present_outcomes, function(ov) {
-  rbindlist(lapply(present_macros, function(mv) {
+msg("Resolving variable names:")
+OIL_VAR <- resolve_col(OIL_CANDIDATES, all_cols, "Oil YoY")
 
-    df2 <- panel_model[!is.na(get(ov)) & !is.na(get(mv)) & !is.na(join_number)]
-
-    if (nrow(df2) < 500L) {
-      msg("  %-25s ~ %-30s : too few obs", ov, mv)
-      return(NULL)
-    }
-
-    # Primary: CU fixed effects only (macro var varies over time → identified)
-    fml_fe <- as.formula(sprintf("`%s` ~ `%s` | join_number", ov, mv))
-
-    fit_fe <- tryCatch(
-      feols(fml_fe, data = df2, cluster = ~join_number, warn = FALSE),
-      error = function(e) NULL
-    )
-
-    cf_fe  <- get_cf(fit_fe)
-    row_fe <- find_coef(cf_fe, mv)
-
-    # Fallback: pooled OLS with clustered SE (if FE fails or returns NULL)
-    fit_pool <- NULL
-    row_pool <- NULL
-    if (is.null(row_fe)) {
-      fml_pool <- as.formula(sprintf("`%s` ~ `%s`", ov, mv))
-      fit_pool <- tryCatch(
-        feols(fml_pool, data = df2, cluster = ~join_number, warn = FALSE),
-        error = function(e) NULL
-      )
-      cf_pool  <- get_cf(fit_pool)
-      row_pool <- find_coef(cf_pool, mv)
-    }
-
-    row  <- if (!is.null(row_fe)) row_fe else row_pool
-    spec <- if (!is.null(row_fe)) "CU FE" else "Pooled OLS"
-
-    if (is.null(row)) {
-      msg("  %-25s ~ %-30s : BOTH specs returned NULL", ov, mv)
-      return(data.table(outcome = ov, macro_var = mv,
-                        beta = NA_real_, se = NA_real_,
-                        pval = NA_real_, spec = "failed", n = nrow(df2)))
-    }
-
-    sig <- dplyr::case_when(
-      row$p_value < 0.001 ~ "***",
-      row$p_value < 0.01  ~ "** ",
-      row$p_value < 0.05  ~ "*  ",
-      row$p_value < 0.10  ~ ".  ",
-      TRUE                 ~ "   "
-    )
-    msg("  %-25s ~ %-30s : β=%+.4f  p=%.3f %s [%s]",
-        ov, mv, row$estimate, row$p_value, trimws(sig), spec)
-
-    data.table(outcome   = ov,
-               macro_var = mv,
-               beta      = row$estimate,
-               se        = row$std_err,
-               pval      = row$p_value,
-               stars     = trimws(sig),
-               spec      = spec,
-               n         = nrow(df2))
-  }))
-}))
-
-fwrite(link2_results, "Results/04d_link2_macro_cu.csv")
-msg("  Link 2 → Results/04d_link2_macro_cu.csv")
-msg("  Rows with estimates: %d / %d",
-    sum(!is.na(link2_results$beta)), nrow(link2_results))
-
-# Link 2 heatmap
-if (any(!is.na(link2_results$beta))) {
-
-  p_link2 <- link2_results[!is.na(beta)] |>
-    ggplot(aes(x = macro_var, y = outcome, fill = beta)) +
-    geom_tile(color = "white") +
-    geom_text(aes(label = paste0(round(beta, 3), "\n", stars)),
-              size = 2.8) +
-    scale_fill_gradient2(low = "#ae2012", mid = "white", high = "#0a9396",
-                         midpoint = 0, name = "β") +
-    labs(title    = "Link 2: Macro Variables → CU Balance Sheet",
-         subtitle = "CU fixed effects | Cluster SE by CU",
-         x = "Macro Variable", y = "CU Outcome") +
-    theme_minimal(base_size = 10) +
-    theme(axis.text.x = element_text(angle = 30, hjust = 1),
-          plot.title   = element_text(face = "bold"))
-
-  ggsave("Figures/04d_link2_macro_cu.png", p_link2,
-         width = 10, height = 6, dpi = 150, bg = "white")
-  msg("  Link 2 plot → Figures/04d_link2_macro_cu.png")
+MACRO_VARS   <- character(0)
+MACRO_LABELS <- character(0)
+for (nm in names(MACRO_CANDIDATES)) {
+  col <- resolve_col(MACRO_CANDIDATES[[nm]], all_cols, MACRO_NICE[nm])
+  if (!is.null(col)) {
+    MACRO_VARS   <- c(MACRO_VARS, col)
+    MACRO_LABELS <- c(MACRO_LABELS, MACRO_NICE[nm])
+  }
 }
+names(MACRO_LABELS) <- MACRO_VARS
 
-# =============================================================================
-# LINK 3: AR PERSISTENCE OF CU BALANCE SHEET OUTCOMES
-# y_{i,t} = α_i + ρ · y_{i,t-1} + ε_{i,t}
-# ρ is the persistence coefficient: how long a shock to the balance sheet lasts.
-# Use CU FE only (same reasoning as Link 2 — no quarter FE to avoid
-# eliminating the lagged-DV variation).
-# =============================================================================
-msg("\n[04d] LINK 3: AR(1) persistence of CU outcomes (CU FE)...")
+if (is.null(OIL_VAR)) stop("Oil variable not found — check OIL_CANDIDATES")
+if (length(MACRO_VARS) == 0) stop("No macro variables found — check MACRO_CANDIDATES")
+msg("Using oil var: %s | macro vars (%d): %s",
+    OIL_VAR, length(MACRO_VARS), paste(MACRO_VARS, collapse=", "))
 
-link3_results <- rbindlist(lapply(present_outcomes, function(ov) {
-  lag_col <- paste0(ov, "_lag1")
-
-  df3 <- copy(panel_model[!is.na(get(ov)) & !is.na(join_number)])
-  setkey(df3, join_number, yyyyqq)
-  df3[, (lag_col) := shift(get(ov), 1L), by = join_number]
-  df3 <- df3[!is.na(get(lag_col))]
-
-  if (nrow(df3) < 500L) {
-    msg("  %-30s : too few obs (%d)", ov, nrow(df3))
-    return(NULL)
-  }
-
-  fml_ar <- as.formula(sprintf("`%s` ~ `%s` | join_number", ov, lag_col))
-
-  fit_ar <- tryCatch(
-    feols(fml_ar, data = df3, cluster = ~join_number, warn = FALSE),
-    error = function(e) NULL
-  )
-
-  cf_ar  <- get_cf(fit_ar)
-  row_ar <- find_coef(cf_ar, lag_col)
-
-  # Within-R²
-  r2_within <- tryCatch(
-    as.numeric(r2(fit_ar, "wr2"))[[1L]],
-    error = function(e) NA_real_
-  )
-
-  if (is.null(row_ar)) {
-    msg("  %-30s : AR(1) coef not found in fixest output", ov)
-    # Try fallback column name without backticks
-    row_ar <- find_coef(cf_ar, gsub("`", "", lag_col))
-  }
-
-  if (is.null(row_ar)) {
-    msg("  %-30s : AR(1) FAILED", ov)
-    return(data.table(outcome = ov, ar1 = NA_real_,
-                      se = NA_real_, pval = NA_real_,
-                      r2_within = r2_within, n = nrow(df3)))
-  }
-
-  msg("  %-30s : AR1=%+.4f  p=%.3f  within-R²=%.3f  N=%s",
-      ov, row_ar$estimate, row_ar$p_value,
-      r2_within %||% NA_real_,
-      format(nrow(df3), big.mark = ","))
-
-  data.table(outcome   = ov,
-             ar1       = row_ar$estimate,
-             se        = row_ar$std_err,
-             pval      = row_ar$p_value,
-             r2_within = r2_within,
-             n         = nrow(df3))
-}))
-
-fwrite(link3_results, "Results/04d_link3_ar_persistence.csv")
-msg("  Link 3 → Results/04d_link3_ar_persistence.csv")
-
-# =============================================================================
-# SOBEL INDIRECT EFFECTS
-# Indirect effect = β_link1 × β_link2
-# SE (Sobel) = sqrt( β2² × se1² + β1² × se2² )
-# This quantifies: how much of oil's effect on CU outcomes flows through
-# each macro channel?
-# =============================================================================
-msg("\n[04d] Computing Sobel indirect effects...")
-
-# For Sobel we need:
-#   Link 1: oil → macro_var  (β1, se1)
-#   Link 2: macro_var → CU outcome  (β2, se2)
-# Indirect = β1 × β2 through each macro channel
-
-sobel_results <- rbindlist(lapply(present_macros, function(mv) {
-  l1 <- link1_results[macro_var == mv]
-  if (nrow(l1) == 0 || is.na(l1$beta)) return(NULL)
-
-  rbindlist(lapply(present_outcomes, function(ov) {
-    l2 <- link2_results[macro_var == mv & outcome == ov]
-    if (nrow(l2) == 0 || is.na(l2$beta)) return(NULL)
-
-    b1 <- l1$beta;  se1 <- l1$se
-    b2 <- l2$beta;  se2 <- l2$se
-
-    indirect <- b1 * b2
-    se_sobel <- sqrt(b2^2 * se1^2 + b1^2 * se2^2)
-    z_sobel  <- indirect / se_sobel
-    p_sobel  <- 2 * pnorm(-abs(z_sobel))
-
-    data.table(
-      macro_channel = mv,
-      cu_outcome    = ov,
-      beta_link1    = b1,
-      beta_link2    = b2,
-      indirect      = indirect,
-      se_sobel      = se_sobel,
-      z_sobel       = z_sobel,
-      p_sobel       = p_sobel
-    )
-  }))
-}))
-
-if (!is.null(sobel_results) && nrow(sobel_results) > 0) {
-  fwrite(sobel_results, "Results/04d_sobel_indirect.csv")
-  msg("  Sobel results → Results/04d_sobel_indirect.csv")
-  print(sobel_results[order(-abs(indirect))][1:min(10, .N)],
-        digits = 4)
+# ── Merge macro_base onto panel for any vars not already present ──────────────
+vars_need_merge <- setdiff(c(OIL_VAR, MACRO_VARS), names(panel))
+vars_need_merge <- intersect(vars_need_merge, names(macro_base))
+if (length(vars_need_merge) > 0) {
+  mc <- c("yyyyqq", vars_need_merge)
+  panel <- merge(panel, macro_base[, ..mc], by="yyyyqq", all.x=TRUE)
+  msg("Merged from macro_base: %s", paste(vars_need_merge, collapse=", "))
 } else {
-  msg("  Sobel: no complete Link 1 × Link 2 pairs found.")
+  msg("All variables already in panel")
+}
+
+# ── Build lag columns ─────────────────────────────────────────────────────────
+setorder(panel, join_number, yyyyqq)
+vars_to_lag <- intersect(c(Y_VARS, MACRO_VARS, OIL_VAR), names(panel))
+for (v in vars_to_lag) {
+  for (k in 1:P_LAG) {
+    nm <- paste0(v, "_lag", k)
+    if (!nm %in% names(panel))
+      panel[, (nm) := shift(.SD[[v]], k, type="lag"),
+             by=join_number, .SDcols=v]
+  }
+}
+msg("Lags built for %d variables", length(vars_to_lag))
+
+# ── Build panel_clean (complete cases on all required columns) ────────────────
+req_cols <- unique(c("join_number","yyyyqq",
+  Y_VARS, OIL_VAR, MACRO_VARS,
+  paste0(OIL_VAR,  "_lag", 1:P_LAG),
+  unlist(lapply(Y_VARS,      function(v) paste0(v,"_lag",1:P_LAG))),
+  unlist(lapply(MACRO_VARS,  function(v) paste0(v,"_lag",1:P_LAG)))
+))
+req_cols   <- intersect(req_cols, names(panel))
+panel_clean <- panel[complete.cases(panel[, ..req_cols])]
+msg("panel_clean: %s obs | %s CUs",
+    format(nrow(panel_clean),big.mark=","),
+    format(uniqueN(panel_clean$join_number),big.mark=","))
+
+# Verify key vars are present
+missing_key <- setdiff(c(OIL_VAR, MACRO_VARS), names(panel_clean))
+if (length(missing_key) > 0)
+  warning("Missing from panel_clean: ", paste(missing_key, collapse=", "))
+
+# ── Build quarterly aggregate for Link 1 (time-series) ───────────────────────
+ts_cols <- intersect(c(OIL_VAR, MACRO_VARS,
+  paste0(OIL_VAR, "_lag", 1:P_LAG),
+  unlist(lapply(MACRO_VARS, function(v) paste0(v,"_lag",1:P_LAG)))),
+  names(panel))
+agg_ts  <- panel[, lapply(.SD, mean, na.rm=TRUE), by=yyyyqq, .SDcols=ts_cols]
+setorder(agg_ts, yyyyqq)
+msg("agg_ts: %d quarters | %d columns", nrow(agg_ts), ncol(agg_ts))
+
+# =============================================================================
+# 2. SAFE REGRESSION HELPERS
+# =============================================================================
+# safe_feols: run panel FE regression, return NULL on any error
+safe_feols <- function(formula_str, data) {
+  tryCatch(
+    feols(as.formula(formula_str), data=data,
+          se="cluster", cluster=~join_number, notes=FALSE),
+    error=function(e) NULL
+  )
+}
+
+# safe_r2: extract R² — fixest native approach
+safe_r2 <- function(fit) {
+  tryCatch(r2(fit, type="within"),
+    error=function(e) tryCatch(r2(fit, type="r2"),
+      error=function(e2) NA_real_))
+}
+
+# safe_cf: extract from fixest model directly (more reliable than coef(summary()))
+# Returns named list: Estimate, SE, pval for each coefficient
+get_fixest_cf <- function(fit) {
+  tryCatch({
+    b  <- coef(fit)            # named numeric vector
+    se <- se(fit)              # named numeric vector
+    pv <- pvalue(fit)          # named numeric vector
+    data.frame(
+      Estimate       = as.numeric(b),
+      `Std. Error`   = as.numeric(se),
+      `Pr(>|t|)`     = as.numeric(pv),
+      row.names      = names(b),
+      check.names    = FALSE
+    )
+  }, error = function(e) {
+    # fallback to coef(summary())
+    tryCatch(as.data.frame(get_fixest_cf(fit)),
+             error=function(e2) data.frame())
+  })
+}
+
+safe_cf <- function(cf, name, col) {
+  if (nrow(cf) == 0) return(NA_real_)
+  clean <- gsub("`","", rownames(cf))
+  idx   <- which(clean == gsub("`","", name))
+  if (length(idx) > 0) cf[idx[1], col] else NA_real_
 }
 
 # =============================================================================
-# CAUSAL CHAIN DIAGRAM (ggplot2)
-# Oil → Macro → CU Balance Sheet → CU Outcomes
-# Shows β coefficients with significance stars at each arrow
+# 3. LINK 1 — OIL → MACRO (time-series OLS)
 # =============================================================================
-msg("\n[04d] Building causal chain diagram...")
+hdr("SECTION 3: Link 1 — Oil → Macro Variables")
 
-# Pull headline coefficients for diagram labels
-# Link 1: oil → CPI (strongest expected)
-b_oil_cpi <- {
-  r <- link1_results[macro_var == "macro_base_pcpi"]
-  if (nrow(r) > 0 && !is.na(r$beta))
-    sprintf("β=%.3f%s", r$beta, r$stars) else "N/A"
+link1 <- rbindlist(lapply(MACRO_VARS, function(m) {
+  if (!m %in% names(agg_ts)) { msg("SKIP %s — not in agg_ts", m); return(NULL) }
+  lag_oil <- intersect(paste0(OIL_VAR,"_lag",1:P_LAG), names(agg_ts))
+  lag_m   <- intersect(paste0(m,"_lag",1:P_LAG), names(agg_ts))
+  rhs     <- paste(c(OIL_VAR, lag_oil, lag_m), collapse=" + ")
+  fit     <- tryCatch(
+    lm(as.formula(paste0(m," ~ ",rhs)),
+       data=agg_ts[complete.cases(agg_ts[, c(m,OIL_VAR,lag_oil,lag_m), with=FALSE])]),
+    error=function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  cf <- summary(fit)$coefficients
+  if (!OIL_VAR %in% rownames(cf)) return(NULL)
+  ar1  <- if (paste0(m,"_lag1") %in% rownames(cf)) cf[paste0(m,"_lag1"),"Estimate"] else 0
+  data.table(
+    macro_var   = m,
+    macro_label = MACRO_LABELS[m],
+    a_path      = cf[OIL_VAR,"Estimate"],
+    a_se        = cf[OIL_VAR,"Std. Error"],
+    a_p         = cf[OIL_VAR,"Pr(>|t|)"],
+    lr_mult     = if (abs(1-ar1)>0.01) cf[OIL_VAR,"Estimate"]/(1-ar1) else NA_real_,
+    r2          = summary(fit)$r.squared,
+    n_obs       = nobs(fit),
+    sig         = fcase(cf[OIL_VAR,"Pr(>|t|)"]<0.01,"***",
+                        cf[OIL_VAR,"Pr(>|t|)"]<0.05,"**",
+                        cf[OIL_VAR,"Pr(>|t|)"]<0.10,"*", default="")
+  )
+}))
+
+fwrite(link1, "Results/04d_link1_oil_macro.csv")
+msg("Link 1: %d macro vars estimated", nrow(link1))
+if (nrow(link1) > 0)
+  print(link1[, .(macro_label, a_path=round(a_path,4), a_se=round(a_se,4),
+                   a_p=round(a_p,4), sig, lr=round(lr_mult,3), r2=round(r2,3))])
+
+# =============================================================================
+# 4. LINK 2 — MACRO → CU OUTCOMES (panel FE)
+# =============================================================================
+hdr("SECTION 4: Link 2 — Macro Variables → CU Outcomes")
+
+# DIAGNOSTIC: show exactly what's available
+msg("panel_clean columns: %d total", length(names(panel_clean)))
+msg("Y_VARS in panel_clean: %s",
+    paste(intersect(Y_VARS, names(panel_clean)), collapse=", "))
+msg("MACRO_VARS in panel_clean: %s",
+    paste(intersect(MACRO_VARS, names(panel_clean)), collapse=", "))
+msg("OIL_VAR in panel_clean: %s", as.character(OIL_VAR %in% names(panel_clean)))
+macro_lags_present <- intersect(paste0(MACRO_VARS[1],"_lag1"), names(panel_clean))
+msg("Sample lag check (%s_lag1): %s", MACRO_VARS[1],
+    as.character(length(macro_lags_present) > 0))
+
+# If MACRO_VARS not in panel_clean, try adding them now from panel
+macro_missing_pc <- setdiff(MACRO_VARS, names(panel_clean))
+if (length(macro_missing_pc) > 0) {
+  msg("Adding missing macro vars to panel_clean from panel ...")
+  avail <- intersect(macro_missing_pc, names(panel))
+  if (length(avail) > 0) {
+    merge_key <- c("join_number","yyyyqq",avail)
+    panel_clean <- merge(panel_clean,
+                          panel[, ..merge_key],
+                          by=c("join_number","yyyyqq"), all.x=TRUE)
+    msg("Added: %s", paste(avail, collapse=", "))
+    # Build their lags too
+    setorder(panel_clean, join_number, yyyyqq)
+    for (v in avail) {
+      for (k in 1:P_LAG) {
+        nm <- paste0(v,"_lag",k)
+        if (!nm %in% names(panel_clean))
+          panel_clean[, (nm) := shift(.SD[[v]], k, type="lag"),
+                       by=join_number, .SDcols=v]
+      }
+    }
+  }
 }
-b_oil_unemp <- {
-  r <- link1_results[macro_var == "macro_base_lurc"]
-  if (nrow(r) > 0 && !is.na(r$beta))
-    sprintf("β=%.3f%s", r$beta, r$stars) else "N/A"
+
+# NOTE: Macro vars vary only over time (not across CUs).
+# CU fixed effects absorb them — fall back to pooled OLS if needed.
+
+link2 <- rbindlist(lapply(Y_VARS, function(y) {
+  rbindlist(lapply(MACRO_VARS, function(m) {
+    if (!all(c(y,m) %in% names(panel_clean))) return(NULL)
+    lag_y <- intersect(paste0(y,"_lag",1:P_LAG), names(panel_clean))
+    rhs   <- paste(c(m, lag_y), collapse=" + ")
+
+    # Try 1: CU fixed effects (ideal if macro var has residual variation)
+    fit <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
+
+    # If collinear (fixest drops the macro var), fall back to pooled OLS
+    if (!is.null(fit)) {
+      cf <- get_fixest_cf(fit)
+      if (!m %in% gsub("`","",rownames(cf))) fit <- NULL  # var was dropped — collinear
+    }
+
+    # Try 2: pooled OLS with clustered SE (no FE — macro var retained)
+    if (is.null(fit)) {
+      fit <- tryCatch(
+        feols(as.formula(paste0(y," ~ ",rhs)),
+              data=panel_clean, se="cluster",
+              cluster=~join_number, notes=FALSE),
+        error=function(e) NULL)
+    }
+
+    if (is.null(fit)) return(NULL)
+    cf <- get_fixest_cf(fit)
+    # Strip backticks from rownames before lookup (feols may quote col names)
+    rownames(cf) <- gsub("`","", rownames(cf))
+    if (!m %in% rownames(cf)) return(NULL)
+
+    data.table(outcome=y, macro_var=m,
+               b_path=cf[m,"Estimate"], b_se=cf[m,"Std. Error"],
+               b_p=cf[m,"Pr(>|t|)"], r2=safe_r2(fit), n_obs=nobs(fit),
+               sig=fcase(cf[m,"Pr(>|t|)"]<0.01,"***",
+                         cf[m,"Pr(>|t|)"]<0.05,"**",
+                         cf[m,"Pr(>|t|)"]<0.10,"*", default=""))
+  }))
+}))
+
+fwrite(link2, "Results/04d_link2_macro_cu.csv")
+msg("Link 2: %d regressions completed", nrow(link2))
+if (nrow(link2) > 0) {
+  sig2 <- link2[b_p < 0.10]
+  if (nrow(sig2) > 0)
+    print(sig2[, .(outcome=OUTCOME_LABELS[outcome], macro=MACRO_LABELS[macro_var],
+                    b=round(b_path,5), p=round(b_p,4), sig)])
+  else msg("No significant relationships at p < 0.10")
 }
-b_oil_mtg <- {
-  r <- link1_results[macro_var == "macro_base_rmtg"]
-  if (nrow(r) > 0 && !is.na(r$beta))
-    sprintf("β=%.3f%s", r$beta, r$stars) else "N/A"
+
+# =============================================================================
+# 5. LINK 3 — LAGGED BALANCE SHEET → OUTCOMES (AR persistence)
+# =============================================================================
+hdr("SECTION 5: Link 3 — Lagged Balance Sheet Persistence")
+
+# Ensure Y lags exist in panel_clean
+y_lags_needed <- unlist(lapply(Y_VARS, function(v) paste0(v,"_lag",1:P_LAG)))
+y_lags_missing <- setdiff(y_lags_needed, names(panel_clean))
+if (length(y_lags_missing) > 0) {
+  msg("Building %d missing Y lag columns in panel_clean ...", length(y_lags_missing))
+  setorder(panel_clean, join_number, yyyyqq)
+  for (v in Y_VARS) {
+    for (k in 1:P_LAG) {
+      nm <- paste0(v,"_lag",k)
+      if (!nm %in% names(panel_clean) && v %in% names(panel_clean))
+        panel_clean[, (nm) := shift(.SD[[v]], k, type="lag"),
+                     by=join_number, .SDcols=v]
+    }
+  }
 }
 
-# Link 2: CPI → NIM (illustrative — pick most significant)
-best_l2 <- if (nrow(link2_results[!is.na(beta)]) > 0)
-  link2_results[!is.na(beta)][which.min(pval)]
-else
-  data.table(outcome = "?", macro_var = "?", beta = NA, stars = "")
+link3 <- rbindlist(lapply(Y_VARS, function(y) {
+  lag_terms <- intersect(
+    unlist(lapply(Y_VARS, function(v) paste0(v,"_lag",1:P_LAG))),
+    names(panel_clean))
+  if (length(lag_terms) == 0) return(NULL)
+  rhs <- paste(lag_terms, collapse=" + ")
+  fit <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
+  if (is.null(fit)) return(NULL)
+  cf   <- get_fixest_cf(fit)
 
-b_cpi_nim <- sprintf("β=%.3f%s", best_l2$beta %||% 0, best_l2$stars %||% "")
+  # Diagnostic for first outcome only
+  if (y == Y_VARS[1])
+    msg("  Link3 coef names sample: %s",
+        paste(head(rownames(cf), 5), collapse=", "))
 
-# Link 3: NIM AR1
-b_ar_nim <- {
-  r <- link3_results[outcome == "nim_ratio"]
-  if (!is.null(r) && nrow(r) > 0 && !is.na(r$ar1))
-    sprintf("ρ=%.3f", r$ar1) else "ρ=N/A"
+  # feols sometimes uses backtick-quoted names — search flexibly
+  find_coef <- function(cf, name, col) {
+    # exact match first
+    if (name %in% rownames(cf)) return(cf[name, col])
+    # try with backticks stripped
+    clean_names <- gsub("`","", rownames(cf))
+    idx <- which(clean_names == name)
+    if (length(idx) > 0) return(cf[idx[1], col])
+    return(NA_real_)
+  }
+
+  l1 <- paste0(y,"_lag1"); l2 <- paste0(y,"_lag2")
+  data.table(
+    outcome   = y,
+    ar1_coef  = find_coef(cf, l1, "Estimate"),
+    ar1_p     = find_coef(cf, l1, "Pr(>|t|)"),
+    ar2_coef  = find_coef(cf, l2, "Estimate"),
+    ar2_p     = find_coef(cf, l2, "Pr(>|t|)"),
+    r2_within = safe_r2(fit),
+    n_obs     = nobs(fit)
+  )
+}))
+
+fwrite(link3, "Results/04d_link3_lag_cu.csv")
+msg("Link 3: %d outcomes estimated", nrow(link3))
+if (nrow(link3) > 0)
+  print(link3[, .(outcome=OUTCOME_LABELS[outcome],
+                   ar1=round(ar1_coef,3), ar1_p=round(ar1_p,4),
+                   r2=round(r2_within,3))])
+
+# =============================================================================
+# 6. TOTAL EFFECTS — OIL → CU (path c)
+# =============================================================================
+hdr("SECTION 6: Total Effects (Path c)")
+# Oil var is time-varying but cross-sectionally constant.
+# CU FE absorbs it — fall back to pooled OLS with clustered SE if needed.
+
+total_eff <- rbindlist(lapply(Y_VARS, function(y) {
+  if (!OIL_VAR %in% names(panel_clean)) return(NULL)
+  lag_y <- intersect(paste0(y,"_lag",1:P_LAG), names(panel_clean))
+  rhs   <- paste(c(OIL_VAR, lag_y), collapse=" + ")
+  fit   <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
+  if (!is.null(fit)) {
+    cf_tmp <- get_fixest_cf(fit)
+    if (!OIL_VAR %in% rownames(cf_tmp)) fit <- NULL
+  }
+  if (is.null(fit))
+    fit <- tryCatch(feols(as.formula(paste0(y," ~ ",rhs)),
+                          data=panel_clean, se="cluster",
+                          cluster=~join_number, notes=FALSE),
+                    error=function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  cf <- get_fixest_cf(fit)
+  rownames(cf) <- gsub("`","", rownames(cf))
+  if (!OIL_VAR %in% rownames(cf)) return(NULL)
+  data.table(outcome=y, c_total=cf[OIL_VAR,"Estimate"],
+             c_se=cf[OIL_VAR,"Std. Error"], c_p=cf[OIL_VAR,"Pr(>|t|)"])
+}))
+
+msg("Total effects: %d outcomes", nrow(total_eff))
+if (nrow(total_eff) > 0)
+  print(total_eff[, .(outcome=OUTCOME_LABELS[outcome],
+                       c=round(c_total,5), p=round(c_p,4))])
+
+# =============================================================================
+hdr("SECTION 7: Direct Effects (Path c')")
+# Same fallback approach for direct effects
+
+direct_eff <- rbindlist(lapply(Y_VARS, function(y) {
+  rbindlist(lapply(MACRO_VARS, function(m) {
+    if (!all(c(y,m,OIL_VAR) %in% names(panel_clean))) return(NULL)
+    lag_y <- intersect(paste0(y,"_lag",1:P_LAG), names(panel_clean))
+    rhs   <- paste(c(OIL_VAR, m, lag_y), collapse=" + ")
+    fit   <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
+    if (!is.null(fit)) {
+      cf_tmp <- get_fixest_cf(fit)
+      if (!OIL_VAR %in% rownames(cf_tmp) || !m %in% rownames(cf_tmp)) fit <- NULL
+    }
+    if (is.null(fit))
+      fit <- tryCatch(feols(as.formula(paste0(y," ~ ",rhs)),
+                            data=panel_clean, se="cluster",
+                            cluster=~join_number, notes=FALSE),
+                      error=function(e) NULL)
+    if (is.null(fit)) return(NULL)
+    cf <- get_fixest_cf(fit)
+    data.table(outcome=y, macro_var=m,
+               c_prime=safe_cf(cf, OIL_VAR, "Estimate"),
+               b_path =safe_cf(cf, m, "Estimate"),
+               b_se   =safe_cf(cf, m, "Std. Error"))
+  }))
+}))
+
+msg("Direct effects: %d pairs", nrow(direct_eff))
+
+
+hdr("SECTION 8: Mediation Decomposition")
+
+if (nrow(link1) == 0 || nrow(direct_eff) == 0 || nrow(total_eff) == 0) {
+  msg("Skipping mediation — upstream steps incomplete")
+  msg("  link1 rows: %d | direct_eff rows: %d | total_eff rows: %d",
+      nrow(link1), nrow(direct_eff), nrow(total_eff))
+  med_dt      <- data.table()
+  prop_med    <- data.table()
+} else {
+  a_paths <- link1[, .(macro_var, a_path, a_se)]
+  med_dt  <- merge(direct_eff, a_paths, by="macro_var")
+  med_dt  <- merge(med_dt, total_eff, by="outcome")
+  med_dt[, indirect_ab   := a_path * b_path]
+  med_dt[, prop_mediated := indirect_ab / c_total]
+  med_dt[, indirect_pct  := indirect_ab / c_total * 100]
+  med_dt[, ab_se_sobel   := sqrt(b_path^2 * a_se^2 + a_path^2 * b_se^2)]
+  med_dt[, ab_z          := indirect_ab / pmax(ab_se_sobel, 1e-10)]
+  med_dt[, ab_p          := 2 * pnorm(-abs(ab_z))]
+  med_dt[, outcome_label := OUTCOME_LABELS[outcome]]
+  med_dt[, macro_label   := MACRO_LABELS[macro_var]]
+  med_dt[, sig_ab        := fcase(ab_p<0.01,"***",ab_p<0.05,"**",
+                                   ab_p<0.10,"*",default="")]
+
+  prop_med <- med_dt[is.finite(prop_mediated),
+    .(total_indirect_pct=sum(indirect_pct, na.rm=TRUE),
+      n_sig=sum(ab_p < 0.10, na.rm=TRUE)),
+    by=outcome]
+  prop_med[, outcome_label := OUTCOME_LABELS[outcome]]
+
+  fwrite(med_dt,   "Results/04d_mediation_summary.csv")
+  fwrite(prop_med, "Results/04d_proportion_mediated.csv")
+  msg("Mediation complete: %d rows", nrow(med_dt))
+  cat("\n  Proportion of oil effect mediated through macro channels:\n\n")
+  print(prop_med[order(-total_indirect_pct),
+    .(outcome_label, pct_indirect=round(total_indirect_pct,1), n_sig)])
 }
 
-# Build the diagram as a ggplot annotation canvas
-nodes <- data.frame(
-  x     = c(1, 3, 3, 3, 5, 5, 5),
-  y     = c(4, 6, 4, 2, 6, 4, 2),
-  label = c("Oil\nPrice\n(PBRENT)",
-            "Inflation\n(CPI)",
-            "Mortgage\nRate",
-            "Unemployment",
-            "NIM",
-            "Delinquency\nRate",
-            "Net Worth\nRatio"),
-  type  = c("oil", "macro", "macro", "macro",
-            "cu", "cu", "cu"),
-  stringsAsFactors = FALSE
+# =============================================================================
+# 9. CHARTS
+# =============================================================================
+hdr("SECTION 9: Charts")
+
+MACRO_COLS <- setNames(
+  c("#2d7a4a","#c04828","#4a2080","#185FA5","#3B6D11"),
+  names(MACRO_NICE)
 )
-
-col_map <- c(oil = "#005f73", macro = "#ee9b00", cu = "#0a9396")
-
-arrows <- data.frame(
-  x1 = c(1.3, 1.3, 1.3, 3.3, 3.3, 5.3),
-  y1 = c(4.1, 4.0, 3.9, 6,   4,   4),
-  x2 = c(2.7, 2.7, 2.7, 4.7, 4.7, 6.3),
-  y2 = c(6,   4,   2,   6,   4,   4),
-  label = c(b_oil_cpi, b_oil_mtg, b_oil_unemp,
-            "", b_cpi_nim, b_ar_nim),
-  stringsAsFactors = FALSE
+# Map detected MACRO_VARS to colours via their code
+macro_col_vec <- setNames(
+  MACRO_COLS[match(names(MACRO_LABELS), names(MACRO_NICE))],
+  MACRO_VARS
 )
+macro_col_vec[is.na(macro_col_vec)] <- "#888888"
 
-p_chain <- ggplot() +
-  # Arrows
-  geom_segment(data = arrows,
-    aes(x = x1, y = y1, xend = x2, yend = y2),
-    arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
-    color = "grey40", linewidth = 0.7) +
-  geom_label(data = arrows[arrows$label != "", ],
-    aes(x = (x1 + x2) / 2, y = (y1 + y2) / 2, label = label),
-    size = 2.8, fill = "white", label.size = 0.2, color = "grey30") +
-  # Nodes
-  geom_point(data = nodes,
-    aes(x = x, y = y, color = type), size = 18, alpha = 0.15) +
-  geom_text(data = nodes,
-    aes(x = x, y = y, label = label, color = type),
-    size = 3, fontface = "bold", lineheight = 0.9) +
-  scale_color_manual(values = col_map, guide = "none") +
-  # Stage labels
-  annotate("text", x = 1,   y = 7.5, label = "LINK 1\nOil Shock",
-           fontface = "bold", size = 3.5, color = "#005f73") +
-  annotate("text", x = 3,   y = 7.5, label = "LINK 2\nMacro Channel",
-           fontface = "bold", size = 3.5, color = "#ee9b00") +
-  annotate("text", x = 5,   y = 7.5, label = "LINK 3\nCU Persistence",
-           fontface = "bold", size = 3.5, color = "#0a9396") +
-  xlim(0, 7) + ylim(0.5, 8.5) +
-  labs(title    = "Causal Chain: Oil Price → Macro → CU Balance Sheet",
-       subtitle = paste("Baron-Kenny mediation | Sobel SEs |",
-                        format(Sys.Date(), "%B %Y")),
-       caption  = "Coefficients from Links 1–3. Stars: ***p<0.001 **p<0.01 *p<0.05") +
-  theme_void(base_size = 11) +
-  theme(plot.title    = element_text(face = "bold", size = 13, hjust = 0.5),
-        plot.subtitle = element_text(size = 9,  hjust = 0.5, color = "grey40"),
-        plot.caption  = element_text(size = 8,  hjust = 0.5, color = "grey50"),
-        plot.margin   = margin(10, 10, 10, 10))
+ok <- function(dt) !is.null(dt) && nrow(dt) > 0
 
-ggsave("Figures/04d_causal_chain_diagram.png", p_chain,
-       width = 12, height = 7, dpi = 150, bg = "white")
-msg("  Causal chain diagram → Figures/04d_causal_chain_diagram.png")
+# ── Chart 1: Link 1 — oil → macro elasticities ───────────────────────────────
+if (ok(link1) && "a_path" %in% names(link1)) {
+  p1 <- ggplot(link1, aes(x=reorder(macro_label, abs(a_path)),
+                            y=a_path, fill=macro_var)) +
+    geom_col(width=0.65) +
+    geom_errorbar(aes(ymin=a_path-1.96*a_se, ymax=a_path+1.96*a_se),
+                  width=0.25, linewidth=0.6, colour="#333") +
+    geom_text(aes(label=paste0(sig,"\nLR=",round(lr_mult,3))),
+              hjust=ifelse(link1$a_path>=0,-0.1,1.1), size=3, fontface="bold") +
+    geom_hline(yintercept=0, linewidth=0.4, colour="#555") +
+    scale_fill_manual(values=macro_col_vec, guide="none") +
+    scale_y_continuous(expand=expansion(mult=c(0.2,0.2))) +
+    coord_flip() +
+    labs(title="LINK 1 \u2014 Oil YoY \u2192 Macro Variables",
+         subtitle="OLS quarterly time series | Error bars = 95% CI | LR = long-run multiplier",
+         caption="*** p<0.01, ** p<0.05, * p<0.10",
+         x=NULL, y="Coefficient per 1pp oil YoY") +
+    theme_minimal(base_size=10) +
+    theme(plot.title=element_text(face="bold",size=11),
+          plot.subtitle=element_text(size=8.5,colour="#444"),
+          plot.caption=element_text(size=7.5,colour="#888",hjust=0),
+          panel.grid.major.y=element_blank())
+  ggsave("Figures/04d_link1_elasticities.png", p1, width=11, height=6,
+         dpi=300, bg="white")
+  msg("Chart 1 saved")
+}
+
+# ── Chart 2: Link 2 heatmap — macro → CU ─────────────────────────────────────
+if (ok(link2) && "b_path" %in% names(link2)) {
+  link2[, outcome_label := factor(OUTCOME_LABELS[outcome], levels=OUTCOME_LABELS)]
+  link2[, macro_label   := MACRO_LABELS[macro_var]]
+  link2[, cell_lbl := fifelse(b_p < 0.10, sprintf("%.4f%s",b_path,sig), "")]
+  # Winsorise for colour scale
+  q99 <- quantile(abs(link2$b_path), 0.99, na.rm=TRUE)
+  link2[, b_plot := pmax(pmin(b_path, q99), -q99)]
+
+  p2 <- ggplot(link2[!is.na(outcome_label)],
+               aes(x=outcome_label, y=macro_label, fill=b_plot)) +
+    geom_tile(colour="white", linewidth=0.5) +
+    geom_text(aes(label=cell_lbl), size=2.5, fontface="bold",
+              colour=ifelse(abs(link2$b_plot[!is.na(link2$outcome_label)]) >
+                              0.5*q99, "white","#333")) +
+    scale_fill_gradient2(low="#185FA5", mid="white", high="#b5470a",
+                         midpoint=0, name="Coeff\n(panel FE)") +
+    scale_x_discrete(guide=guide_axis(angle=35)) +
+    labs(title="LINK 2 \u2014 Macro Variables \u2192 CU Outcomes",
+         subtitle="Panel FE | CU fixed effects + lagged Y | Significant cells (p<0.10) labelled",
+         caption="Clustered SE by CU | feols()",
+         x=NULL, y=NULL) +
+    theme_minimal(base_size=10) +
+    theme(plot.title=element_text(face="bold",size=11),
+          plot.subtitle=element_text(size=8.5,colour="#444"),
+          plot.caption=element_text(size=7.5,colour="#888",hjust=0),
+          panel.grid=element_blank())
+  ggsave("Figures/04d_link2_macro_heatmap.png", p2, width=13, height=7,
+         dpi=300, bg="white")
+  msg("Chart 2 saved")
+}
+
+# ── Chart 3: Mediation waterfall ──────────────────────────────────────────────
+if (ok(med_dt) && ok(total_eff)) {
+  med_agg <- med_dt[, .(direct=mean(c_prime,na.rm=TRUE),
+                          indirect=sum(indirect_ab,na.rm=TRUE)),
+                     by=outcome]
+  med_agg[, outcome_label := factor(OUTCOME_LABELS[outcome], levels=OUTCOME_LABELS)]
+  med_long <- melt(med_agg[!is.na(outcome_label)],
+                    id.vars=c("outcome","outcome_label"),
+                    variable.name="type", value.name="effect")
+  med_long[, type_lbl := fifelse(type=="direct",
+    "Direct (oil \u2192 outcome)",
+    "Indirect (oil \u2192 macro \u2192 outcome)")]
+  med_long[, type_lbl := factor(type_lbl,
+    levels=c("Direct (oil \u2192 outcome)",
+             "Indirect (oil \u2192 macro \u2192 outcome)"))]
+
+  p3 <- ggplot(med_long, aes(x=outcome_label, y=effect, fill=type_lbl)) +
+    geom_col(position="dodge", width=0.72, colour="white", linewidth=0.2) +
+    geom_hline(yintercept=0, linewidth=0.4, colour="#444") +
+    scale_fill_manual(values=c("Direct (oil \u2192 outcome)"="#b5470a",
+                                "Indirect (oil \u2192 macro \u2192 outcome)"="#4a2080"),
+                      name=NULL) +
+    scale_x_discrete(guide=guide_axis(angle=35)) +
+    scale_y_continuous(labels=function(x) sprintf("%+.5f",x)) +
+    labs(title="MEDIATION \u2014 Direct vs Indirect Oil Effect",
+         subtitle="Direct = oil \u2192 CU | Indirect = oil \u2192 macro \u2192 CU (summed across mediators)",
+         caption="Baron-Kenny | Sobel SE | Panel FE",
+         x=NULL, y="Effect size") +
+    theme_minimal(base_size=10) +
+    theme(plot.title=element_text(face="bold",size=11),
+          plot.subtitle=element_text(size=8.5,colour="#444"),
+          plot.caption=element_text(size=7.5,colour="#888",hjust=0),
+          panel.grid.major.x=element_blank(), legend.position="top")
+  ggsave("Figures/04d_mediation_waterfall.png", p3, width=13, height=7,
+         dpi=300, bg="white")
+  msg("Chart 3 saved")
+}
+
+# ── Chart 4: Proportion mediated ─────────────────────────────────────────────
+if (ok(prop_med) && ok(total_eff)) {
+  prop_plot <- merge(prop_med, total_eff[, .(outcome, c_p)], by="outcome")
+  prop_plot[, outcome_label := factor(OUTCOME_LABELS[outcome], levels=OUTCOME_LABELS)]
+  prop_plot[, sig_lbl := fcase(c_p<0.01,"***",c_p<0.05,"**",c_p<0.10,"*",default="(ns)")]
+  prop_plot[, pct_capped := pmin(pmax(total_indirect_pct,-150),200)]
+
+  p4 <- ggplot(prop_plot[!is.na(outcome_label)],
+               aes(x=reorder(outcome_label,total_indirect_pct),
+                   y=pct_capped, fill=total_indirect_pct>50)) +
+    geom_col(width=0.72) +
+    geom_hline(yintercept=c(0,50,100), linetype=c("solid","dashed","dashed"),
+               colour=c("#444","#b5470a","#2d7a4a"), linewidth=c(0.4,0.5,0.5)) +
+    geom_text(aes(label=paste0(round(total_indirect_pct,0),"% ",sig_lbl)),
+              hjust=ifelse(prop_plot$pct_capped>=0,-0.1,1.1),
+              size=3, fontface="bold") +
+    scale_fill_manual(values=c("FALSE"="#888","TRUE"="#b5470a"), guide="none") +
+    scale_y_continuous(labels=function(x) paste0(x,"%"),
+                       expand=expansion(mult=c(0.05,0.25))) +
+    coord_flip() +
+    labs(title="MEDIATION \u2014 % of Oil Effect via Macro Channels",
+         subtitle="% mediated = indirect(ab) / total(c) x 100 | Summed across macro mediators",
+         caption="Baron-Kenny | Panel FE regressions",
+         x=NULL, y="% of total oil effect mediated") +
+    theme_minimal(base_size=10) +
+    theme(plot.title=element_text(face="bold",size=11),
+          plot.subtitle=element_text(size=8.5,colour="#444"),
+          plot.caption=element_text(size=7.5,colour="#888",hjust=0),
+          panel.grid.major.y=element_blank())
+  ggsave("Figures/04d_proportion_mediated.png", p4, width=12, height=7,
+         dpi=300, bg="white")
+  msg("Chart 4 saved")
+}
+
+# ── Chart 5: Causal chain diagram ────────────────────────────────────────────
+nodes <- data.table(
+  label=c("Oil price\nYoY %","Macro vars\n(unemp, CPI,\nrates, HPI)",
+          "CU balance\nsheet lags","CU outcomes\n(dq, pll, nim...)"),
+  x=c(1,2.5,4,5.5), y=c(2,2,2,2),
+  col=c("#b5470a","#4a2080","#185FA5","#2d7a4a")
+)
+mean_a  <- if (ok(link1)) mean(abs(link1$a_path),na.rm=TRUE) else NA
+mean_b  <- if (ok(link2)) mean(abs(link2$b_path[link2$b_p<0.10]),na.rm=TRUE) else NA
+mean_ar <- if (ok(link3)) mean(link3$ar1_coef,na.rm=TRUE) else NA
+
+p5 <- ggplot() +
+  geom_segment(aes(x=1.3,xend=2.2,y=2,yend=2),
+               arrow=arrow(length=unit(0.3,"cm"),type="closed"),
+               colour="#333",linewidth=1.2) +
+  geom_segment(aes(x=2.8,xend=3.6,y=2,yend=2),
+               arrow=arrow(length=unit(0.3,"cm"),type="closed"),
+               colour="#333",linewidth=1.2) +
+  geom_segment(aes(x=3.6,xend=4.3,y=2,yend=2),
+               arrow=arrow(length=unit(0.3,"cm"),type="closed"),
+               colour="#333",linewidth=1.2) +
+  geom_segment(aes(x=4.3,xend=5.2,y=2,yend=2),
+               arrow=arrow(length=unit(0.3,"cm"),type="closed"),
+               colour="#333",linewidth=1.2) +
+  annotate("curve",x=1.3,xend=5.2,y=1.5,yend=1.5,curvature=-0.2,
+           colour="#b5470a",linewidth=0.9,
+           arrow=arrow(length=unit(0.25,"cm"),type="closed")) +
+  annotate("text",x=3.25,y=1.2,
+           label=sprintf("Direct effect (path c')\nMean = %.5f",
+                          if (!is.na(mean_b)) mean_b else 0),
+           size=2.8,colour="#b5470a",fontface="bold") +
+  annotate("label",x=1.75,y=2.35,
+           label=sprintf("Link 1\na=%.4f",if(!is.na(mean_a)) mean_a else 0),
+           size=2.8,fill="white",colour="#333",label.size=0.2,fontface="bold") +
+  annotate("label",x=3.2,y=2.35,
+           label=sprintf("Link 2\nb=%.4f",if(!is.na(mean_b)) mean_b else 0),
+           size=2.8,fill="white",colour="#333",label.size=0.2,fontface="bold") +
+  annotate("label",x=3.95,y=2.35,
+           label=sprintf("Link 3\nAR=%.2f",if(!is.na(mean_ar)) mean_ar else 0),
+           size=2.8,fill="white",colour="#333",label.size=0.2,fontface="bold") +
+  geom_tile(data=nodes, aes(x=x,y=y,fill=col),
+            width=0.9,height=0.55,colour="white",linewidth=1.2) +
+  scale_fill_identity() +
+  geom_text(data=nodes, aes(x=x,y=y,label=label),
+            size=2.8,colour="white",fontface="bold",lineheight=1.2) +
+  xlim(0.4,6.2) + ylim(0.8,2.9) +
+  labs(title="CAUSAL CHAIN \u2014 Oil Price Shock Transmission to CU Outcomes",
+       subtitle="Three-link mediation | All coefficients estimated from data",
+       caption="Link 1: OLS time series | Link 2: Panel FE | Link 3: AR persistence") +
+  theme_void(base_size=10) +
+  theme(plot.title=element_text(face="bold",size=12,hjust=0.5),
+        plot.subtitle=element_text(size=9,colour="#444",hjust=0.5),
+        plot.caption=element_text(size=7.5,colour="#888",hjust=0.5),
+        plot.margin=margin(10,10,10,10))
+ggsave("Figures/04d_causal_chain.png", p5, width=14, height=7,
+       dpi=300, bg="white")
+msg("Chart 5 saved")
 
 # =============================================================================
-# SUMMARY CONSOLE PRINT
+# 10. MANIFEST
 # =============================================================================
-cat("\n╔══════════════════════════════════════════════════════════╗\n")
-cat("║  04d MEDIATION SUMMARY                                   ║\n")
-cat("╠══════════════════════════════════════════════════════════╣\n")
-cat(sprintf("║  Link 1 (Oil → Macro)       : %2d estimates              ║\n",
-    sum(!is.na(link1_results$beta))))
-cat(sprintf("║  Link 2 (Macro → CU)        : %2d estimates              ║\n",
-    sum(!is.na(link2_results$beta))))
-cat(sprintf("║  Link 3 (AR persistence)    : %2d estimates              ║\n",
-    sum(!is.na(link3_results$ar1))))
-cat(sprintf("║  Sobel indirect effects     : %2d computed               ║\n",
-    if (!is.null(sobel_results)) nrow(sobel_results) else 0))
-cat("╚══════════════════════════════════════════════════════════╝\n")
+hdr("SECTION 10: Output Manifest")
 
-cat("\n[04d] DONE —", format(Sys.time()), "\n\n")
+for (grp in c("Results","Figures")) {
+  ff <- list.files(grp, pattern="04d_", full.names=TRUE)
+  cat(sprintf("\n  %s:\n", grp))
+  for (f in ff)
+    cat(sprintf("    %-50s [%s bytes]\n", basename(f),
+                format(file.size(f), big.mark=",")))
+}
 
-# =============================================================================
-# DEBUGGING CHECKLIST (run in console if Link 2 still returns 0)
-# =============================================================================
-# 1. Check macro vars are in panel:
-#    intersect(MACRO_VARS, names(panel_model))
-#
-# 2. Check they are NOT all-NA:
-#    panel_model[, lapply(.SD, function(x) sum(!is.na(x))), .SDcols=MACRO_VARS]
-#
-# 3. Check cross-sectional variation within a quarter (should be zero —
-#    they are constant within quarter, which is expected):
-#    panel_model[yyyyqq == "2010.2",
-#                .(sd_lurc = sd(macro_base_lurc, na.rm=TRUE))]
-#
-# 4. Confirm get_cf() works on a test feols object:
-#    test_fit <- feols(nim_ratio ~ macro_base_pcpi | join_number,
-#                      data = panel_model[1:10000], warn=FALSE)
-#    get_cf(test_fit)   # should return a data.table with pcpi row
-# =============================================================================
+t_el <- (proc.time()-t0)["elapsed"]
+cat(sprintf("\n  Total: %.1f sec | Script 04d complete\n", t_el))
