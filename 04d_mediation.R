@@ -148,23 +148,29 @@ msg("panel columns      (%d total)", length(panel_cols))
 
 # Pattern → label mapping for auto-detection
 MACRO_PATTERNS <- list(
-  list(pattern="lurc|unemp",         label="Unemployment rate"),
-  list(pattern="pcpi|cpi",           label="CPI level"),
-  list(pattern="yield_curve|spread", label="Yield curve (10Y-3M)"),
-  list(pattern="rmtg|mortgage",      label="Mortgage rate"),
-  list(pattern="hpi",                label="HPI growth YoY")
+  list(pattern="lurc",                    label="Unemployment rate"),
+  list(pattern="pcpi",                    label="CPI level"),
+  list(pattern="yield_curve",             label="Yield curve (10Y-3M)"),
+  list(pattern="rmtg",                    label="Mortgage rate"),
+  list(pattern="hpi_yoy|^hpi$|house_price", label="HPI growth YoY")
 )
+# Exclusion patterns — columns matching these are NOT macro mediators
+MACRO_EXCLUDE <- "nim|netint|spread_fee|fee_spread|loan|dep|member|dq|pll|pcan|costf|insured"
 OIL_PATTERN <- "yoy_oil|oil_yoy|pbrent_yoy"
 
 # Search panel FIRST (macro vars are often already merged in panel_model.rds)
 # then fall back to macro_base
 find_col <- function(pattern, prefer_cols, fallback_cols) {
-  # Non-lag matches in preferred source
-  m <- grep(pattern, prefer_cols, value=TRUE, ignore.case=TRUE)
-  m <- m[!grepl("_lag", m)]
+  filter_col <- function(cols) {
+    m <- grep(pattern, cols, value=TRUE, ignore.case=TRUE)
+    m <- m[!grepl("_lag", m)]
+    # Exclude CU outcome variables and other non-macro columns
+    m <- m[!grepl(MACRO_EXCLUDE, m, ignore.case=TRUE)]
+    m
+  }
+  m <- filter_col(prefer_cols)
   if (length(m) > 0) return(m[1])
-  m <- grep(pattern, fallback_cols, value=TRUE, ignore.case=TRUE)
-  m <- m[!grepl("_lag", m)]
+  m <- filter_col(fallback_cols)
   if (length(m) > 0) return(m[1])
   return(NULL)
 }
@@ -590,11 +596,32 @@ direct_effects <- rbindlist(lapply(Y_VARS, function(y) {
 # Step 3: Compute indirect effects ab and proportion mediated
 msg("Computing indirect effects and proportion mediated ...")
 
-# a-path comes from Link 1 (oil → macro time series regressions)
+# Guard: all three inputs must have rows
+inputs_ok <- !is.null(direct_effects) && nrow(direct_effects) > 0 &&
+             !is.null(total_effects)  && nrow(total_effects)  > 0 &&
+             !is.null(link1_results)  && nrow(link1_results)  > 0 &&
+             "beta_contemp" %in% names(link1_results)
+
+if (!inputs_ok) {
+  msg("WARNING: Cannot compute mediation — one or more upstream steps produced no results")
+  msg("  direct_effects rows : %d", if (!is.null(direct_effects)) nrow(direct_effects) else 0)
+  msg("  total_effects rows  : %d", if (!is.null(total_effects))  nrow(total_effects)  else 0)
+  msg("  link1_results rows  : %d", if (!is.null(link1_results))  nrow(link1_results)  else 0)
+  med_dt      <- data.table()
+  prop_summary <- data.table()
+} else {
+
+# a-path comes from Link 1
 a_paths <- link1_results[, .(macro_var, a_path=beta_contemp, a_se=se_contemp)]
 
 med_dt <- merge(direct_effects, a_paths, by="macro_var")
-med_dt <- merge(med_dt, total_effects, by="outcome")
+if (nrow(med_dt) > 0 && "outcome" %in% names(total_effects))
+  med_dt <- merge(med_dt, total_effects, by="outcome")
+
+if (nrow(med_dt) == 0) {
+  msg("WARNING: mediation merge produced zero rows")
+  prop_summary <- data.table()
+} else {
 
 med_dt[, indirect_ab   := a_path * b_path]
 med_dt[, prop_mediated := indirect_ab / c_total]
@@ -631,6 +658,9 @@ if (!is.null(prop_summary) && nrow(prop_summary) > 0 &&
 } else {
   msg("Mediation summary empty — check Link 1 and Link 2 completed successfully")
 }
+
+} # end nrow(med_dt) > 0 guard
+} # end inputs_ok guard
 
 # =============================================================================
 # 6. CHARTS
