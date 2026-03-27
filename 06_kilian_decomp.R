@@ -533,10 +533,15 @@ if (ok(struct_shocks) && "date" %in% names(struct_shocks)) {
                   id.vars=c("yyyyqq","date"),
                   measure.vars=intersect(shock_cols, names(struct_shocks)),
                   variable.name="shock", value.name="value")
-  sh_long[, shock_lbl := SHOCK_LBL[as.character(shock)]]
+  sh_long[, shock_lbl := {
+    lbl <- SHOCK_LBL[as.character(shock)]
+    # Fallback: if lookup returns NA, use the raw column name
+    ifelse(is.na(lbl), as.character(shock), lbl)
+  }]
+  # Only keep rows where shock_lbl has a valid value
+  sh_long <- sh_long[!is.na(shock_lbl) & nchar(shock_lbl) > 0]
   sh_long[, shock_lbl := factor(shock_lbl,
-    levels=c("Supply Disruption","Supply Disruption (episode flag)",
-             "Aggregate Demand","Geopolitical/Precautionary"))]
+    levels=unique(sh_long$shock_lbl))]
 
   # Mark Iran war period
   iran_start <- as.Date("2025-10-01")
