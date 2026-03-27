@@ -607,7 +607,7 @@ if (!is.null(pdp_dt)) {
     facet_wrap(~outcome_label, scales="free_y", ncol=3) +
     scale_x_continuous(
       breaks=seq(-50,120,25),
-      labels=function(x) paste0(ifelse(x>0,"+",""), x, "%%")
+      labels=function(x) paste0(ifelse(x>0,"+",""), x, "%")
     ) +
     labs(
       title    = "FIGURE 04c-2 \u2014 Partial Dependence: Oil YoY vs CU Outcomes",
@@ -616,7 +616,7 @@ if (!is.null(pdp_dt)) {
         "\nNon-linearity visible: threshold effects at ~$95 and ~$125/bbl"
       ),
       caption  = "XGBoost PDP | 500 background obs | Features not standardised (tree splits are scale-invariant)",
-      x="Oil price YoY %%", y="Predicted outcome (level units)"
+      x="Oil price YoY %", y="Predicted outcome (level units)"
     ) +
     theme_minimal(base_size=10) +
     theme(
@@ -654,13 +654,13 @@ if (!is.null(pdp_dt)) {
     ) +
     scale_x_continuous(
       breaks=seq(-50,120,25),
-      labels=function(x) paste0(ifelse(x>0,"+",""),x,"%%")
+      labels=function(x) paste0(ifelse(x>0,"+",""),x,"%")
     ) +
     labs(
       title    = "FIGURE 04c-3 \u2014 Nonlinearity Detection: Oil Price Curvature",
       subtitle = "|d\u00b2Y/d(oil)\u00b2| \u2014 spikes show where linear VARX assumption breaks down",
       caption  = "Numerical 2nd derivative of XGBoost PDP curve",
-      x="Oil YoY %%", y="|Second derivative|"
+      x="Oil YoY %", y="|Second derivative|"
     ) +
     theme_minimal(base_size=10) +
     theme(plot.title=element_text(face="bold",size=11),
@@ -1013,30 +1013,48 @@ p_pol2 <- ggplot(pol2_long[!is.na(outcome_label)],
                  aes(x=outcome_label, y=pct, fill=component_label)) +
   geom_col(width=0.72, colour="white", linewidth=0.3) +
   geom_hline(yintercept=50, linetype="dashed", colour="#888", linewidth=0.4) +
-  annotate("text", x=0.6, y=53, label="50%% threshold",
+  geom_hline(yintercept=100, linetype="dashed", colour="#2d7a4a", linewidth=0.4) +
+  annotate("text", x=0.6, y=52, label="50% threshold",
            hjust=0, size=2.8, colour="#888") +
+  annotate("text", x=0.6, y=102, label="100% indirect",
+           hjust=0, size=2.8, colour="#2d7a4a") +
   scale_fill_manual(
     values=c("Direct oil price"="#b5470a",
              "Indirect (all other pathways)"="#185FA5"),
     name=NULL
   ) +
   scale_x_discrete(guide=guide_axis(angle=35)) +
-  scale_y_continuous(labels=function(x) paste0(x,"%%"),
-                     breaks=seq(0,100,25), limits=c(0,110)) +
-  geom_text(aes(label=sprintf("%.0f%%%%",pct)),
-            position=position_stack(vjust=0.5),
-            size=3.0, fontface="bold", colour="white") +
+  # Use percent_format() from scales — no manual %% needed
+  scale_y_continuous(labels=percent_format(scale=1),
+                     breaks=seq(0, 100, 25), limits=c(0, 112)) +
+  # Label only the indirect (blue) bar — direct is near zero so skip it
+  geom_text(
+    data=pol2_long[!is.na(outcome_label) &
+                   component_label == "Indirect (all other pathways)"],
+    aes(label=paste0(round(pct, 0), "%")),
+    position=position_stack(vjust=0.5),
+    size=3.2, fontface="bold", colour="white"
+  ) +
+  # Add direct share as small top label only where > 0.5%
+  geom_text(
+    data=pol2_long[!is.na(outcome_label) &
+                   component_label == "Direct oil price" & pct > 0.5],
+    aes(y=pct, label=paste0(round(pct, 1), "%")),
+    position=position_stack(vjust=1.5),
+    size=2.5, colour="#b5470a", fontface="bold"
+  ) +
   labs(
     title    = "POLICY FIG 2 \u2014 Direct vs Indirect Oil Transmission: Share of Total Effect",
     subtitle = paste(
       "Orange = direct oil price SHAP | Blue = all indirect pathways combined",
-      "\nKey finding: >95%% of oil's effect operates through indirect channels for most outcomes"
+      "\nKey finding: ~100% of oil's effect operates through indirect channels for most outcomes"
     ),
     caption  = paste(
-      "Indirect share = (total \u2212 direct) / total SHAP | Exact TreeSHAP | XGBoost",
-      "\nNear-zero direct share reflects that oil transmits via balance sheet accumulation, not contemporaneous price level"
+      "Indirect share = (total - direct) / total SHAP | Exact TreeSHAP | XGBoost",
+      "\nNear-zero direct share: oil transmits via accumulated balance sheet dynamics,",
+      "not contemporaneous price level"
     ),
-    x=NULL, y="Share of total attributable SHAP effect (%%)"
+    x=NULL, y="Share of total attributable SHAP effect"
   ) +
   theme_minimal(base_size=10) +
   theme(
