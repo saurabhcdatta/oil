@@ -183,17 +183,17 @@ get_fixest_cf <- function(fit) {
     b  <- coef(fit)            # named numeric vector
     se <- se(fit)              # named numeric vector
     pv <- pvalue(fit)          # named numeric vector
+    # Strip backticks fixest adds around column names (e.g. `macro_base_lurc`)
+    rn <- gsub("`", "", names(b))
     data.frame(
       Estimate       = as.numeric(b),
       `Std. Error`   = as.numeric(se),
       `Pr(>|t|)`     = as.numeric(pv),
-      row.names      = names(b),
+      row.names      = rn,
       check.names    = FALSE
     )
   }, error = function(e) {
-    # fallback to coef(summary())
-    tryCatch(as.data.frame(get_fixest_cf(fit)),
-             error=function(e2) data.frame())
+    data.frame()
   })
 }
 
@@ -298,7 +298,7 @@ link2 <- rbindlist(lapply(Y_VARS, function(y) {
     # If collinear (fixest drops the macro var), fall back to pooled OLS
     if (!is.null(fit)) {
       cf <- get_fixest_cf(fit)
-      if (!m %in% gsub("`","",rownames(cf))) fit <- NULL  # var was dropped — collinear
+      if (!m %in% rownames(cf)) fit <- NULL   # var was dropped — collinear
     }
 
     # Try 2: pooled OLS with clustered SE (no FE — macro var retained)
@@ -312,8 +312,6 @@ link2 <- rbindlist(lapply(Y_VARS, function(y) {
 
     if (is.null(fit)) return(NULL)
     cf <- get_fixest_cf(fit)
-    # Strip backticks from rownames before lookup (feols may quote col names)
-    rownames(cf) <- gsub("`","", rownames(cf))
     if (!m %in% rownames(cf)) return(NULL)
 
     data.table(outcome=y, macro_var=m,
@@ -424,7 +422,6 @@ total_eff <- rbindlist(lapply(Y_VARS, function(y) {
                     error=function(e) NULL)
   if (is.null(fit)) return(NULL)
   cf <- get_fixest_cf(fit)
-  rownames(cf) <- gsub("`","", rownames(cf))
   if (!OIL_VAR %in% rownames(cf)) return(NULL)
   data.table(outcome=y, c_total=cf[OIL_VAR,"Estimate"],
              c_se=cf[OIL_VAR,"Std. Error"], c_p=cf[OIL_VAR,"Pr(>|t|)"])
