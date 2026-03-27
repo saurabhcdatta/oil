@@ -169,16 +169,39 @@ safe_feols <- function(formula_str, data) {
   )
 }
 
-# safe_r2: extract R² without crashing on degenerate models
+# safe_r2: extract R² — fixest native approach
 safe_r2 <- function(fit) {
   tryCatch(r2(fit, type="within"),
     error=function(e) tryCatch(r2(fit, type="r2"),
       error=function(e2) NA_real_))
 }
 
-# safe_coef: extract named coefficient safely
+# safe_cf: extract from fixest model directly (more reliable than coef(summary()))
+# Returns named list: Estimate, SE, pval for each coefficient
+get_fixest_cf <- function(fit) {
+  tryCatch({
+    b  <- coef(fit)            # named numeric vector
+    se <- se(fit)              # named numeric vector
+    pv <- pvalue(fit)          # named numeric vector
+    data.frame(
+      Estimate       = as.numeric(b),
+      `Std. Error`   = as.numeric(se),
+      `Pr(>|t|)`     = as.numeric(pv),
+      row.names      = names(b),
+      check.names    = FALSE
+    )
+  }, error = function(e) {
+    # fallback to coef(summary())
+    tryCatch(as.data.frame(get_fixest_cf(fit)),
+             error=function(e2) data.frame())
+  })
+}
+
 safe_cf <- function(cf, name, col) {
-  if (name %in% rownames(cf)) cf[name, col] else NA_real_
+  if (nrow(cf) == 0) return(NA_real_)
+  clean <- gsub("`","", rownames(cf))
+  idx   <- which(clean == gsub("`","", name))
+  if (length(idx) > 0) cf[idx[1], col] else NA_real_
 }
 
 # =============================================================================
@@ -274,7 +297,7 @@ link2 <- rbindlist(lapply(Y_VARS, function(y) {
 
     # If collinear (fixest drops the macro var), fall back to pooled OLS
     if (!is.null(fit)) {
-      cf <- coef(summary(fit))
+      cf <- get_fixest_cf(fit)
       if (!m %in% rownames(cf)) fit <- NULL   # var was dropped — collinear
     }
 
@@ -288,7 +311,7 @@ link2 <- rbindlist(lapply(Y_VARS, function(y) {
     }
 
     if (is.null(fit)) return(NULL)
-    cf <- coef(summary(fit))
+    cf <- get_fixest_cf(fit)
     if (!m %in% rownames(cf)) return(NULL)
 
     data.table(outcome=y, macro_var=m,
@@ -339,7 +362,7 @@ link3 <- rbindlist(lapply(Y_VARS, function(y) {
   rhs <- paste(lag_terms, collapse=" + ")
   fit <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
   if (is.null(fit)) return(NULL)
-  cf   <- coef(summary(fit))
+  cf   <- get_fixest_cf(fit)
 
   # Diagnostic for first outcome only
   if (y == Y_VARS[1])
@@ -389,7 +412,7 @@ total_eff <- rbindlist(lapply(Y_VARS, function(y) {
   rhs   <- paste(c(OIL_VAR, lag_y), collapse=" + ")
   fit   <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
   if (!is.null(fit)) {
-    cf_tmp <- coef(summary(fit))
+    cf_tmp <- get_fixest_cf(fit)
     if (!OIL_VAR %in% rownames(cf_tmp)) fit <- NULL
   }
   if (is.null(fit))
@@ -398,7 +421,7 @@ total_eff <- rbindlist(lapply(Y_VARS, function(y) {
                           cluster=~join_number, notes=FALSE),
                     error=function(e) NULL)
   if (is.null(fit)) return(NULL)
-  cf <- coef(summary(fit))
+  cf <- tryCatch(as.data.frame(coef(summary(fit))), error=function(e) data.frame())
   if (!OIL_VAR %in% rownames(cf)) return(NULL)
   data.table(outcome=y, c_total=cf[OIL_VAR,"Estimate"],
              c_se=cf[OIL_VAR,"Std. Error"], c_p=cf[OIL_VAR,"Pr(>|t|)"])
@@ -420,7 +443,7 @@ direct_eff <- rbindlist(lapply(Y_VARS, function(y) {
     rhs   <- paste(c(OIL_VAR, m, lag_y), collapse=" + ")
     fit   <- safe_feols(paste0(y," ~ ",rhs," | join_number"), panel_clean)
     if (!is.null(fit)) {
-      cf_tmp <- coef(summary(fit))
+      cf_tmp <- get_fixest_cf(fit)
       if (!OIL_VAR %in% rownames(cf_tmp) || !m %in% rownames(cf_tmp)) fit <- NULL
     }
     if (is.null(fit))
@@ -429,7 +452,7 @@ direct_eff <- rbindlist(lapply(Y_VARS, function(y) {
                             cluster=~join_number, notes=FALSE),
                       error=function(e) NULL)
     if (is.null(fit)) return(NULL)
-    cf <- coef(summary(fit))
+    cf <- get_fixest_cf(fit)
     data.table(outcome=y, macro_var=m,
                c_prime=safe_cf(cf, OIL_VAR, "Estimate"),
                b_path =safe_cf(cf, m, "Estimate"),
