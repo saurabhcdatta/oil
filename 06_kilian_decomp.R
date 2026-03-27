@@ -85,7 +85,7 @@ IRAN_SHOCK_PP  <- 60.3   # +60pp YoY — Moody's $125 from $78
 IRAN_GEO_SHARE <- 1.0    # 100% geopolitical (conservative assumption)
 
 # Shock type labels — defined here unconditionally so always available
-shock_labels <- c(
+SHOCK_LBL <- c(
   shock_supply = "Supply Disruption",
   shock_demand = "Aggregate Demand",
   shock_geo    = "Geopolitical/Precautionary"
@@ -286,14 +286,14 @@ if (!is.null(var_fit)) {
 
   if (ncol(struct_shocks) == 3) {
     setnames(struct_shocks, c("shock_supply","shock_demand","shock_geo"))
-    shock_labels <- c(
+    SHOCK_LBL <- c(
       shock_supply = "Supply Disruption",
       shock_demand = "Aggregate Demand",
       shock_geo    = "Geopolitical/Precautionary"
     )
   } else if (ncol(struct_shocks) == 2) {
     setnames(struct_shocks, c("shock_demand","shock_geo"))
-    shock_labels <- c(
+    SHOCK_LBL <- c(
       shock_demand = "Aggregate Demand",
       shock_geo    = "Geopolitical/Precautionary"
     )
@@ -306,7 +306,7 @@ if (!is.null(var_fit)) {
                            supply_disruption][(SVAR_LAGS+1):n_ts]
       struct_shocks[, shock_supply := as.numeric(ep_flags[1:nrow(struct_shocks)])]
     }
-    shock_labels["shock_supply"] <- "Supply Disruption (episode flag)"
+    SHOCK_LBL["shock_supply"] <- "Supply Disruption (episode flag)"
   }
 
   # Attach dates
@@ -428,14 +428,21 @@ run_shock_reg <- function(y, shock_var, data) {
 # ── 4.2 Run for all outcome × shock type combinations ────────────────────────
 transmission_by_shock <- rbindlist(lapply(Y_VARS, function(y) {
   rbindlist(lapply(shock_cols, function(s) {
-    res <- run_shock_reg(y, s, panel)
-    if (!is.null(res))
-      msg("%-28s × %-18s : β=%+.5f  p=%.3f %s",
-          OUTCOME_LABELS[y], shock_labels[s] %||% s,
-          res$beta, res$pval, res$sig)
-    res
+    run_shock_reg(y, s, panel)   # msg removed — was causing round_any on fixest
   }))
 }))
+
+# Post-loop summary print (safe — no fixest objects)
+if (nrow(transmission_by_shock) > 0) {
+  cat("\n  Transmission by shock type results:\n")
+  print(transmission_by_shock[, .(
+    outcome    = OUTCOME_LABELS[outcome],
+    shock      = SHOCK_LBL[shock_type] %||% shock_type,
+    beta       = round(as.numeric(beta), 5),
+    pval       = round(as.numeric(pval), 3),
+    sig
+  )])
+}
 
 fwrite(transmission_by_shock, "Results/06_transmission_by_shock.csv")
 msg("\nTransmission by shock type: %d estimates", nrow(transmission_by_shock))
@@ -478,11 +485,11 @@ comparison[, impact_geo_lr  := impact_geo_q1  * LR]
 fwrite(comparison, "Results/06_geopolitical_scenario.csv")
 msg("Iran scenario comparison saved -> Results/06_geopolitical_scenario.csv")
 
-cat("\n  ── IRAN WAR SCENARIO: FULL-SAMPLE vs GEOPOLITICAL COEFFICIENTS ──\n\n")
+cat("\n  -- IRAN WAR SCENARIO: FULL-SAMPLE vs GEOPOLITICAL COEFFICIENTS --\n\n")
 print(comparison[!is.na(beta_full) & !is.na(beta_geo),
   .(Outcome      = outcome_label,
-    `β Full`     = round(beta_full,5),
-    `β Geo`      = round(beta_geo,5),
+    `beta_full`     = round(beta_full,5),
+    `beta_geo`      = round(beta_geo,5),
     `% Diff`     = round(pct_diff,1),
     `Q1 Full`    = round(impact_full_q1,4),
     `Q1 Geo`     = round(impact_geo_q1,4),
@@ -508,7 +515,7 @@ if (ok(struct_shocks) && "date" %in% names(struct_shocks)) {
                   id.vars=c("yyyyqq","date"),
                   measure.vars=intersect(shock_cols, names(struct_shocks)),
                   variable.name="shock", value.name="value")
-  sh_long[, shock_lbl := shock_labels[as.character(shock)]]
+  sh_long[, shock_lbl := SHOCK_LBL[as.character(shock)]]
   sh_long[, shock_lbl := factor(shock_lbl,
     levels=c("Supply Disruption","Supply Disruption (episode flag)",
              "Aggregate Demand","Geopolitical/Precautionary"))]
@@ -563,7 +570,7 @@ if (ok(comparison) && any(!is.na(comparison$beta_geo))) {
     labs(
       title="Figure 6.2 — Transmission Coefficients: Full Sample vs Geopolitical Shocks",
       subtitle="Blue = average across all oil shock types | Red = geopolitical/precautionary shocks only",
-      x=NULL, y="Coefficient (β per 1pp oil shock)",
+      x=NULL, y="Coefficient (beta per 1pp oil shock)",
       caption="Re-estimated using Kilian structural shock series | Panel FE + clustered SE by CU"
     ) +
     THEME
@@ -602,7 +609,7 @@ if (ok(comparison) && any(!is.na(comparison$impact_geo_q1))) {
       name=NULL) +
     scale_y_continuous(labels=function(x) sprintf("%+.3f",x)) +
     labs(
-      title=sprintf("Figure 6.3 — Iran War Scenario: +%.0fpp Oil Shock Impact on CU Outcomes",
+      title=sprintf("Figure 6.3 - Iran War Scenario: +%.0fpp Oil Shock Impact on CU Outcomes",
                     IRAN_SHOCK_PP),
       subtitle=paste0("Geopolitical-specific coefficients vs full-sample | ",
                       "Honest range for policy decision\n",
@@ -610,7 +617,7 @@ if (ok(comparison) && any(!is.na(comparison$impact_geo_q1))) {
       x=NULL, y="Estimated effect on CU outcome ratio",
       caption=paste0("Full-sample estimate (blue) mixes supply/demand/geopolitical shocks.\n",
                      "Geopolitical estimate (red) uses only Kilian precautionary demand shock periods.\n",
-                     "Long-run = Q1 impact × 2.44× AR multiplier")
+                     "Long-run = Q1 impact x 2.44x AR multiplier")
     ) +
     THEME +
     theme(legend.position="top")
@@ -652,31 +659,31 @@ if (ok(comparison) && any(!is.na(comparison$pct_diff))) {
 # =============================================================================
 hdr("SECTION 7: Policy Summary")
 
-cat("\n  ═══════════════════════════════════════════════════════════\n")
-cat("  POLICY CONCLUSION: Iran War Oil Shock — Revised Assessment\n")
-cat("  ═══════════════════════════════════════════════════════════\n\n")
+cat("\n  ===================================================================\n")
+cat("  POLICY CONCLUSION: Iran War Oil Shock - Revised Assessment\n")
+cat("  ===================================================================\n\n")
 
 cat(sprintf("  Shock magnitude:     +%.1fpp YoY (Moody's $125 from $78)\n", IRAN_SHOCK_PP))
 cat(sprintf("  Shock classification: Geopolitical/Precautionary (Kilian Type 3)\n"))
-cat(sprintf("  AR persistence:      0.59 | Long-run multiplier: 2.44×\n\n"))
+cat(sprintf("  AR persistence:      0.59 | Long-run multiplier: 2.44x\n\n"))
 
 cat("  WHAT CHANGES vs full-sample:\n")
-cat("  ✓ Geographic concentration weaker — pain more diffuse across all CUs\n")
-cat("  ✓ Deposit growth impact may differ — income effect less certain\n")
-cat("  ✓ Subject to rapid reversal — war risk premium can unwind in 1 quarter\n")
-cat("  ✓ Financial markets channel (war risk premium on rates) not captured\n\n")
+cat("  [+] Geographic concentration weaker - pain more diffuse across all CUs\n")
+cat("  [+] Deposit growth impact may differ - income effect less certain\n")
+cat("  [+] Subject to rapid reversal - war risk premium can unwind in 1 quarter\n")
+cat("  [+] Financial markets channel (war risk premium on rates) not captured\n\n")
 
 cat("  WHAT STAYS THE SAME:\n")
-cat("  ✓ AR=0.59 persistence once shock is absorbed into balance sheets\n")
-cat("  ✓ 2.44× long-run multiplier still applies\n")
-cat("  ✓ 2015Q1 structural break still relevant\n")
-cat("  ✓ Deposit growth remains most exposed outcome\n\n")
+cat("  [=] AR=0.59 persistence once shock is absorbed into balance sheets\n")
+cat("  [=] 2.44x long-run multiplier still applies\n")
+cat("  [=] 2015Q1 structural break still relevant\n")
+cat("  [=] Deposit growth remains most exposed outcome\n\n")
 
 cat("  SUPERVISORY RECOMMENDATION:\n")
 cat("  Use geopolitical-specific coefficients as base case.\n")
 cat("  Use full-sample coefficients as upper-bound stress scenario.\n")
-cat("  Monitor oil-state CU deposit flows weekly — first signal of transmission.\n")
-cat("  Act within Q+1 to Q+2 — captures 75% of cumulative long-run damage.\n\n")
+cat("  Monitor oil-state CU deposit flows weekly - first signal of transmission.\n")
+cat("  Act within Q+1 to Q+2 - captures 75% of cumulative long-run damage.\n\n")
 
 # =============================================================================
 # 8. MANIFEST
