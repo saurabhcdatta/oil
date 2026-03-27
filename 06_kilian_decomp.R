@@ -397,16 +397,29 @@ run_shock_reg <- function(y, shock_var, data) {
 
   if (nrow(cf)==0 || !shock_var %in% rownames(cf)) return(NULL)
 
+  # Safe scalar extraction — force numeric, guard against row returning vector
+  get_cf_val <- function(cf, rn, col) {
+    idx <- which(rownames(cf) == rn)
+    if (length(idx) == 0) return(NA_real_)
+    as.numeric(cf[idx[1], col])
+  }
+
+  beta_val <- get_cf_val(cf, shock_var, "Estimate")
+  se_val   <- get_cf_val(cf, shock_var, "SE")
+  pval_val <- get_cf_val(cf, shock_var, "p")
+
+  if (is.na(beta_val)) return(NULL)
+
   data.table(
     outcome    = y,
     shock_type = shock_var,
-    beta       = cf[shock_var,"Estimate"],
-    se         = cf[shock_var,"SE"],
-    pval       = cf[shock_var,"p"],
-    sig        = fcase(cf[shock_var,"p"]<0.01,"***",
-                       cf[shock_var,"p"]<0.05,"**",
-                       cf[shock_var,"p"]<0.10,"*",
-                       default="")
+    beta       = beta_val,
+    se         = se_val,
+    pval       = pval_val,
+    sig        = fcase(pval_val < 0.01, "***",
+                       pval_val < 0.05, "**",
+                       pval_val < 0.10, "*",
+                       default = "")
   )
 }
 
