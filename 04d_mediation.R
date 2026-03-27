@@ -219,17 +219,44 @@ if (nrow(link1) > 0)
 # 4. LINK 2 — MACRO → CU OUTCOMES (panel FE)
 # =============================================================================
 hdr("SECTION 4: Link 2 — Macro Variables → CU Outcomes")
-# NOTE: Macro vars (unemployment, CPI etc.) are cross-sectionally constant
-# within each quarter — they vary only over time, not across CUs.
-# CU fixed effects would absorb all their variation (collinearity).
-# Correct specification: CU FE + lagged Y for autocorrelation,
-# BUT use the macro var as a time-varying regressor WITHOUT absorbing
-# time variation via quarter FE. This estimates the within-CU response
-# to aggregate macro conditions, controlling for CU-level heterogeneity.
-# Alternative: pooled OLS with clustered SE (no FE) gives same macro coef
-# but without controlling for CU heterogeneity.
-# We use: Y ~ macro + lag_Y | join_number  with se="twoway" (CU + time cluster)
-# If that collinears out, fall back to: Y ~ macro + lag_Y (clustered by CU)
+
+# DIAGNOSTIC: show exactly what's available
+msg("panel_clean columns: %d total", length(names(panel_clean)))
+msg("Y_VARS in panel_clean: %s",
+    paste(intersect(Y_VARS, names(panel_clean)), collapse=", "))
+msg("MACRO_VARS in panel_clean: %s",
+    paste(intersect(MACRO_VARS, names(panel_clean)), collapse=", "))
+msg("OIL_VAR in panel_clean: %s", as.character(OIL_VAR %in% names(panel_clean)))
+macro_lags_present <- intersect(paste0(MACRO_VARS[1],"_lag1"), names(panel_clean))
+msg("Sample lag check (%s_lag1): %s", MACRO_VARS[1],
+    as.character(length(macro_lags_present) > 0))
+
+# If MACRO_VARS not in panel_clean, try adding them now from panel
+macro_missing_pc <- setdiff(MACRO_VARS, names(panel_clean))
+if (length(macro_missing_pc) > 0) {
+  msg("Adding missing macro vars to panel_clean from panel ...")
+  avail <- intersect(macro_missing_pc, names(panel))
+  if (length(avail) > 0) {
+    merge_key <- c("join_number","yyyyqq",avail)
+    panel_clean <- merge(panel_clean,
+                          panel[, ..merge_key],
+                          by=c("join_number","yyyyqq"), all.x=TRUE)
+    msg("Added: %s", paste(avail, collapse=", "))
+    # Build their lags too
+    setorder(panel_clean, join_number, yyyyqq)
+    for (v in avail) {
+      for (k in 1:P_LAG) {
+        nm <- paste0(v,"_lag",k)
+        if (!nm %in% names(panel_clean))
+          panel_clean[, (nm) := shift(.SD[[v]], k, type="lag"),
+                       by=join_number, .SDcols=v]
+      }
+    }
+  }
+}
+
+# NOTE: Macro vars vary only over time (not across CUs).
+# CU fixed effects absorb them — fall back to pooled OLS if needed.
 
 link2 <- rbindlist(lapply(Y_VARS, function(y) {
   rbindlist(lapply(MACRO_VARS, function(m) {
@@ -282,6 +309,22 @@ if (nrow(link2) > 0) {
 # 5. LINK 3 — LAGGED BALANCE SHEET → OUTCOMES (AR persistence)
 # =============================================================================
 hdr("SECTION 5: Link 3 — Lagged Balance Sheet Persistence")
+
+# Ensure Y lags exist in panel_clean
+y_lags_needed <- unlist(lapply(Y_VARS, function(v) paste0(v,"_lag",1:P_LAG)))
+y_lags_missing <- setdiff(y_lags_needed, names(panel_clean))
+if (length(y_lags_missing) > 0) {
+  msg("Building %d missing Y lag columns in panel_clean ...", length(y_lags_missing))
+  setorder(panel_clean, join_number, yyyyqq)
+  for (v in Y_VARS) {
+    for (k in 1:P_LAG) {
+      nm <- paste0(v,"_lag",k)
+      if (!nm %in% names(panel_clean) && v %in% names(panel_clean))
+        panel_clean[, (nm) := shift(.SD[[v]], k, type="lag"),
+                     by=join_number, .SDcols=v]
+    }
+  }
+}
 
 link3 <- rbindlist(lapply(Y_VARS, function(y) {
   lag_terms <- intersect(
