@@ -1025,17 +1025,28 @@ for (i in seq_len(nrow(grp_latest))) {
 }
 
 # Check: Direct must be a non-trivial minority
-n_direct <- grp_all[cu_group == "Direct", N]
+# Guard: cu_group=="Direct" may have 0 rows if data source has no oil states
+n_direct   <- grp_all[cu_group == "Direct", N]
 pct_direct <- grp_all[cu_group == "Direct", pct]
-if (pct_direct < 5 || pct_direct > 40) {
+
+# Coerce to scalar NA if subsetting returned length-0 (no Direct rows)
+n_direct   <- if (length(n_direct)   == 0L) NA_integer_ else n_direct[1]
+pct_direct <- if (length(pct_direct) == 0L) NA_real_    else pct_direct[1]
+
+if (is.na(pct_direct)) {
+  cat("  WARNING: No 'Direct' rows in cu_group -- oil_exposure_bin may be all 0\n")
+  cat("  This is expected when using Tier 3 static fallback with no states above 2%\n")
+  log_checkpoint("CK-19: CU group composition", "WARN",
+                 "Direct group is empty -- check threshold or data source")
+} else if (pct_direct < 5 || pct_direct > 40) {
   log_checkpoint("CK-19: CU group composition", "WARN",
                  sprintf("Direct = %.1f%% of state-quarters (expected 10-30%%)", pct_direct))
 } else {
   log_checkpoint("CK-19: CU group composition", "PASS",
                  sprintf("Direct=%.1f%%, Indirect=%.1f%%, Negligible=%.1f%%",
-                         grp_all[cu_group=="Direct",    pct],
-                         grp_all[cu_group=="Indirect",  pct],
-                         grp_all[cu_group=="Negligible",pct]))
+                         pct_direct,
+                         grp_all[cu_group=="Indirect",   pct] %||% 0,
+                         grp_all[cu_group=="Negligible", pct] %||% 0))
 }
 
 # ============================================================================
