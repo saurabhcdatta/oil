@@ -1628,65 +1628,98 @@ hdr("CHART 18: NCUA PCA traffic-light dashboard")
 
 panel_pca <- copy(panel)
 
-# Step 1: compute from raw columns
-asset_col_18 <- intersect(c("assets_tot","acct_010"), names(panel_pca))[1]
-nw_col_18    <- intersect(c("networth","networthalt"), names(panel_pca))[1]
+# Strategy: find the best available net worth ratio with full coverage.
+# In OCE_combined, 'networth' and 'pcanetworth' are BOTH ratio/pct columns
+# (not dollar amounts) -- dividing by assets_tot produces near-zero values.
+# We try each candidate column, inspect its median, and use the one that
+# produces a plausible net worth ratio (typical NCUA CU median ~10-12%).
+#
+# Candidate columns (in priority order):
+#   pcanetworth  : Net worth ratio (PCA), may be ratio (0.10) or pct (10.0)
+#   networth     : Net worth ratio variant, same scale issue
+#   networthalt  : Alternative measure
+# We do NOT divide by assets_tot -- these are already ratio/pct columns.
 
-cat(sprintf("\n  Chart 18 column selection:\n"))
-cat(sprintf("  Net worth column : %s\n",
-            if (!is.na(nw_col_18)) nw_col_18 else "NOT FOUND"))
-cat(sprintf("  Asset column     : %s\n",
-            if (!is.na(asset_col_18)) asset_col_18 else "NOT FOUND"))
+cat("\n  Chart 18 -- net worth ratio column inspection:\n")
+nw_candidates <- intersect(c("pcanetworth","networth","networthalt"), names(panel))
+cat(sprintf("  Candidates available: %s\n", paste(nw_candidates, collapse=", ")))
 
-if (!is.na(nw_col_18) && !is.na(asset_col_18)) {
-  panel_pca[, nw_ratio := fifelse(
-    !is.na(get(asset_col_18)) & get(asset_col_18) > 0 &
-    !is.na(get(nw_col_18)),
-    get(nw_col_18) / get(asset_col_18),
-    NA_real_
-  )]
-  n_raw <- sum(!is.na(panel_pca$nw_ratio))
-  cat(sprintf("  Step 1 (networth/assets_tot): %s valid rows\n",
-              format(n_raw, big.mark=",")))
+# Inspect each candidate
+for (cc in nw_candidates) {
+  v <- panel[[cc]]
+  med <- median(v, na.rm=TRUE)
+  pct_miss <- mean(is.na(v))*100
+  cat(sprintf("    %-16s: median=%.4f  miss=%.1f%%  range=[%.4f, %.4f]\n",
+              cc, med, pct_miss,
+              quantile(v, 0.01, na.rm=TRUE),
+              quantile(v, 0.99, na.rm=TRUE)))
+}
+
+# Select: prefer the column with most coverage AND plausible median
+# Plausible ratio: 0.04 to 0.30 (4% to 30%) OR 4 to 30 (percentage form)
+best_col <- NULL
+for (cc in nw_candidates) {
+  v   <- panel[[cc]]
+  med <- median(v, na.rm=TRUE)
+  cov <- mean(!is.na(v))
+  # Plausible if median is in ratio range (0.04-0.30) or pct range (4-30)
+  plausible <- (med >= 0.04 && med <= 0.30) || (med >= 4 && med <= 30)
+  if (plausible && cov > 0.10) { best_col <- cc; break }
+}
+
+if (is.null(best_col)) {
+  # Fallback: use whichever has most coverage regardless of scale
+  cov_vec <- sapply(nw_candidates, function(cc) mean(!is.na(panel[[cc]])))
+  if (length(cov_vec) > 0) best_col <- names(which.max(cov_vec))
+}
+
+cat(sprintf("\n  Selected column: %s\n",
+            if (!is.null(best_col)) best_col else "NONE"))
+
+if (!is.null(best_col)) {
+  panel_pca[, nw_ratio := as.double(get(best_col))]
+
+  # Auto-scale: convert to ratio (0-1) if values are in percentage form
+  nr_med <- median(panel_pca$nw_ratio, na.rm=TRUE)
+  if (!is.na(nr_med) && nr_med > 1) {
+    panel_pca[, nw_ratio := nw_ratio / 100]
+    nr_med <- median(panel_pca$nw_ratio, na.rm=TRUE)
+    cat(sprintf("  Rescaled pct->ratio | new median=%.4f\n", nr_med))
+  } else {
+    cat(sprintf("  Already ratio form | median=%.4f\n", nr_med))
+  }
+
+  # Fill gaps from secondary columns
+  for (cc2 in setdiff(nw_candidates, best_col)) {
+    n_before <- sum(!is.na(panel_pca$nw_ratio))
+    v2 <- panel[[cc2]]
+    med2 <- median(v2, na.rm=TRUE)
+    scale2 <- if (!is.na(med2) && med2 > 1) 100 else 1
+    panel_pca[is.na(nw_ratio) & !is.na(get(cc2)),
+               nw_ratio := get(cc2) / scale2]
+    n_added <- sum(!is.na(panel_pca$nw_ratio)) - n_before
+    if (n_added > 0)
+      cat(sprintf("  Filled %s gaps from %s\n",
+                  format(n_added, big.mark=","), cc2))
+  }
 } else {
   panel_pca[, nw_ratio := NA_real_]
-  n_raw <- 0L
-  cat("  Step 1: raw columns missing\n")
 }
 
-# Step 2: fill gaps from pcanetworth
-if ("pcanetworth" %in% names(panel_pca)) {
-  pca_med <- median(panel_pca$pcanetworth, na.rm = TRUE)
-  pca_is_pct <- !is.na(pca_med) && pca_med > 1
-  # Convert pcanetworth to ratio (0-1) if it's in percentage form
-  panel_pca[is.na(nw_ratio) & !is.na(pcanetworth),
-             nw_ratio := fifelse(pca_is_pct,
-                                  pcanetworth / 100,
-                                  pcanetworth)]
-  n_filled <- sum(!is.na(panel_pca$nw_ratio)) - n_raw
-  cat(sprintf("  Step 2 (pcanetworth fill): +%s rows | scale=%s\n",
-              format(n_filled, big.mark=","),
-              if (pca_is_pct) "pct->ratio" else "ratio"))
-}
+n_total  <- sum(!is.na(panel_pca$nw_ratio))
+n_miss   <- sum(is.na(panel_pca$nw_ratio))
+nr_med   <- median(panel_pca$nw_ratio, na.rm=TRUE)
+nw_source <- if (!is.null(best_col)) best_col else "none"
 
-n_total <- sum(!is.na(panel_pca$nw_ratio))
-n_missing <- sum(is.na(panel_pca$nw_ratio))
-cat(sprintf("  Final nw_ratio: %s valid | %s NA (%.1f%%)\n",
+cat(sprintf("  Final nw_ratio: %s valid (%.0f%%) | %s NA | median=%.4f\n",
             format(n_total, big.mark=","),
-            format(n_missing, big.mark=","),
-            n_missing/nrow(panel_pca)*100))
-
-# Auto-detect: if nw_ratio still looks like percentages, rescale
-nr_med <- median(panel_pca$nw_ratio, na.rm = TRUE)
-if (!is.na(nr_med) && nr_med > 1) {
-  panel_pca[!is.na(nw_ratio), nw_ratio := nw_ratio / 100]
-  cat("  nw_ratio rescaled from percentage to ratio (0-1)\n")
-  nr_med <- median(panel_pca$nw_ratio, na.rm = TRUE)
-}
-cat(sprintf("  nw_ratio median=%.4f  (ratio form; PCA thresholds: 0.10/0.07/0.06/0.04)\n",
+            n_total/nrow(panel_pca)*100,
+            format(n_miss, big.mark=","),
             nr_med))
+cat(sprintf("  PCA thresholds (ratio): well>=0.10 | adeq>=0.07 | under>=0.06 | sig>=0.04\n"))
 
-if (n_total > 100) {
+
+if (n_total > 100 && !is.na(nr_med) && nr_med > 0.01) {
   panel_pca <- panel_pca[!is.na(nw_ratio)]
 
   panel_pca[, pca_class := fcase(
@@ -1740,16 +1773,10 @@ if (n_total > 100) {
     scale_y_continuous(labels = percent_format(scale = 1),
                        limits = c(0, 101)) +
     labs(title    = "FIGURE 18 -- NCUA PCA Traffic-Light Dashboard (2005-2025)",
-         subtitle = paste("Share of CU-quarters by PCA capitalisation category",
-                          "| Red/Orange = supervisory concern",
-                          sprintf("| Source: %s/%s (%.0f%% coverage)",
-                                  if (!is.na(nw_col_18)) nw_col_18 else "pcanetworth",
-                                  if (!is.na(asset_col_18)) asset_col_18 else "pcanetworth",
-                                  n_total/nrow(panel)*100)),
-         caption  = paste("Source: NCUA Form 5300",
-                          sprintf("| nw_ratio = %s / %s (filled from pcanetworth where missing)",
-                                  if (!is.na(nw_col_18)) nw_col_18 else "pcanetworth",
-                                  if (!is.na(asset_col_18)) asset_col_18 else "avg assets")),
+         subtitle = sprintf("Share of CU-quarters by PCA capitalisation category | Red/Orange = supervisory concern | Source: %s (%.0f%% coverage)",
+                            nw_source, n_total/nrow(panel)*100),
+         caption  = sprintf("Source: NCUA Form 5300 | Column: %s | Auto-scaled to ratio form | PCA thresholds: >=10%% well / >=7%% adequate / >=6%% under / >=4%% sig-under",
+                            nw_source),
          x = NULL, y = "Share of CU-Quarters (%)") +
     theme_pub() +
     theme(legend.position = "right",
