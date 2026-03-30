@@ -787,15 +787,24 @@ if (any(!is.na(panel$tier_norm))) {
                           legend.text = element_text(size = 7))
   }
 
+  # Diagnostic: report which outcome vars have data in tier_agg
+  tier_coverage <- sapply(intersect(c("dq_rate","pll_rate","netintmrg","costfds",
+                                       "cert_share","insured_share_growth",
+                                       "member_growth_yoy","pcanetworth"),
+                                     names(tier_agg)),
+                           function(v) sum(!is.na(tier_agg[[v]])))
+  cat("\n  Chart 06 tier_agg coverage (non-NA rows):\n")
+  print(sort(tier_coverage, decreasing = TRUE))
+
   t_panels <- Filter(Negate(is.null), list(
-    make_tier_plot("dq_rate",            "Delinquency Rate (%)"),
-    make_tier_plot("pll_rate",           "PLL Rate (% of Avg Loans)",
+    make_tier_plot("dq_rate",             "Delinquency Rate (%)"),
+    make_tier_plot("pll_rate",            "PLL Rate (% of Avg Loans)",
                    number_format(accuracy = 0.01)),
-    make_tier_plot("netintmrg",          "Net Interest Margin (%)"),
-    make_tier_plot("costfds",            "Cost of Funds (%)"),
-    make_tier_plot("cert_share",         "Certificate Share",
-                   percent_format(scale = 100, accuracy = 0.1)),
-    make_tier_plot("member_growth_yoy",  "Membership Growth (YoY%)",
+    make_tier_plot("netintmrg",           "Net Interest Margin (%)"),
+    make_tier_plot("costfds",             "Cost of Funds (%)"),
+    make_tier_plot("insured_share_growth","Insured Share Growth (YoY%)",
+                   number_format(accuracy = 0.1)),
+    make_tier_plot("member_growth_yoy",   "Membership Growth (YoY%)",
                    number_format(accuracy = 0.1))
   ))
 
@@ -1710,9 +1719,37 @@ if (any(!is.na(panel$tier_norm)) && exists("tier_agg") && nrow(tier_agg) > 0) {
                                 "insured_share_growth","pcanetworth"),
                               names(tier_agg))
 
+  # Self-contained episode definition for Chart 22 (independent of Chart 09)
+  # Covers full 2005-2025 range; adjust yyyyqq_to to panel max if data extends further
+  panel_max_qtr <- max(panel$yyyyqq, na.rm = TRUE)
+  ep_def22 <- data.table(
+    episode     = c("Pre-GFC
+2005-07","GFC
+2008-09","Recovery
+2010-13",
+                    "Shale Bust
+2014-16","Rebound
+2017-19","COVID
+2020",
+                    "Surge
+2021-22","Post-Surge
+2023-25"),
+    yyyyqq_from = c(200501L,200801L,201001L,201401L,201701L,202001L,
+                    202101L,202301L),
+    yyyyqq_to   = c(200704L,200904L,201304L,201604L,201904L,202004L,
+                    202204L,max(panel_max_qtr, 202504L))
+  )
+  # Only keep episodes that have data
+  ep_def22 <- ep_def22[yyyyqq_from <= panel_max_qtr]
+
+  cat(sprintf("\n  Chart 22: panel max yyyyqq = %d | episodes with data: %d\n",
+              panel_max_qtr, nrow(ep_def22)))
+  cat(sprintf("  dash_outcomes available: %s\n",
+              paste(dash_outcomes, collapse=", ")))
+
   # Compute episode means by tier for heatmap
-  tier_ep_list <- lapply(1:nrow(ep_def), function(i) {
-    ep  <- ep_def[i]
+  tier_ep_list <- lapply(1:nrow(ep_def22), function(i) {
+    ep  <- ep_def22[i]
     sub <- tier_agg[yyyyqq >= ep$yyyyqq_from & yyyyqq <= ep$yyyyqq_to &
                       !is.na(tier_norm)]
     if (nrow(sub) == 0) return(NULL)
@@ -1725,6 +1762,14 @@ if (any(!is.na(panel$tier_norm)) && exists("tier_agg") && nrow(tier_agg) > 0) {
   tier_ep_dt <- rbindlist(Filter(Negate(is.null), tier_ep_list), fill = TRUE)
 
   if (nrow(tier_ep_dt) > 0 && length(dash_outcomes) >= 1) {
+
+    # Diagnostic: how many tier-episode combinations have data?
+    cat("\n  Chart 22 tier_ep_dt dimensions:", nrow(tier_ep_dt),
+        "rows x", ncol(tier_ep_dt), "cols\n")
+    cat("  Episodes present:", paste(sort(unique(tier_ep_dt$episode)), collapse=", "), "\n")
+    cat("  Tiers present   :", paste(sort(unique(as.character(tier_ep_dt$tier_code))),
+                                     collapse=", "), "\n")
+
     tier_ep_long <- melt(tier_ep_dt,
                           id.vars = c("tier_code","episode"),
                           variable.name = "outcome", value.name = "val")
@@ -1732,6 +1777,14 @@ if (any(!is.na(panel$tier_norm)) && exists("tier_agg") && nrow(tier_agg) > 0) {
     tier_ep_long[is.na(out_label), out_label := as.character(outcome)]
     tier_ep_long[, tier_label := TIER_LABELS8[as.character(tier_code)]]
     tier_ep_long[is.na(tier_label), tier_label := as.character(tier_code)]
+
+    # Enforce chronological episode order using ep_def22
+    ep_levels_22 <- ep_def22$episode[ep_def22$episode %in% unique(tier_ep_long$episode)]
+    tier_ep_long[, episode := factor(episode, levels = ep_levels_22)]
+
+    # Enforce T1->T8 tier order on y-axis (reversed so T1 at top)
+    tier_ep_long[, tier_label := factor(tier_label,
+                                         levels = rev(TIER_LABELS8))]
 
     # Normalise within outcome
     tier_ep_long[, norm_val := {
@@ -1753,7 +1806,7 @@ if (any(!is.na(panel$tier_norm)) && exists("tier_agg") && nrow(tier_agg) > 0) {
       facet_wrap(~out_label, ncol = 2) +
       labs(title    = "FIGURE 22 -- 8-Tier Asset Response Dashboard: Episode x Tier Heatmap",
            subtitle = paste("Rows = 8 asset tiers (T1 <$10M to T8 >$10B) |",
-                            "Columns = oil price episodes | Values = episode mean"),
+                            "Columns = oil price episodes (chronological) | Values = episode mean"),
            caption  = "Source: NCUA Form 5300 | assets_cat2 from OCE_combined Stata file",
            x = NULL, y = NULL) +
       theme_pub() +
