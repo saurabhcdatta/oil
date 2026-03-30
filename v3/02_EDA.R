@@ -1618,32 +1618,83 @@ if (!is.na(nw_col)) {
 # ============================================================================
 hdr("CHART 18: NCUA PCA traffic-light dashboard")
 
-if ("pcanetworth" %in% names(panel)) {
-  panel_pca <- copy(panel[!is.na(pcanetworth)])
+# Build net worth ratio from raw columns for maximum coverage.
+# pcanetworth is 64.5% missing (not populated in earlier/later vintages).
+# networth / assets_tot gives the same ratio with near-100% coverage.
+# Strategy:
+#   1. Compute nw_ratio = networth / assets_tot for all rows where both exist
+#   2. Fill any remaining gaps from pcanetworth (auto-scaled to ratio form)
+#   3. Classify all rows with a valid nw_ratio into PCA categories
 
-  # Diagnostic: detect scale of pcanetworth (ratio 0-1 vs percentage 0-100)
-  pca_median <- median(panel_pca$pcanetworth, na.rm = TRUE)
-  pca_p99    <- quantile(panel_pca$pcanetworth, 0.99, na.rm = TRUE)
-  cat(sprintf("\n  pcanetworth median=%.4f  p99=%.4f\n", pca_median, pca_p99))
+panel_pca <- copy(panel)
 
-  # Auto-scale: if median > 1 the values are already in percent form
-  pca_scale <- if (pca_median > 1) 1 else 100   # multiply to get % for thresholds
-  cat(sprintf("  pcanetworth scale detected: values are in %s form\n",
-              if (pca_scale == 1) "PERCENTAGE (0-100)" else "RATIO (0-1)"))
-  cat(sprintf("  PCA thresholds applied (%%): 10 | 7 | 6 | 4\n"))
+# Step 1: compute from raw columns
+asset_col_18 <- intersect(c("assets_tot","acct_010"), names(panel_pca))[1]
+nw_col_18    <- intersect(c("networth","networthalt"), names(panel_pca))[1]
 
-  # Classify -- thresholds in same units as the data
-  thr_well  <- if (pca_scale == 1) 10   else 0.10
-  thr_adeq  <- if (pca_scale == 1) 7    else 0.07
-  thr_under <- if (pca_scale == 1) 6    else 0.06
-  thr_sig   <- if (pca_scale == 1) 4    else 0.04
+cat(sprintf("\n  Chart 18 column selection:\n"))
+cat(sprintf("  Net worth column : %s\n",
+            if (!is.na(nw_col_18)) nw_col_18 else "NOT FOUND"))
+cat(sprintf("  Asset column     : %s\n",
+            if (!is.na(asset_col_18)) asset_col_18 else "NOT FOUND"))
+
+if (!is.na(nw_col_18) && !is.na(asset_col_18)) {
+  panel_pca[, nw_ratio := fifelse(
+    !is.na(get(asset_col_18)) & get(asset_col_18) > 0 &
+    !is.na(get(nw_col_18)),
+    get(nw_col_18) / get(asset_col_18),
+    NA_real_
+  )]
+  n_raw <- sum(!is.na(panel_pca$nw_ratio))
+  cat(sprintf("  Step 1 (networth/assets_tot): %s valid rows\n",
+              format(n_raw, big.mark=",")))
+} else {
+  panel_pca[, nw_ratio := NA_real_]
+  n_raw <- 0L
+  cat("  Step 1: raw columns missing\n")
+}
+
+# Step 2: fill gaps from pcanetworth
+if ("pcanetworth" %in% names(panel_pca)) {
+  pca_med <- median(panel_pca$pcanetworth, na.rm = TRUE)
+  pca_is_pct <- !is.na(pca_med) && pca_med > 1
+  # Convert pcanetworth to ratio (0-1) if it's in percentage form
+  panel_pca[is.na(nw_ratio) & !is.na(pcanetworth),
+             nw_ratio := fifelse(pca_is_pct,
+                                  pcanetworth / 100,
+                                  pcanetworth)]
+  n_filled <- sum(!is.na(panel_pca$nw_ratio)) - n_raw
+  cat(sprintf("  Step 2 (pcanetworth fill): +%s rows | scale=%s\n",
+              format(n_filled, big.mark=","),
+              if (pca_is_pct) "pct->ratio" else "ratio"))
+}
+
+n_total <- sum(!is.na(panel_pca$nw_ratio))
+n_missing <- sum(is.na(panel_pca$nw_ratio))
+cat(sprintf("  Final nw_ratio: %s valid | %s NA (%.1f%%)\n",
+            format(n_total, big.mark=","),
+            format(n_missing, big.mark=","),
+            n_missing/nrow(panel_pca)*100))
+
+# Auto-detect: if nw_ratio still looks like percentages, rescale
+nr_med <- median(panel_pca$nw_ratio, na.rm = TRUE)
+if (!is.na(nr_med) && nr_med > 1) {
+  panel_pca[!is.na(nw_ratio), nw_ratio := nw_ratio / 100]
+  cat("  nw_ratio rescaled from percentage to ratio (0-1)\n")
+  nr_med <- median(panel_pca$nw_ratio, na.rm = TRUE)
+}
+cat(sprintf("  nw_ratio median=%.4f  (ratio form; PCA thresholds: 0.10/0.07/0.06/0.04)\n",
+            nr_med))
+
+if (n_total > 100) {
+  panel_pca <- panel_pca[!is.na(nw_ratio)]
 
   panel_pca[, pca_class := fcase(
-    pcanetworth >= thr_well,  "Well-Capitalised (>=10%)",
-    pcanetworth >= thr_adeq,  "Adequately Capitalised (7-10%)",
-    pcanetworth >= thr_under, "Under-Capitalised (6-7%)",
-    pcanetworth >= thr_sig,   "Significantly Under-Cap'd (4-6%)",
-    default                   = "Critically Under-Cap'd (<4%)"
+    nw_ratio >= 0.10, "Well-Capitalised (>=10%)",
+    nw_ratio >= 0.07, "Adequately Capitalised (7-10%)",
+    nw_ratio >= 0.06, "Under-Capitalised (6-7%)",
+    nw_ratio >= 0.04, "Significantly Under-Cap'd (4-6%)",
+    default           = "Critically Under-Cap'd (<4%)"
   )]
   panel_pca[, pca_class := factor(pca_class, levels = c(
     "Critically Under-Cap'd (<4%)",
@@ -1653,22 +1704,31 @@ if ("pcanetworth" %in% names(panel)) {
     "Well-Capitalised (>=10%)"
   ))]
 
-  # Diagnostic: show PCA distribution
+  # Diagnostic: PCA distribution + quarterly coverage check
   pca_dist <- panel_pca[, .N, by = pca_class][order(pca_class)]
   pca_dist[, pct := round(N / nrow(panel_pca) * 100, 2)]
   cat("  PCA class distribution:\n")
   print(pca_dist, row.names = FALSE)
 
-  pca_qtr <- panel_pca[, .(pct = .N), by = .(yyyyqq, cal_date, pca_class)]
-  pca_qtr[, total := sum(pct), by = yyyyqq]
-  pca_qtr[, pct := pct / total * 100]
+  # Check quarterly coverage -- flag any gaps
+  qtr_cover <- panel_pca[, .(n_cus = .N), by = .(yyyyqq, cal_date)][order(yyyyqq)]
+  cat(sprintf("  Quarters with data: %d | range: %s to %s\n",
+              nrow(qtr_cover),
+              format(min(qtr_cover$cal_date)), format(max(qtr_cover$cal_date))))
+  n_gap_qtrs <- qtr_cover[n_cus < 100, .N]
+  if (n_gap_qtrs > 0)
+    cat(sprintf("  WARNING: %d quarters with <100 CUs (data gaps)\n", n_gap_qtrs))
+
+  pca_qtr <- panel_pca[, .(n = .N), by = .(yyyyqq, cal_date, pca_class)]
+  pca_qtr[, total := sum(n), by = yyyyqq]
+  pca_qtr[, pct   := n / total * 100]
 
   PCA_COLS <- c(
-    "Critically Under-Cap'd (<4%)"        = "#c0392b",
-    "Significantly Under-Cap'd (4-6%)"    = "#e67e22",
-    "Under-Capitalised (6-7%)"            = "#f1c40f",
-    "Adequately Capitalised (7-10%)"      = "#2ecc71",
-    "Well-Capitalised (>=10%)"            = "#1a3a5c"
+    "Critically Under-Cap'd (<4%)"     = "#c0392b",
+    "Significantly Under-Cap'd (4-6%)" = "#e67e22",
+    "Under-Capitalised (6-7%)"         = "#f1c40f",
+    "Adequately Capitalised (7-10%)"   = "#2ecc71",
+    "Well-Capitalised (>=10%)"         = "#1a3a5c"
   )
 
   p18 <- ggplot(pca_qtr[!is.na(cal_date)],
@@ -1681,14 +1741,23 @@ if ("pcanetworth" %in% names(panel)) {
                        limits = c(0, 101)) +
     labs(title    = "FIGURE 18 -- NCUA PCA Traffic-Light Dashboard (2005-2025)",
          subtitle = paste("Share of CU-quarters by PCA capitalisation category",
-                          "| Red/Orange = supervisory concern"),
-         caption  = "Source: NCUA Form 5300 | pcanetworth = net worth / avg assets",
+                          "| Red/Orange = supervisory concern",
+                          sprintf("| Source: %s/%s (%.0f%% coverage)",
+                                  if (!is.na(nw_col_18)) nw_col_18 else "pcanetworth",
+                                  if (!is.na(asset_col_18)) asset_col_18 else "pcanetworth",
+                                  n_total/nrow(panel)*100)),
+         caption  = paste("Source: NCUA Form 5300",
+                          sprintf("| nw_ratio = %s / %s (filled from pcanetworth where missing)",
+                                  if (!is.na(nw_col_18)) nw_col_18 else "pcanetworth",
+                                  if (!is.na(asset_col_18)) asset_col_18 else "avg assets")),
          x = NULL, y = "Share of CU-Quarters (%)") +
     theme_pub() +
     theme(legend.position = "right",
           legend.text     = element_text(size = 8))
 
   save_plot(p18, "18_pca_traffic_light.png", w = 12, h = 7)
+} else {
+  cat("  SKIP Chart 18: insufficient net worth data (<100 valid rows)\n")
 }
 
 # ============================================================================
