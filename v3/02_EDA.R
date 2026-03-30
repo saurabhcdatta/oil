@@ -224,6 +224,72 @@ add_date <- function(dt) {
 }
 add_date(panel); add_date(macro)
 
+# ── Normalise tier column to canonical T-codes ────────────────────────────────
+# assets_cat2 may arrive as: integer codes (Stata after zap_labels),
+# string labels ("Assets < 10 million"), or already T-codes ("T1_under10M").
+# This block normalises everything to T-codes used throughout all charts.
+
+TIER_LABELS8 <- c(
+  "T1_under10M"  = "< $10M",     "T2_10to50M"   = "$10-50M",
+  "T3_50to100M"  = "$50-100M",   "T4_100to500M" = "$100-500M",
+  "T5_500Mto1B"  = "$500M-$1B",  "T6_1Bto5B"    = "$1-5B",
+  "T7_5Bto10B"   = "$5-10B",     "T8_over10B"   = "> $10B"
+)
+
+# Integer code -> T-code (Stata value labels 1-8)
+INT_TO_T <- c("1"="T1_under10M","2"="T2_10to50M","3"="T3_50to100M",
+              "4"="T4_100to500M","5"="T5_500Mto1B","6"="T6_1Bto5B",
+              "7"="T7_5Bto10B","8"="T8_over10B")
+
+# String label -> T-code
+STR_TO_T <- c(
+  "Assets < 10 million"    = "T1_under10M",
+  "10M up to 50M"          = "T2_10to50M",
+  "50M through 100M"       = "T3_50to100M",
+  "Over 100M through 500M" = "T4_100to500M",
+  "Over 500M through 1B"   = "T5_500Mto1B",
+  "Over 1B through 5B"     = "T6_1Bto5B",
+  "Over 5B through 10B"    = "T7_5Bto10B",
+  "Over 10B"               = "T8_over10B"
+)
+
+normalise_tier <- function(x) {
+  xs <- as.character(x)
+  # Already a T-code?
+  ok_t <- xs %in% names(TIER_LABELS8)
+  # Integer string (Stata value labels)?
+  ok_i <- grepl("^[1-8]$", xs) & !ok_t
+  # String label?
+  ok_s <- xs %in% names(STR_TO_T) & !ok_t & !ok_i
+
+  result <- rep(NA_character_, length(xs))
+  result[ok_t] <- xs[ok_t]
+  result[ok_i] <- INT_TO_T[xs[ok_i]]
+  result[ok_s] <- STR_TO_T[xs[ok_s]]
+  factor(result, levels = names(TIER_LABELS8))
+}
+
+# Apply normaliser: prefer asset_tier (already T-codes from Script 01),
+# fall back to assets_cat2 (may be integers or strings from Stata)
+if ("asset_tier" %in% names(panel)) {
+  panel[, tier_norm := normalise_tier(asset_tier)]
+  msg("  Tier column: asset_tier -> tier_norm (T-codes)")
+} else if ("assets_cat2" %in% names(panel)) {
+  panel[, tier_norm := normalise_tier(assets_cat2)]
+  msg("  Tier column: assets_cat2 -> tier_norm (T-codes)")
+} else {
+  panel[, tier_norm := factor(NA_character_, levels = names(TIER_LABELS8))]
+  msg("  WARNING: No tier column found -- tier_norm set to NA")
+}
+
+n_na_tier <- sum(is.na(panel$tier_norm))
+n_ok_tier <- sum(!is.na(panel$tier_norm))
+msg("  tier_norm: %s valid | %d NA | levels: %s",
+    format(n_ok_tier, big.mark=","), n_na_tier,
+    paste(levels(panel$tier_norm), collapse=", "))
+msg("  tier_norm distribution:")
+print(panel[, .N, by = tier_norm][order(tier_norm)])
+
 # Macro spine
 mac_spine <- unique(macro[, .(
   cal_date, yyyyqq,
@@ -659,39 +725,27 @@ if (length(dep_vars) >= 2) {
 # ============================================================================
 hdr("CHART 06: Asset tier response (8-tier assets_cat2)")
 
-tier_col_06 <- intersect(c("asset_tier","assets_cat2"), names(panel))[1]
+# Use pre-normalised tier_norm column (robust to Stata integers, strings, T-codes)
+tier_col_06 <- "tier_norm"
 
-if (!is.na(tier_col_06)) {
+if (any(!is.na(panel$tier_norm))) {
   tier_agg <- agg_group(panel,
                          intersect(c("dq_rate","netintmrg","costfds",
                                      "cert_share","insured_share_growth",
                                      "member_growth_yoy","pll_rate",
                                      "pcanetworth"),
                                    names(panel)),
-                         tier_col_06)
+                         "tier_norm")
   tier_agg <- merge(tier_agg, mac_spine[, .(yyyyqq, pbrent, yoy_oil)],
                     by = "yyyyqq", all.x = TRUE)
 
-  # Map to T-codes if needed
-  if (tier_col_06 == "assets_cat2") {
-    cat2_to_t <- c(
-      "Assets < 10 million"    = "T1_under10M",
-      "10M up to 50M"          = "T2_10to50M",
-      "50M through 100M"       = "T3_50to100M",
-      "Over 100M through 500M" = "T4_100to500M",
-      "Over 500M through 1B"   = "T5_500Mto1B",
-      "Over 1B through 5B"     = "T6_1Bto5B",
-      "Over 5B through 10B"    = "T7_5Bto10B",
-      "Over 10B"               = "T8_over10B"
-    )
-    tier_agg[, tier_code := cat2_to_t[as.character(get(tier_col_06))]]
-    tier_var_06 <- "tier_code"
-  } else {
-    tier_var_06 <- "asset_tier"
-  }
+  tier_var_06    <- "tier_norm"
+  tier_cols_use  <- TIER_COLS[intersect(names(TIER_COLS),
+                                         levels(panel$tier_norm))]
 
-  tier_cols_use <- TIER_COLS[intersect(names(TIER_COLS),
-                                        unique(tier_agg[[tier_var_06]]))]
+  msg("  Chart 06: tier_norm levels present: %s",
+      paste(unique(tier_agg$tier_norm[!is.na(tier_agg$tier_norm)]),
+            collapse=", "))
 
   make_tier_plot <- function(v, lab, y_fmt = waiver()) {
     if (!v %in% names(tier_agg)) return(NULL)
@@ -1096,27 +1150,21 @@ if ("member_growth_yoy" %in% names(panel)) {
 # ============================================================================
 hdr("CHART NEW-C: Membership growth by asset tier")
 
-if ("member_growth_yoy" %in% names(panel) && !is.na(tier_col_06)) {
-  tier_mem <- agg_group(panel, "member_growth_yoy", tier_col_06)
+if ("member_growth_yoy" %in% names(panel) && any(!is.na(panel$tier_norm))) {
+  tier_mem <- agg_group(panel, "member_growth_yoy", "tier_norm")
   tier_mem <- merge(tier_mem, mac_spine[, .(yyyyqq, yoy_oil)],
                     by = "yyyyqq", all.x = TRUE)
-  if (tier_col_06 == "assets_cat2" && "tier_code" %in% names(tier_agg)) {
-    tier_mem[, tier_code := cat2_to_t[as.character(get(tier_col_06))]]
-    tier_mem_col <- "tier_code"
-  } else {
-    tier_mem_col <- tier_col_06
-  }
+  tier_mem_col <- "tier_norm"
+  tc_use_nc <- TIER_COLS[intersect(names(TIER_COLS), levels(panel$tier_norm))]
 
-  tc_use_nc <- TIER_COLS[intersect(names(TIER_COLS), unique(tier_mem[[tier_mem_col]]))]
-
-  pNC1 <- ggplot(tier_mem[!is.na(member_growth_yoy)],
+  pNC1 <- ggplot(tier_mem[!is.na(member_growth_yoy) & !is.na(tier_norm)],
                  aes(x = cal_date, y = member_growth_yoy,
-                     colour = get(tier_mem_col))) +
+                     colour = tier_norm)) +
     ep_rects() +
     geom_line(linewidth = 0.7) +
     geom_hline(yintercept = 0, linewidth = 0.35, colour = "#888") +
     scale_colour_manual(values = tc_use_nc,
-                        labels = TIER_LABELS[names(tc_use_nc)],
+                        labels = TIER_LABELS8[names(tc_use_nc)],
                         name   = "Tier") +
     scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
     scale_y_continuous(labels = number_format(accuracy = 0.1)) +
@@ -1126,14 +1174,17 @@ if ("member_growth_yoy" %in% names(panel) && !is.na(tier_col_06)) {
     theme_pub() + theme(legend.position = "right",
                         legend.text = element_text(size = 7.5))
 
-  pNC2 <- ggplot(panel[!is.na(member_growth_yoy) & !is.na(get(tier_col_06))],
-                 aes(x = get(tier_col_06),
+  pNC2 <- ggplot(panel[!is.na(member_growth_yoy) & !is.na(tier_norm)],
+                 aes(x = tier_norm,
                      y = member_growth_yoy,
-                     fill = get(tier_col_06))) +
+                     fill = tier_norm)) +
     geom_boxplot(outlier.size = 0.4, outlier.alpha = 0.3,
                  linewidth = 0.5, width = 0.6) +
     geom_hline(yintercept = 0, linewidth = 0.4, linetype = "dashed", colour = "#888") +
-    scale_fill_manual(values = TIER_COLS, guide = "none") +
+    scale_fill_manual(values = TIER_COLS,
+                      labels = TIER_LABELS8[names(TIER_COLS)],
+                      guide  = "none") +
+    scale_x_discrete(labels = TIER_LABELS8) +
     scale_y_continuous(labels = number_format(accuracy = 0.1)) +
     labs(title    = "Membership Growth Distribution by Asset Tier",
          subtitle = "Interquartile range reveals size-dependent volatility",
@@ -1264,18 +1315,15 @@ if ("pll_rate" %in% names(panel)) {
   }
 
   # By tier
-  pll_tier <- if (!is.na(tier_col_06)) {
-    tier_pll <- agg_group(panel, "pll_rate", tier_col_06)
-    if (tier_col_06 == "assets_cat2") {
-      tier_pll[, tier_code := cat2_to_t[as.character(get(tier_col_06))]]
-      tc_pll <- "tier_code"
-    } else { tc_pll <- tier_col_06 }
-    tc_use_pll <- TIER_COLS[intersect(names(TIER_COLS), unique(tier_pll[[tc_pll]]))]
-    ggplot(tier_pll[!is.na(pll_rate)],
-           aes(x = cal_date, y = pll_rate, colour = get(tc_pll))) +
+  pll_tier <- if (any(!is.na(panel$tier_norm))) {
+    tier_pll <- agg_group(panel, "pll_rate", "tier_norm")
+    tc_pll    <- "tier_norm"
+    tc_use_pll <- TIER_COLS[intersect(names(TIER_COLS), levels(panel$tier_norm))]
+    ggplot(tier_pll[!is.na(pll_rate) & !is.na(tier_norm)],
+           aes(x = cal_date, y = pll_rate, colour = tier_norm)) +
       ep_rects() +
       geom_line(linewidth = 0.65) +
-      scale_colour_manual(values = tc_use_pll, labels = TIER_LABELS[names(tc_use_pll)],
+      scale_colour_manual(values = tc_use_pll, labels = TIER_LABELS8[names(tc_use_pll)],
                           name = "Tier") +
       scale_x_date(date_breaks = "3 years", date_labels = "%Y") +
       labs(title    = "PLL Rate by Asset Tier",
@@ -1633,27 +1681,22 @@ if (all(c("cert_share","insured_share_growth") %in% names(panel)) &&
 # ============================================================================
 hdr("CHART 22: 8-tier assets_cat2 response dashboard")
 
-if (!is.na(tier_col_06) && nrow(tier_agg) > 0) {
-  # Long format: all key outcomes by tier
+if (any(!is.na(panel$tier_norm)) && exists("tier_agg") && nrow(tier_agg) > 0) {
+  # tier_agg uses tier_norm (pre-normalised T-codes) -- no remapping needed
   dash_outcomes <- intersect(c("dq_rate","pll_rate","netintmrg","costfds",
                                 "insured_share_growth","pcanetworth"),
                               names(tier_agg))
 
-  if (tier_col_06 == "assets_cat2" && "tier_code" %in% names(tier_agg)) {
-    tier_agg_dash <- tier_agg
-  } else {
-    tier_agg_dash <- tier_agg
-    tier_agg_dash[, tier_code := get(tier_col_06)]
-  }
-
   # Compute episode means by tier for heatmap
   tier_ep_list <- lapply(1:nrow(ep_def), function(i) {
     ep  <- ep_def[i]
-    sub <- tier_agg_dash[yyyyqq >= ep$yyyyqq_from & yyyyqq <= ep$yyyyqq_to]
+    sub <- tier_agg[yyyyqq >= ep$yyyyqq_from & yyyyqq <= ep$yyyyqq_to &
+                      !is.na(tier_norm)]
     if (nrow(sub) == 0) return(NULL)
     means <- sub[, lapply(.SD, function(x) mean(x, na.rm = TRUE)),
-                  by = tier_code, .SDcols = intersect(dash_outcomes, names(sub))]
+                  by = tier_norm, .SDcols = intersect(dash_outcomes, names(sub))]
     means[, episode := ep$episode]
+    setnames(means, "tier_norm", "tier_code")
     means
   })
   tier_ep_dt <- rbindlist(Filter(Negate(is.null), tier_ep_list), fill = TRUE)
@@ -1664,7 +1707,7 @@ if (!is.na(tier_col_06) && nrow(tier_agg) > 0) {
                           variable.name = "outcome", value.name = "val")
     tier_ep_long[, out_label := out_labels[as.character(outcome)]]
     tier_ep_long[is.na(out_label), out_label := as.character(outcome)]
-    tier_ep_long[, tier_label := TIER_LABELS[as.character(tier_code)]]
+    tier_ep_long[, tier_label := TIER_LABELS8[as.character(tier_code)]]
     tier_ep_long[is.na(tier_label), tier_label := as.character(tier_code)]
 
     # Normalise within outcome
