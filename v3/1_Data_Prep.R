@@ -386,167 +386,112 @@ if (length(direct_present) > 0) {
 }
 
 # ============================================================================
-# SECTION 5: ASSET TIER ASSIGNMENT  (assets_cat2 -- 8 tiers)
+# SECTION 5: ASSET TIER ASSIGNMENT  (built from assets_tot)
 # ============================================================================
-section("5", "Asset Tier Assignment (assets_cat2 -- 8 tiers)")
+section("5", "Asset Tier Assignment (built from assets_tot)")
 
 # Tier scheme matches assets_cat2 from OCE_combined Stata file exactly.
-# Units in call report: $thousands.
-# Breaks (in $thousands):  0 | 10,000 | 50,000 | 100,000 | 500,000 |
-#                          1,000,000 | 5,000,000 | 10,000,000 | Inf
+# Built directly from assets_tot (raw asset column, units: $thousands).
+# This eliminates all Stata label encoding issues and ensures 100% coverage
+# for every CU-quarter where assets_tot is non-missing.
+#
+# Breaks ($thousands): 0 | 10,000 | 50,000 | 100,000 | 500,000 |
+#                      1,000,000 | 5,000,000 | 10,000,000 | Inf
 ASSET_BREAKS2 <- c(0, 10e3, 50e3, 100e3, 500e3, 1e6, 5e6, 10e6, Inf)
 ASSET_LABELS2 <- c(
-  "T1_under10M",        # < $10M
-  "T2_10to50M",         # $10M up to $50M
-  "T3_50to100M",        # $50M through $100M
-  "T4_100to500M",       # Over $100M through $500M
-  "T5_500Mto1B",        # Over $500M through $1B
-  "T6_1Bto5B",          # Over $1B through $5B
-  "T7_5Bto10B",         # Over $5B through $10B
-  "T8_over10B"          # Over $10B
+  "T1_under10M",   # < $10M
+  "T2_10to50M",    # $10M to $50M
+  "T3_50to100M",   # $50M to $100M
+  "T4_100to500M",  # $100M to $500M
+  "T5_500Mto1B",   # $500M to $1B
+  "T6_1Bto5B",     # $1B to $5B
+  "T7_5Bto10B",    # $5B to $10B
+  "T8_over10B"     # > $10B
 )
 
-cat("  8-tier scheme matching assets_cat2 in OCE_combined Stata file:\n")
-cat("    T1_under10M   : assets < $10M              (<      10,000)\n")
-cat("    T2_10to50M    : $10M up to $50M            (10,000 --  50,000)\n")
-cat("    T3_50to100M   : $50M through $100M         (50,000 -- 100,000)\n")
-cat("    T4_100to500M  : Over $100M through $500M   (100,000 -- 500,000)\n")
-cat("    T5_500Mto1B   : Over $500M through $1B     (500,000 -- 1,000,000)\n")
-cat("    T6_1Bto5B     : Over $1B through $5B       (1,000,000 -- 5,000,000)\n")
-cat("    T7_5Bto10B    : Over $5B through $10B      (5,000,000 -- 10,000,000)\n")
-cat("    T8_over10B    : Over $10B                  (>= 10,000,000)\n\n")
+cat("  8-tier scheme -- built from assets_tot (no Stata label dependency):\n")
+cat("    T1_under10M   : < $10M              (<      10,000)\n")
+cat("    T2_10to50M    : $10M to $50M        ( 10,000 --  50,000)\n")
+cat("    T3_50to100M   : $50M to $100M       ( 50,000 -- 100,000)\n")
+cat("    T4_100to500M  : $100M to $500M      (100,000 -- 500,000)\n")
+cat("    T5_500Mto1B   : $500M to $1B        (500,000 -- 1,000,000)\n")
+cat("    T6_1Bto5B     : $1B to $5B          (1,000,000 -- 5,000,000)\n")
+cat("    T7_5Bto10B    : $5B to $10B         (5,000,000 -- 10,000,000)\n")
+cat("    T8_over10B    : > $10B              (>= 10,000,000)\n\n")
 
-# Strategy: prefer assets_cat2 if already present in data (pre-computed in Stata)
-# Fall back to constructing from assets_tot / acct_010
+# Detect asset column
+asset_col <- intersect(c("assets_tot", "acct_010"), names(cr))[1]
 
-if ("assets_cat2" %in% names(cr)) {
-  # ── Path A: use pre-computed assets_cat2 directly ──────────────────────────
-  cat("  assets_cat2 column FOUND in call_report.rds -- using pre-computed tiers\n\n")
+if (!is.na(asset_col)) {
+  cat(sprintf("  Asset column : %s\n", asset_col))
+  cat(sprintf("  N rows       : %s\n", format(nrow(cr), big.mark = ",")))
 
-  # Audit the pre-computed values
-  cat("  Pre-computed assets_cat2 distribution:\n")
-  cat(sprintf("  %-24s  %10s  %8s  %8s\n",
-              "Category", "N (CU-qtrs)", "Pct", "Cum."))
-  cat(sprintf("  %s\n", paste(rep("-", 56), collapse = "")))
-  cat_dist <- cr[, .N, by = assets_cat2][order(assets_cat2)]
-  cum_pct  <- 0
-  for (i in seq_len(nrow(cat_dist))) {
-    pct_i <- cat_dist$N[i] / nrow(cr) * 100
-    cum_pct <- cum_pct + pct_i
-    cat(sprintf("  %-24s  %10s  %7.1f%%  %7.1f%%\n",
-                as.character(cat_dist$assets_cat2[i]),
-                format(cat_dist$N[i], big.mark = ","),
-                pct_i, cum_pct))
-  }
+  describe_var(cr[[asset_col]], asset_col, "raw")
 
-  # Map existing labels to canonical T1-T8 codes for regression use
-  # assets_cat2 Stata labels -> T-codes
-  label_map <- c(
-    "Assets < 10 million"        = "T1_under10M",
-    "10M up to 50M"              = "T2_10to50M",
-    "50M through 100M"           = "T3_50to100M",
-    "Over 100M through 500M"     = "T4_100to500M",
-    "Over 500M through 1B"       = "T5_500Mto1B",
-    "Over 1B through 5B"         = "T6_1Bto5B",
-    "Over 5B through 10B"        = "T7_5Bto10B",
-    "Over 10B"                   = "T8_over10B"
-  )
+  # Diagnostics before classification
+  n_zero_assets <- cr[get(asset_col) <= 0,   .N]
+  n_na_assets   <- cr[is.na(get(asset_col)), .N]
+  cat(sprintf("\n  Zero/negative assets  : %s rows -> tier set to NA\n",
+              format(n_zero_assets, big.mark = ",")))
+  cat(sprintf("  Missing assets        : %s rows -> tier set to NA\n\n",
+              format(n_na_assets, big.mark = ",")))
 
+  # Construct asset_tier directly from assets_tot
   cr[, asset_tier := factor(
-    label_map[as.character(assets_cat2)],
+    fifelse(
+      !is.na(get(asset_col)) & get(asset_col) > 0,
+      ASSET_LABELS2[findInterval(get(asset_col), ASSET_BREAKS2,
+                                  rightmost.closed = FALSE)],
+      NA_character_
+    ),
     levels = ASSET_LABELS2
   )]
 
-  n_unmapped <- cr[is.na(asset_tier) & !is.na(assets_cat2), .N]
-  if (n_unmapped > 0) {
-    unmapped_vals <- unique(cr[is.na(asset_tier) & !is.na(assets_cat2), assets_cat2])
-    cat(sprintf("\n  WARNING: %d rows with unrecognised assets_cat2 labels:\n", n_unmapped))
-    cat(sprintf("    %s\n", paste(head(unmapped_vals, 10), collapse = ", ")))
-    cat("  These will be NA in asset_tier -- verify label_map above\n")
-    log_checkpoint("CK-12a: assets_cat2 label mapping", "WARN",
-                   sprintf("%d rows unmapped -- check label_map", n_unmapped))
-  } else {
-    log_checkpoint("CK-12a: assets_cat2 label mapping", "PASS",
-                   "All assets_cat2 labels mapped to T1-T8 codes")
-  }
+  # Also build assets_cat2 in Stata-compatible label format for any downstream
+  # scripts that reference that column name
+  cat2_labels <- c(
+    "Assets < 10 million", "10M up to 50M", "50M through 100M",
+    "Over 100M through 500M", "Over 500M through 1B",
+    "Over 1B through 5B", "Over 5B through 10B", "Over 10B"
+  )
+  cr[, assets_cat2 := factor(
+    fifelse(
+      !is.na(get(asset_col)) & get(asset_col) > 0,
+      cat2_labels[findInterval(get(asset_col), ASSET_BREAKS2,
+                                rightmost.closed = FALSE)],
+      NA_character_
+    ),
+    levels = cat2_labels
+  )]
+
+  log_checkpoint("CK-12: Asset column", "PASS",
+                 sprintf("Using %s | zero/neg: %d | NA: %d",
+                         asset_col, n_zero_assets, n_na_assets))
 
 } else {
-  # ── Path B: construct from raw asset column ─────────────────────────────────
-  cat("  assets_cat2 NOT in call_report.rds -- constructing from raw asset column\n\n")
-
-  asset_col <- intersect(c("assets_tot", "acct_010"), names(cr))[1]
-
-  if (!is.na(asset_col)) {
-    cat(sprintf("  Asset column: %s\n\n", asset_col))
-    describe_var(cr[[asset_col]], asset_col, "raw")
-
-    # Zero/negative assets are data errors -- set tier to NA
-    n_zero_assets <- cr[get(asset_col) <= 0, .N]
-    if (n_zero_assets > 0)
-      cat(sprintf("  Zero/negative assets: %d rows -> tier set to NA\n", n_zero_assets))
-
-    cr[, asset_tier := factor(
-      fifelse(
-        get(asset_col) > 0,
-        ASSET_LABELS2[findInterval(get(asset_col), ASSET_BREAKS2,
-                                   rightmost.closed = FALSE)],
-        NA_character_
-      ),
-      levels = ASSET_LABELS2
-    )]
-
-    # Also construct assets_cat2 to match Stata labels (for downstream merges)
-    cat2_labels <- c(
-      "Assets < 10 million",
-      "10M up to 50M",
-      "50M through 100M",
-      "Over 100M through 500M",
-      "Over 500M through 1B",
-      "Over 1B through 5B",
-      "Over 5B through 10B",
-      "Over 10B"
-    )
-    cr[, assets_cat2 := factor(
-      fifelse(
-        get(asset_col) > 0,
-        cat2_labels[findInterval(get(asset_col), ASSET_BREAKS2,
-                                  rightmost.closed = FALSE)],
-        NA_character_
-      ),
-      levels = cat2_labels
-    )]
-    cat("  Also constructed assets_cat2 (Stata-label format) for compatibility\n")
-    log_checkpoint("CK-12b: Asset column found", "INFO",
-                   sprintf("Constructed from %s", asset_col))
-
-  } else {
-    cat("  WARNING: Neither assets_cat2, assets_tot nor acct_010 found\n")
-    cr[, asset_tier  := factor(NA_character_, levels = ASSET_LABELS2)]
-    cr[, assets_cat2 := factor(NA_character_)]
-    log_checkpoint("CK-12b: Asset column found", "WARN",
-                   "No asset column -- tiers set to NA")
-  }
+  cat("  WARNING: Neither assets_tot nor acct_010 found in call_report.rds\n")
+  cat("  asset_tier and assets_cat2 set to NA -- tier charts will be blank\n")
+  cr[, asset_tier  := factor(NA_character_, levels = ASSET_LABELS2)]
+  cr[, assets_cat2 := factor(NA_character_)]
+  log_checkpoint("CK-12: Asset column", "WARN",
+                 "No asset column found -- tiers set to NA")
 }
 
-# ── Final tier distribution (regardless of path taken) ───────────────────────
+# ── Final tier distribution ───────────────────────────────────────────────────
 tier_dist <- cr[, .N, by = asset_tier][order(asset_tier)]
 tier_dist[, pct := round(N / nrow(cr) * 100, 1)]
 n_na_tier <- cr[is.na(asset_tier), .N]
 
-cat("\n  Final asset_tier distribution (T-codes for regression):\n")
+cat("\n  Final asset_tier distribution:\n")
 cat(sprintf("  %-22s  %10s  %8s  %8s  %s\n",
             "Tier", "N (CU-qtrs)", "Pct", "Cum.", "Label"))
 cat(sprintf("  %s\n", paste(rep("-", 74), collapse = "")))
 
 tier_labels_display <- c(
-  T1_under10M  = "< $10M",
-  T2_10to50M   = "$10M-$50M",
-  T3_50to100M  = "$50M-$100M",
-  T4_100to500M = "$100M-$500M",
-  T5_500Mto1B  = "$500M-$1B",
-  T6_1Bto5B    = "$1B-$5B",
-  T7_5Bto10B   = "$5B-$10B",
-  T8_over10B   = "> $10B"
+  T1_under10M  = "< $10M",      T2_10to50M   = "$10-50M",
+  T3_50to100M  = "$50-100M",    T4_100to500M = "$100-500M",
+  T5_500Mto1B  = "$500M-$1B",   T6_1Bto5B    = "$1B-$5B",
+  T7_5Bto10B   = "$5B-$10B",    T8_over10B   = "> $10B"
 )
 
 cum_pct <- 0
@@ -557,36 +502,24 @@ for (i in seq_len(nrow(tier_dist))) {
     cat(sprintf("  %-22s  %10s  %7.1f%%  %7.1f%%  %s\n",
                 tier_nm,
                 format(tier_dist$N[i], big.mark = ","),
-                tier_dist$pct[i],
-                cum_pct,
+                tier_dist$pct[i], cum_pct,
                 tier_labels_display[tier_nm]))
   }
 }
 if (n_na_tier > 0)
-  cat(sprintf("  %-22s  %10s  %7.1f%%  (zero/NA assets)\n",
-              "NA",
-              format(n_na_tier, big.mark = ","),
+  cat(sprintf("  %-22s  %10s  %7.1f%%  (zero/missing assets)\n",
+              "NA", format(n_na_tier, big.mark = ","),
               n_na_tier / nrow(cr) * 100))
 
-# ── Validation: cross-check against Stata counts where visible ───────────────
-# From OCE_combined Stata tab assets_cat2 (616,971 total, 2005Q1+):
-#   T1_under10M  : 239,275  (38.78%)
-#   T2_10to50M   : 192,470  (31.20%)
-#   T3_50to100M  :  65,604  (10.63%)
-#   T4_100to500M :  86,153  (13.96%)
-#   T5_500Mto1B  :  17,363   (2.81%)
-#   T6_1Bto5B    :  14,618   (2.37%)
-#   T7_5Bto10B   :   1,075   (0.17%)
-#   T8_over10B   :     413   (0.07%)
-#   Total        : 616,971
-cat("\n  Validation against Stata tab assets_cat2 (from OCE_combined Stata file):\n")
+# Validation against Stata reference counts (OCE_combined, 616,971 obs, 2005Q1+)
+cat("\n  Validation vs Stata tab assets_cat2 (OCE_combined 2005Q1+):\n")
 stata_ref <- data.table(
-  tier    = ASSET_LABELS2,
-  n_stata = c(239275L, 192470L, 65604L, 86153L, 17363L, 14618L, 1075L, 413L),
+  tier      = ASSET_LABELS2,
+  n_stata   = c(239275L,192470L,65604L,86153L,17363L,14618L,1075L,413L),
   pct_stata = c(38.78, 31.20, 10.63, 13.96, 2.81, 2.37, 0.17, 0.07)
 )
 cat(sprintf("  %-22s  %10s  %8s  %10s  %8s  %s\n",
-            "Tier", "N (data)", "Pct", "N (Stata)", "Pct", "Match"))
+            "Tier","N (data)","Pct","N (Stata)","Pct (Stata)","Match"))
 cat(sprintf("  %s\n", paste(rep("-", 80), collapse = "")))
 for (i in seq_len(nrow(stata_ref))) {
   tn    <- stata_ref$tier[i]
@@ -596,23 +529,16 @@ for (i in seq_len(nrow(stata_ref))) {
   diff  <- abs(pct_d - stata_ref$pct_stata[i])
   flag  <- if (diff > 2.0) "  <- DIFF" else if (diff > 0.5) "  <- NOTE" else "  OK"
   cat(sprintf("  %-22s  %10s  %7.1f%%  %10s  %7.2f%%%s\n",
-              tn,
-              format(n_d, big.mark = ","),
-              pct_d,
-              format(stata_ref$n_stata[i], big.mark = ","),
-              stata_ref$pct_stata[i],
-              flag))
+              tn, format(n_d, big.mark=","), pct_d,
+              format(stata_ref$n_stata[i], big.mark=","),
+              stata_ref$pct_stata[i], flag))
 }
 
-# Overall size check
-n_within_2pct <- sum(abs(tier_dist$pct -
-  stata_ref[match(tier_dist$asset_tier, tier_dist$asset_tier), pct_stata]) < 2,
-  na.rm = TRUE)
-
-log_checkpoint("CK-12: Asset tiers (assets_cat2)", "PASS",
-               sprintf("8 tiers constructed; %d NA-tier rows; Stata ref validation printed",
-                       n_na_tier))
-
+log_checkpoint("CK-12: Asset tiers final", "PASS",
+               sprintf("8 tiers from %s | NA: %d (%.1f%%)",
+                       if (!is.na(asset_col)) asset_col else "NONE",
+                       n_na_tier,
+                       n_na_tier / nrow(cr) * 100))
 # ============================================================================
 # SECTION 6: CONSTRUCTED OUTCOME VARIABLES
 # ============================================================================
