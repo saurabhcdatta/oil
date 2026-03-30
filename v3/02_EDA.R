@@ -269,17 +269,40 @@ normalise_tier <- function(x) {
   factor(result, levels = names(TIER_LABELS8))
 }
 
-# Apply normaliser: prefer asset_tier (already T-codes from Script 01),
-# fall back to assets_cat2 (may be integers or strings from Stata)
-if ("asset_tier" %in% names(panel)) {
-  panel[, tier_norm := normalise_tier(asset_tier)]
-  msg("  Tier column: asset_tier -> tier_norm (T-codes)")
-} else if ("assets_cat2" %in% names(panel)) {
-  panel[, tier_norm := normalise_tier(assets_cat2)]
-  msg("  Tier column: assets_cat2 -> tier_norm (T-codes)")
-} else {
+# Apply normaliser: try assets_cat2 first (primary source from OCE_combined),
+# then asset_tier (T-codes built in Script 01), then give up.
+# Within each branch, if the result is all-NA, fall through to the next source.
+tier_norm_built <- FALSE
+
+if ("assets_cat2" %in% names(panel)) {
+  cand <- normalise_tier(panel$assets_cat2)
+  if (sum(!is.na(cand)) > 0) {
+    panel[, tier_norm := cand]
+    msg("  Tier column: assets_cat2 -> tier_norm (T-codes) | valid: %s",
+        format(sum(!is.na(cand)), big.mark=","))
+    tier_norm_built <- TRUE
+  } else {
+    msg("  assets_cat2 present but all NA after normalisation -- trying asset_tier")
+  }
+}
+
+if (!tier_norm_built && "asset_tier" %in% names(panel)) {
+  cand <- normalise_tier(panel$asset_tier)
+  if (sum(!is.na(cand)) > 0) {
+    panel[, tier_norm := cand]
+    msg("  Tier column: asset_tier -> tier_norm (T-codes) | valid: %s",
+        format(sum(!is.na(cand)), big.mark=","))
+    tier_norm_built <- TRUE
+  } else {
+    msg("  asset_tier present but all NA after normalisation")
+  }
+}
+
+if (!tier_norm_built) {
   panel[, tier_norm := factor(NA_character_, levels = names(TIER_LABELS8))]
-  msg("  WARNING: No tier column found -- tier_norm set to NA")
+  msg("  WARNING: No usable tier column found -- tier_norm set to NA")
+  msg("  Columns checked: assets_cat2, asset_tier")
+  msg("  Check that Script 01 ran successfully and produced at least one tier column")
 }
 
 n_na_tier <- sum(is.na(panel$tier_norm))
