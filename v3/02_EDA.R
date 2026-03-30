@@ -950,13 +950,13 @@ if ("spillover_exposure" %in% names(panel) &&
 hdr("CHART 09: Episode heatmap")
 
 ep_def <- data.table(
-  episode      = c("Pre-GFC\n2005-07","GFC\n2008-09","Recovery\n2010-13",
-                   "Shale Bust\n2014-16","Rebound\n2017-19","COVID\n2020",
-                   "Surge\n2021-22","Post-Surge\n2023-25"),
+  episode      = c("Pre-GFC 2005-07","GFC 2008-09","Recovery 2010-13",
+                   "Shale Bust 2014-16","Rebound 2017-19","COVID 2020",
+                   "Surge 2021-22","Post-Surge 2023-25"),
   yyyyqq_from  = c(200501L,200801L,201001L,201401L,201701L,202001L,
                    202101L,202301L),
   yyyyqq_to    = c(200704L,200904L,201304L,201604L,201904L,202004L,
-                   202204L,202504L)
+                   202204L,max(max(panel$yyyyqq, na.rm=TRUE), 202504L))
 )
 
 agg_ep <- merge(agg_quarter(panel, cu_outcomes),
@@ -1451,14 +1451,31 @@ if ("pcanetworth" %in% names(panel)) {
 hdr("CHART 18: NCUA PCA traffic-light dashboard")
 
 if ("pcanetworth" %in% names(panel)) {
-  # Classify each CU-quarter by PCA category
   panel_pca <- copy(panel[!is.na(pcanetworth)])
+
+  # Diagnostic: detect scale of pcanetworth (ratio 0-1 vs percentage 0-100)
+  pca_median <- median(panel_pca$pcanetworth, na.rm = TRUE)
+  pca_p99    <- quantile(panel_pca$pcanetworth, 0.99, na.rm = TRUE)
+  cat(sprintf("\n  pcanetworth median=%.4f  p99=%.4f\n", pca_median, pca_p99))
+
+  # Auto-scale: if median > 1 the values are already in percent form
+  pca_scale <- if (pca_median > 1) 1 else 100   # multiply to get % for thresholds
+  cat(sprintf("  pcanetworth scale detected: values are in %s form\n",
+              if (pca_scale == 1) "PERCENTAGE (0-100)" else "RATIO (0-1)"))
+  cat(sprintf("  PCA thresholds applied (%%): 10 | 7 | 6 | 4\n"))
+
+  # Classify -- thresholds in same units as the data
+  thr_well  <- if (pca_scale == 1) 10   else 0.10
+  thr_adeq  <- if (pca_scale == 1) 7    else 0.07
+  thr_under <- if (pca_scale == 1) 6    else 0.06
+  thr_sig   <- if (pca_scale == 1) 4    else 0.04
+
   panel_pca[, pca_class := fcase(
-    pcanetworth >= 0.10, "Well-Capitalised (>=10%)",
-    pcanetworth >= 0.07, "Adequately Capitalised (7-10%)",
-    pcanetworth >= 0.06, "Under-Capitalised (6-7%)",
-    pcanetworth >= 0.04, "Significantly Under-Cap'd (4-6%)",
-    default             = "Critically Under-Cap'd (<4%)"
+    pcanetworth >= thr_well,  "Well-Capitalised (>=10%)",
+    pcanetworth >= thr_adeq,  "Adequately Capitalised (7-10%)",
+    pcanetworth >= thr_under, "Under-Capitalised (6-7%)",
+    pcanetworth >= thr_sig,   "Significantly Under-Cap'd (4-6%)",
+    default                   = "Critically Under-Cap'd (<4%)"
   )]
   panel_pca[, pca_class := factor(pca_class, levels = c(
     "Critically Under-Cap'd (<4%)",
@@ -1467,6 +1484,12 @@ if ("pcanetworth" %in% names(panel)) {
     "Adequately Capitalised (7-10%)",
     "Well-Capitalised (>=10%)"
   ))]
+
+  # Diagnostic: show PCA distribution
+  pca_dist <- panel_pca[, .N, by = pca_class][order(pca_class)]
+  pca_dist[, pct := round(N / nrow(panel_pca) * 100, 2)]
+  cat("  PCA class distribution:\n")
+  print(pca_dist, row.names = FALSE)
 
   pca_qtr <- panel_pca[, .(pct = .N), by = .(yyyyqq, cal_date, pca_class)]
   pca_qtr[, total := sum(pct), by = yyyyqq]
@@ -1723,17 +1746,9 @@ if (any(!is.na(panel$tier_norm)) && exists("tier_agg") && nrow(tier_agg) > 0) {
   # Covers full 2005-2025 range; adjust yyyyqq_to to panel max if data extends further
   panel_max_qtr <- max(panel$yyyyqq, na.rm = TRUE)
   ep_def22 <- data.table(
-    episode     = c("Pre-GFC
-2005-07","GFC
-2008-09","Recovery
-2010-13",
-                    "Shale Bust
-2014-16","Rebound
-2017-19","COVID
-2020",
-                    "Surge
-2021-22","Post-Surge
-2023-25"),
+    episode     = c("Pre-GFC 2005-07","GFC 2008-09","Recovery 2010-13",
+                    "Shale Bust 2014-16","Rebound 2017-19","COVID 2020",
+                    "Surge 2021-22","Post-Surge 2023-25"),
     yyyyqq_from = c(200501L,200801L,201001L,201401L,201701L,202001L,
                     202101L,202301L),
     yyyyqq_to   = c(200704L,200904L,201304L,201604L,201904L,202004L,
