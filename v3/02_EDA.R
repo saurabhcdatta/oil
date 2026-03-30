@@ -726,7 +726,7 @@ if (any(!is.na(panel$tier_norm))) {
                          intersect(c("dq_rate","netintmrg","costfds",
                                      "cert_share","insured_share_growth",
                                      "member_growth_yoy","pll_rate",
-                                     "pcanetworth"),
+                                     "pcanetworth","networth"),
                                    names(panel)),
                          "tier_norm")
   tier_agg <- merge(tier_agg, mac_spine[, .(yyyyqq, pbrent, yoy_oil)],
@@ -805,6 +805,170 @@ if (any(!is.na(panel$tier_norm))) {
                          plot.subtitle = element_text(size = 8.5, colour = "#555"))
       )
     save_plot(p06, "06_asset_tier_response.png", w = 14, h = 10)
+  }
+}
+
+# ============================================================================
+# CHART 06a -- Oil-Causal Outcomes: Confirmed by v1 Three-Method Validation
+# ============================================================================
+# Shows ONLY the 5 outcomes with confirmed causal relationship to oil price
+# shocks, validated across VARX IRF, Baron-Kenny mediation, and XGBoost SHAP.
+#
+# v1 confirmed findings anchoring this chart:
+#   insured_share_growth : Direct effect dominant (3x SHAP vs all others)
+#                          Q+1 impact = -2.01pp per +60.3pp oil YoY
+#                          LR impact  = -4.91pp (LR multiplier 2.44x)
+#   netintmrg            : Sign REVERSAL at 2015Q1 (pre: compress, post: expand)
+#                          NIM EXPANDS under 2026 scenario (Fed on hold)
+#   dq_rate              : Direct effect b=0.14287 per 1pp oil YoY (82x indirect)
+#                          Pre-2015: oil rise -> more delinquency
+#                          Post-2015: oil rise -> less delinquency
+#   costfds              : Cost of funds via deposit migration + rate channel
+#   pll_rate             : Forward-looking credit quality; diverges from dq_rate
+#                          post-CECL; geopolitical shocks = FUNDING not credit risk
+# ============================================================================
+hdr("CHART 06a: Oil-causal outcomes (v1 confirmed)")
+
+CAUSAL_OUTCOMES <- list(
+  list(var  = "insured_share_growth",
+       lab  = "Deposit Growth (YoY%)",
+       fmt  = number_format(accuracy = 0.1),
+       note = "PRIMARY: 3x SHAP vs all others | v1 Q+1=-2.01pp, LR=-4.91pp",
+       dir  = "neg"),   # neg = oil rise -> outcome falls (stress)
+  list(var  = "netintmrg",
+       lab  = "Net Interest Margin (%)",
+       fmt  = number_format(accuracy = 0.1),
+       note = "SIGN REVERSAL at 2015Q1 | Post-2015: oil rise -> NIM EXPANDS",
+       dir  = "pos"),   # pos = oil rise -> outcome rises (benefit)
+  list(var  = "dq_rate",
+       lab  = "Delinquency Rate (%)",
+       fmt  = number_format(accuracy = 0.1),
+       note = "Direct effect b=0.14287 (82x > indirect=0.00175)",
+       dir  = "neg"),
+  list(var  = "costfds",
+       lab  = "Cost of Funds (%)",
+       fmt  = number_format(accuracy = 0.01),
+       note = "Deposit migration + rate channel | Rises post-oil shock",
+       dir  = "neg"),
+  list(var  = "pll_rate",
+       lab  = "PLL Rate (% of Avg Loans)",
+       fmt  = number_format(accuracy = 0.01),
+       note = "Forward-looking credit quality | Geo shocks = funding not credit risk",
+       dir  = "neg")
+)
+
+causal_vars <- sapply(CAUSAL_OUTCOMES, `[[`, "var")
+causal_vars_present <- intersect(causal_vars, names(agg))
+
+cat(sprintf("\n  Causal outcomes requested: %d | Present in panel: %d\n",
+            length(causal_vars), length(causal_vars_present)))
+cat(sprintf("  Missing: %s\n",
+            if (length(setdiff(causal_vars, causal_vars_present)) > 0)
+              paste(setdiff(causal_vars, causal_vars_present), collapse=", ")
+            else "none"))
+
+# Print v1 finding anchors to log
+cat("\n  v1 confirmed findings (3-method: VARX + Baron-Kenny + XGBoost SHAP):\n")
+cat("  -----------------------------------------------------------------------\n")
+for (co in CAUSAL_OUTCOMES) {
+  if (co$var %in% causal_vars_present)
+    cat(sprintf("  %-26s  %s\n", co$var, co$note))
+}
+
+if (length(causal_vars_present) >= 2) {
+
+  agg_06a <- merge(agg_quarter(panel, causal_vars_present),
+                   mac_spine[, .(yyyyqq, yoy_oil, pbrent)],
+                   by = "yyyyqq", all.x = TRUE)
+  agg_06a[, era := fifelse(yyyyqq < 201501L,
+                            "Pre-Shale (2005-2014)",
+                            "Post-Shale (2015-2025)")]
+
+  # Pre/post slope annotation for each panel
+  make_causal_panel <- function(co) {
+    v   <- co$var
+    lab <- co$lab
+    fmt <- co$fmt
+    if (!v %in% names(agg_06a)) return(NULL)
+    d <- agg_06a[!is.na(get(v)) & !is.na(yoy_oil)]
+    if (nrow(d) < 10) return(NULL)
+
+    # Compute pre/post OLS slopes for annotation
+    beta_pre  <- tryCatch(
+      coef(lm(as.formula(paste(v, "~ yoy_oil")),
+               data = d[yyyyqq < 201501L]))["yoy_oil"],
+      error = function(e) NA_real_)
+    beta_post <- tryCatch(
+      coef(lm(as.formula(paste(v, "~ yoy_oil")),
+               data = d[yyyyqq >= 201501L]))["yoy_oil"],
+      error = function(e) NA_real_)
+
+    # Determine sign reversal
+    has_reversal <- !is.na(beta_pre) && !is.na(beta_post) &&
+                    sign(beta_pre) != sign(beta_post)
+    reversal_txt <- if (has_reversal)
+      sprintf("SIGN REVERSAL: pre=%.4f  post=%.4f", beta_pre, beta_post)
+    else
+      sprintf("pre=%.4f  post=%.4f", beta_pre, beta_post)
+
+    # Highlight direction: green background for beneficial, red for stress
+    bg_col <- if (co$dir == "pos") "#f0fff0" else "#fff0f0"
+
+    # Time series with 2015Q1 break line
+    ggplot(d, aes(x = cal_date, y = get(v))) +
+      ep_rects() +
+      # Pre/post era colouring
+      geom_line(aes(colour = era), linewidth = 0.8) +
+      geom_vline(xintercept = as.Date("2015-01-01"),
+                 linetype = "dashed", colour = "#0072B2", linewidth = 0.7) +
+      # OLS trend lines by era
+      geom_smooth(aes(colour = era, group = era),
+                  method = "lm", se = FALSE,
+                  linetype = "dotted", linewidth = 0.6) +
+      scale_colour_manual(
+        values = c("Pre-Shale (2005-2014)"  = "#1a3a5c",
+                   "Post-Shale (2015-2025)" = "#b5470a"),
+        name = NULL) +
+      scale_x_date(date_breaks = "3 years", date_labels = "%Y") +
+      scale_y_continuous(labels = fmt) +
+      annotate("text", x = as.Date("2015-04-01"), y = Inf,
+               label = "2015Q1", vjust = 1.3, hjust = 0,
+               size = 2.5, colour = "#0072B2") +
+      labs(title    = lab,
+           subtitle = reversal_txt,
+           x = NULL, y = lab) +
+      theme_pub() +
+      theme(legend.position  = "bottom",
+            legend.text      = element_text(size = 7.5),
+            plot.subtitle    = element_text(
+              size   = 7.5,
+              colour = if (has_reversal) COL_NEG else "#555555",
+              face   = if (has_reversal) "bold" else "plain"
+            ))
+  }
+
+  panels_06a <- Filter(Negate(is.null),
+                        lapply(CAUSAL_OUTCOMES, make_causal_panel))
+
+  if (length(panels_06a) >= 2) {
+    p06a <- wrap_plots(panels_06a, ncol = 2) +
+      plot_annotation(
+        title    = "FIGURE 06a -- Oil-Causal CU Outcomes: v1 Three-Method Confirmed",
+        subtitle = paste(
+          "Only outcomes with confirmed causal link to oil price shocks",
+          "(VARX IRF + Baron-Kenny mediation + XGBoost TreeSHAP).",
+          "\nLines = quarterly panel mean | Coloured by era | Dotted = OLS trend | Dashed = 2015Q1 structural break.",
+          "\nBold subtitle = sign reversal confirmed at 2015Q1."
+        ),
+        caption  = paste(
+          "v1 anchors: direct effect=0.14287 (82x > indirect=0.00175) | AR(1)=0.59 | LR-mult=2.44x",
+          "| Deposit growth #1 SHAP (3x next-highest) | NIM expands post-2015 (Fed on hold 2026)"
+        ),
+        theme    = theme(plot.title    = element_text(face = "bold", size = 12),
+                         plot.subtitle = element_text(size = 8.5, colour = "#444",
+                                                      lineheight = 1.3))
+      )
+    save_plot(p06a, "06a_oil_causal_outcomes.png", w = 13, h = 10)
   }
 }
 
@@ -1370,52 +1534,70 @@ if ("pll_rate" %in% names(panel)) {
 # ============================================================================
 hdr("CHART 17: Net worth ratio under oil stress")
 
-if ("pcanetworth" %in% names(panel)) {
-  nw_agg <- merge(agg_quarter(panel, "pcanetworth"),
+nw_col <- intersect(c("networth","pcanetworth"), names(panel))[1]
+
+if (!is.na(nw_col)) {
+  nw_agg <- merge(agg_quarter(panel, c(nw_col, "pcanetworth")),
                   mac_spine[, .(yyyyqq, yoy_oil, pbrent)],
                   by = "yyyyqq", all.x = TRUE)
 
-  p17a <- ggplot(nw_agg[!is.na(pcanetworth)], aes(x = cal_date, y = pcanetworth)) +
+  # Diagnostic: detect networth scale
+  nw_med <- median(nw_agg[[nw_col]], na.rm = TRUE)
+  nw_is_pct <- nw_med > 1   # TRUE = percentage form (e.g. 10.5 means 10.5%)
+  cat(sprintf("\n  networth median = %.4f | scale = %s\n", nw_med,
+              if (nw_is_pct) "PERCENTAGE (0-100)" else "RATIO (0-1)"))
+
+  # PCA threshold values in same units as the data
+  thr_well  <- if (nw_is_pct) 10   else 0.10
+  thr_adeq  <- if (nw_is_pct) 7    else 0.07
+  thr_under <- if (nw_is_pct) 6    else 0.06
+  y_fmt_17  <- if (nw_is_pct) number_format(accuracy = 0.1, suffix = "%%")
+               else percent_format(scale = 100)
+  y_lab_17  <- if (nw_is_pct) "Net Worth Ratio (%)" else "Net Worth Ratio"
+
+  p17a <- ggplot(nw_agg[!is.na(get(nw_col))],
+                 aes(x = cal_date, y = get(nw_col))) +
     ep_rects() +
     geom_line(colour = COL_DIRECT, linewidth = 0.9) +
     # NCUA PCA thresholds
-    geom_hline(yintercept = 0.10, linetype = "dashed",
-               colour = COL_POS, linewidth = 0.5) +
-    geom_hline(yintercept = 0.07, linetype = "dashed",
+    geom_hline(yintercept = thr_well,  linetype = "dashed",
+               colour = COL_POS,  linewidth = 0.5) +
+    geom_hline(yintercept = thr_adeq,  linetype = "dashed",
                colour = COL_WARN, linewidth = 0.5) +
-    geom_hline(yintercept = 0.06, linetype = "dashed",
-               colour = COL_NEG, linewidth = 0.5) +
+    geom_hline(yintercept = thr_under, linetype = "dashed",
+               colour = COL_NEG,  linewidth = 0.5) +
     annotate("text", x = max(nw_agg$cal_date, na.rm = TRUE),
-             y = c(0.101, 0.071, 0.061),
+             y = c(thr_well  * 1.005,
+                   thr_adeq  * 1.005,
+                   thr_under * 1.005),
              label = c("Well-Capitalised (10%)", "Adequately (7%)", "Undercap'd (6%)"),
              hjust = 1, size = 2.5,
              colour = c(COL_POS, COL_WARN, COL_NEG)) +
     scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
-    scale_y_continuous(labels = percent_format(scale = 100)) +
-    labs(title    = "Net Worth Ratio (pcanetworth) vs NCUA PCA Thresholds",
-         subtitle = "v1 finding: pcanetworth stable under oil shocks (AR1=0.98, highest persistence)",
-         x = NULL, y = "Net Worth Ratio") +
+    scale_y_continuous(labels = y_fmt_17) +
+    labs(title    = sprintf("Net Worth Ratio (%s) vs NCUA PCA Thresholds", nw_col),
+         subtitle = "v1 finding: net worth ratio most persistent outcome (AR1=0.98, highest of all outcomes)",
+         x = NULL, y = y_lab_17) +
     theme_pub()
 
   # Direct vs indirect NW ratio
   p17b <- NULL
   if (!is.na(group_col_04) && "plot_group" %in% names(panel04)) {
-    nw_grp <- panel04[!is.na(pcanetworth) & !is.na(plot_group),
-                       .(pcanetworth = mean(pcanetworth, na.rm = TRUE),
-                         cal_date    = first(cal_date)),
+    nw_grp <- panel04[!is.na(get(nw_col)) & !is.na(plot_group),
+                       .(nw_val  = mean(get(nw_col), na.rm = TRUE),
+                         cal_date = first(cal_date)),
                        by = .(yyyyqq, plot_group)][order(yyyyqq)]
-    p17b <- ggplot(nw_grp, aes(x = cal_date, y = pcanetworth,
-                                colour = plot_group)) +
+    p17b <- ggplot(nw_grp, aes(x = cal_date, y = nw_val, colour = plot_group)) +
       ep_rects() +
       geom_line(linewidth = 0.85) +
-      geom_hline(yintercept = 0.07, linetype = "dashed",
+      geom_hline(yintercept = thr_adeq, linetype = "dashed",
                  colour = COL_WARN, linewidth = 0.4) +
       scale_colour_manual(values = grp_colors, name = NULL) +
       scale_x_date(date_breaks = "3 years", date_labels = "%Y") +
-      scale_y_continuous(labels = percent_format(scale = 100)) +
+      scale_y_continuous(labels = y_fmt_17) +
       labs(title    = "Net Worth Ratio: Direct vs Indirect CUs",
-           subtitle = "Post-2015 oil-state CUs are net beneficiaries -- NW ratio should be higher",
-           x = NULL, y = "Net Worth Ratio") +
+           subtitle = "Post-2015 oil-state CUs are net beneficiaries -- NW ratio higher",
+           x = NULL, y = y_lab_17) +
       theme_pub() + theme(legend.position = "bottom")
   }
 
@@ -1424,7 +1606,7 @@ if ("pcanetworth" %in% names(panel)) {
     title    = "FIGURE 17 -- Net Worth Ratio Under Oil Stress Cycles",
     subtitle = paste("NCUA PCA thresholds: well-capitalised >=10% | adequate >=7% | undercap'd <6%",
                      "| v1: NW ratio most persistent outcome (AR1=0.98)"),
-    caption  = "Source: NCUA Form 5300 | pcanetworth = acct_998 / acct_010",
+    caption  = sprintf("Source: NCUA Form 5300 | Column: %s | Scale auto-detected", nw_col),
     theme    = theme(plot.title    = element_text(face = "bold", size = 12),
                      plot.subtitle = element_text(size = 9, colour = "#555"))
   )
