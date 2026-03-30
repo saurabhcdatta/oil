@@ -1,31 +1,37 @@
 # =============================================================================
 # SCRIPT 01 — Data Ingestion, Cleaning, and Variable Construction
-# Oil Price Shock × Credit Union Financial Performance
+# Oil Price Shock × Credit Union Financial Performance — v2
 # Author: Saurabh C. Datta, Ph.D. | NCUA Office of Chief Economist
-# Version: v2.1-DIAGNOSTIC | Built: 2026-03-30
+# Version: v2.2-DIAGNOSTIC | Built: 2026-03-30
 # Working dir: S:/Projects/Oil_Price_Shock_2026/
 # =============================================================================
-# PURPOSE:
-#   Load NCUA Form 5300 call report data, filter to FICUs, construct all
-#   8 outcome variables from raw accounts, handle outliers transparently,
-#   assign asset tiers, and save clean panel for downstream scripts.
+# Inputs
+#   Data/call_report.rds                  NCUA call report panel (CU x quarter)
+#   Data/FRB_Baseline_2026.xlsx           FRB CCAR 2026 Baseline
+#   Data/FRB_Severely_Adverse_2026.xlsx   FRB CCAR 2026 Severely Adverse
+#   Data/oil_exposure.rds                 Built by 01b_oil_exposure_v2.R
 #
-# OUTPUT: Data/01_panel_clean.rds
-#         Results/01_outlier_log.csv      — every observation winsorized
-#         Results/01_variable_summary.csv — pre/post-winsorization stats
-#         Results/01_checkpoint_log.csv   — all checkpoint pass/fail records
+# Outputs
+#   Data/call_clean.rds      Cleaned call report with exposure + derived vars
+#   Data/macro_base.rds      Baseline macro (wide, macro_base_ prefix)
+#   Data/macro_severe.rds    Severely adverse macro (wide, macro_severe_ prefix)
+#   Data/panel_base.rds      CU x quarter panel merged with baseline macro
+#   Data/panel_severe.rds    CU x quarter panel merged with severely adverse
+#   Results/01_outlier_log.csv         Winsorization summary per variable
+#   Results/01_variable_summary.csv    Post-cleaning distributional stats
+#   Results/01_checkpoint_log.csv      All checkpoint pass/warn/fail records
 #
-# DIAGNOSTIC PHILOSOPHY:
-#   Every transformation is logged to screen. Checkpoints halt on critical
-#   failures and warn on soft failures. Outlier treatment is fully auditable.
-#   The log is designed to be self-contained — paste it into the project record.
+# Identifiers : join_number, year, quarter
+# yyyyqq      : integer format year*100+quarter (e.g. 200501, 201504)
+# Start date  : 2005Q1
+# Run order   : 01b must run first to produce Data/oil_exposure.rds
 #
 # BACKWARD REASONING ANCHORS (from v1 confirmed findings):
-#   - AR(1) ≈ 0.59 → lagged outcomes constructed here
-#   - Deposit growth = most exposed (3x SHAP) → insured_share_growth critical
-#   - pll_rate needs avg loan denominator → lns_tot lagged here
-#   - NIM = acct_116 / acct_010 → zero-denominator handled explicitly
-#   - 2015Q1 structural break → post2015 flag aligned to date here
+#   - AR(1) approx 0.59 -> lagged outcomes constructed here
+#   - Deposit growth = most exposed (3x SHAP) -> insured_share_growth critical
+#   - pll_rate = pll / avg(lns_tot) -> confirmed construction from v1 Script 04d
+#   - 2015Q1 structural break -> post2015 flag aligned to date here
+#   - dq_rate, netintmrg, pcanetworth, costfds may be pre-computed in call_report
 # =============================================================================
 
 rm(list = ls())
@@ -35,102 +41,98 @@ gc()
 # SECTION 0: LOGGING INFRASTRUCTURE
 # ============================================================================
 
-# Checkpoint log (accumulates across entire script)
 CHKPT_LOG <- data.frame(
-  checkpoint = character(),
-  status     = character(),
-  detail     = character(),
+  checkpoint = character(), status = character(), detail = character(),
   stringsAsFactors = FALSE
 )
 
-# Separator lines
 SEP  <- paste(rep("=", 72), collapse = "")
 SEP2 <- paste(rep("-", 72), collapse = "")
+ts   <- function() format(Sys.time(), "[%H:%M:%S]")
 
-# Timestamp
-ts <- function() format(Sys.time(), "[%H:%M:%S]")
-
-# Log a checkpoint — prints to screen AND accumulates in CHKPT_LOG
-# status: "PASS", "WARN", "FAIL", "INFO"
 log_checkpoint <- function(label, status, detail = "") {
   icon <- switch(status,
-    PASS = "✓ PASS",
-    WARN = "! WARN",
-    FAIL = "✗ FAIL",
-    INFO = "  INFO"
+    PASS = "PASS", WARN = "WARN", FAIL = "FAIL", INFO = "INFO"
   )
-  cat(sprintf("  %s %s %s\n", ts(), icon, label))
-  if (nchar(detail) > 0) cat(sprintf("         └─ %s\n", detail))
+  cat(sprintf("  %s [%s] %s\n", ts(), icon, label))
+  if (nchar(detail) > 0) cat(sprintf("         => %s\n", detail))
   CHKPT_LOG <<- rbind(CHKPT_LOG, data.frame(
-    checkpoint = label,
-    status     = status,
-    detail     = detail,
+    checkpoint = label, status = status, detail = detail,
     stringsAsFactors = FALSE
   ))
   if (status == "FAIL") {
-    cat("\n", SEP, "\n")
-    cat("  FATAL: Script halted at checkpoint:", label, "\n")
-    cat(SEP, "\n")
+    cat("\n", SEP, "\n  FATAL: Script halted at: ", label, "\n", SEP, "\n", sep = "")
     stop(paste("FATAL checkpoint failure:", label, "|", detail))
   }
 }
 
-# Section banner
 section <- function(n, title) {
   cat("\n", SEP, "\n", sep = "")
   cat(sprintf("  SECTION %s: %s\n", n, title))
   cat(SEP2, "\n", sep = "")
 }
 
-# Summary stats row — prints a clean table row
-stat_row <- function(varname, n, nmiss, mean, sd, p1, p10, p50, p90, p99,
-                     mn, mx, label = "") {
-  cat(sprintf(
-    "  %-28s  N=%7d  miss=%5.1f%%  mean=%9.4f  sd=%8.4f\n",
-    varname, n, nmiss * 100, mean, sd
-  ))
-  cat(sprintf(
-    "  %-28s  p1=%8.4f  p10=%7.4f  p50=%7.4f  p90=%7.4f  p99=%8.4f\n",
-    "", p1, p10, p50, p90, p99
-  ))
-  cat(sprintf(
-    "  %-28s  min=%8.4f  max=%7.4f%s\n",
-    "", mn, mx, if (nchar(label) > 0) paste0("  [", label, "]") else ""
-  ))
-  cat(sprintf("  %s\n", paste(rep("-", 70), collapse = "")))
-}
+msg <- function(...) cat(sprintf(...), "\n")
 
-# Compute and print summary stats for a vector; return named list
-describe_var <- function(x, varname, label = "") {
-  n      <- sum(!is.na(x))
-  nmiss  <- mean(is.na(x))
+describe_var <- function(x, varname, tag = "") {
+  n     <- sum(!is.na(x))
+  nmiss <- mean(is.na(x))
   if (n == 0) {
     cat(sprintf("  %-28s  ALL MISSING\n", varname))
     return(invisible(NULL))
   }
-  qs <- quantile(x, probs = c(0.01, 0.10, 0.50, 0.90, 0.99), na.rm = TRUE)
-  stat_row(
-    varname = varname, n = n, nmiss = nmiss,
-    mean = mean(x, na.rm = TRUE), sd = sd(x, na.rm = TRUE),
-    p1 = qs[1], p10 = qs[2], p50 = qs[3], p90 = qs[4], p99 = qs[5],
-    mn = min(x, na.rm = TRUE), mx = max(x, na.rm = TRUE),
-    label = label
-  )
-  invisible(list(n = n, nmiss = nmiss, mean = mean(x, na.rm = TRUE),
-                 sd = sd(x, na.rm = TRUE), p1 = qs[[1]], p99 = qs[[5]],
+  qs <- quantile(x, c(0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99), na.rm = TRUE)
+  cat(sprintf("  %-28s  [%s]\n", varname, tag))
+  cat(sprintf("    N=%-8s  miss=%5.1f%%  mean=%10.5f  sd=%10.5f\n",
+              format(n, big.mark = ","), nmiss * 100,
+              mean(x, na.rm = TRUE), sd(x, na.rm = TRUE)))
+  cat(sprintf("    p01=%9.5f  p10=%9.5f  p25=%9.5f  p50=%9.5f\n",
+              qs[1], qs[2], qs[3], qs[4]))
+  cat(sprintf("    p75=%9.5f  p90=%9.5f  p99=%9.5f\n", qs[5], qs[6], qs[7]))
+  cat(sprintf("    min=%9.5f  max=%9.5f\n",
+              min(x, na.rm = TRUE), max(x, na.rm = TRUE)))
+  cat(sprintf("    %s\n", paste(rep("-", 66), collapse = "")))
+  invisible(list(n = n, nmiss = nmiss,
+                 mean = mean(x, na.rm = TRUE), sd = sd(x, na.rm = TRUE),
+                 p1 = qs[[1]], p99 = qs[[7]],
                  min = min(x, na.rm = TRUE), max = max(x, na.rm = TRUE)))
+}
+
+winsorize_audit <- function(x, p_lo = 0.01, p_hi = 0.99) {
+  qs   <- quantile(x, c(p_lo, p_hi), na.rm = TRUE)
+  lo   <- qs[1]; hi <- qs[2]
+  n_lo <- sum(!is.na(x) & x < lo, na.rm = TRUE)
+  n_hi <- sum(!is.na(x) & x > hi, na.rm = TRUE)
+  list(
+    x   = pmax(pmin(x, hi), lo),
+    lo  = lo, hi = hi,
+    n_lo = n_lo, n_hi = n_hi,
+    pct  = round((n_lo + n_hi) / max(sum(!is.na(x)), 1) * 100, 3)
+  )
+}
+
+# YoY growth by CU (lag-4 within join_number; data must be sorted CU + time)
+cu_yoy <- function(dt, col) {
+  dt[, .(val = {
+    x    <- get(col)
+    x_l4 <- shift(x, 4L)
+    fifelse(
+      !is.na(x) & !is.na(x_l4) & is.finite(x_l4) & x_l4 > 0,
+      (x - x_l4) / x_l4 * 100,
+      NA_real_
+    )
+  }), by = join_number]$val
 }
 
 # ============================================================================
 # SCRIPT HEADER
 # ============================================================================
 cat(SEP, "\n")
-cat("  SCRIPT 01 — Data Ingestion, Cleaning, and Variable Construction\n")
-cat("  Oil Price Shock x Credit Union Financial Performance — v2\n")
+cat("  SCRIPT 01 -- Data Ingestion, Cleaning, and Variable Construction\n")
+cat("  Oil Price Shock x Credit Union Financial Performance -- v2\n")
 cat("  Author  : Saurabh C. Datta, Ph.D. | NCUA Office of Chief Economist\n")
-cat("  Version : v2.1-DIAGNOSTIC\n")
+cat("  Version : v2.2-DIAGNOSTIC\n")
 cat(sprintf("  Started : %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
-cat("  Working : S:/Projects/Oil_Price_Shock_2026/\n")
 cat(SEP, "\n\n")
 
 # ============================================================================
@@ -140,1147 +142,1337 @@ section("1", "Libraries and Configuration")
 
 suppressPackageStartupMessages({
   library(data.table)
-  library(haven)
-  library(stringr)
+  library(readxl)
   library(lubridate)
+  library(stringr)
 })
 
-# Confirm packages loaded
-for (pkg in c("data.table", "haven", "stringr", "lubridate")) {
+for (pkg in c("data.table", "readxl", "lubridate", "stringr")) {
   log_checkpoint(paste("Package:", pkg), "PASS",
                  paste("v", packageVersion(pkg)))
 }
 
 # ---------------------------------------------------------------------------
-# Configuration — edit these paths as needed
+# Configuration
 # ---------------------------------------------------------------------------
+START_YEAR   <- 2005L
+WIN_LOW      <- 0.01
+WIN_HIGH     <- 0.99
+MIN_CU_COUNT <- 1000L
+MIN_QTR      <- 40L
+
+# Asset tier breaks -- from old script (units: $thousands in call report)
+# T1 <$10M, T2 $10-100M, T3 $100M-$1B, T4 >$1B
+ASSET_BREAKS <- c(0, 10e3, 100e3, 1e6, Inf)
+ASSET_LABELS <- c("T1_under10M", "T2_10to100M", "T3_100Mto1B", "T4_over1B")
+
+# Preliminary oil states (superseded by oil_exposure.rds from 01b,
+# but used as fallback if 01b has not yet been run)
+OIL_STATES_PRELIM <- c("TX", "ND", "LA", "AK", "WY", "OK",
+                        "NM", "CO", "WV", "PA", "MT")
+
+# Quarter-to-month mapping
+Q_MONTH <- c("1" = 1L, "2" = 4L, "3" = 7L, "4" = 10L)
+
 DATA_DIR    <- "Data/"
 RESULTS_DIR <- "Results/"
 
-# Primary raw file — set to actual path for production
-# Supported: .dta (Stata), .rds, .csv
-RAW_FILE    <- "Data/form5300_raw.dta"
-
-# Winsorization thresholds — document in project record if changed
-WIN_LOW  <- 0.01   # 1st percentile lower bound
-WIN_HIGH <- 0.99   # 99th percentile upper bound
-
-# Minimum cell count thresholds for validity checks
-MIN_CU_COUNT   <- 1000   # expect at least 1,000 FICUs
-MIN_QTR_COUNT  <- 40     # expect at least 40 quarters (10 years)
-
-cat(sprintf("\n  RAW_FILE    : %s\n", RAW_FILE))
-cat(sprintf("  DATA_DIR    : %s\n", DATA_DIR))
-cat(sprintf("  RESULTS_DIR : %s\n", RESULTS_DIR))
-cat(sprintf("  Winsorize   : [%.0f%%, %.0f%%]\n", WIN_LOW * 100, WIN_HIGH * 100))
-cat(sprintf("  Min CU threshold  : %d\n", MIN_CU_COUNT))
-cat(sprintf("  Min Qtr threshold : %d\n\n", MIN_QTR_COUNT))
-
-# Create output directories
 for (d in c(DATA_DIR, RESULTS_DIR)) {
-  if (!dir.exists(d)) {
-    dir.create(d, recursive = TRUE)
-    cat(sprintf("  Created directory: %s\n", d))
-  }
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
 }
 
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
+cat(sprintf("\n  START_YEAR  : %d\n", START_YEAR))
+cat(sprintf("  Winsorize   : [%.0f%%, %.0f%%]\n", WIN_LOW * 100, WIN_HIGH * 100))
+cat(sprintf("  Asset tiers : %s\n", paste(ASSET_LABELS, collapse = ", ")))
+cat(sprintf("  Min CUs     : %d\n", MIN_CU_COUNT))
+cat(sprintf("  Min qtrs    : %d\n\n", MIN_QTR))
 
-# yyyyqq parse (BULLETPROOF — validates format before split)
-parse_q <- function(x) {
-  x      <- as.character(x)
-  result <- rep(as.Date(NA), length(x))
-  valid  <- grepl("^[0-9]{4}\\.[1-4]$", x)
-  if (any(valid)) {
-    p             <- str_split_fixed(x[valid], "\\.", 2)
-    yr            <- as.integer(p[, 1])
-    qtr           <- as.integer(p[, 2])
-    mo            <- (qtr - 1L) * 3L + 1L
-    result[valid] <- as.Date(sprintf("%04d-%02d-01", yr, mo))
-  }
-  result
-}
-
-# Winsorize and return list: winsorized vector + audit info
-winsorize_audit <- function(x, varname,
-                            p_low  = WIN_LOW,
-                            p_high = WIN_HIGH) {
-  qs   <- quantile(x, probs = c(p_low, p_high), na.rm = TRUE)
-  lo   <- qs[1]; hi <- qs[2]
-  n_lo <- sum(!is.na(x) & x < lo)
-  n_hi <- sum(!is.na(x) & x > hi)
-  x_w  <- pmax(pmin(x, hi), lo)
-  list(
-    x       = x_w,
-    lo      = lo,
-    hi      = hi,
-    n_lo    = n_lo,
-    n_hi    = n_hi,
-    n_total = n_lo + n_hi,
-    pct_affected = round((n_lo + n_hi) / sum(!is.na(x)) * 100, 3)
-  )
-}
-
-log_checkpoint("Helper functions defined", "PASS", "parse_q, winsorize_audit")
+log_checkpoint("CK-01: Config loaded", "PASS",
+               sprintf("START_YEAR=%d, WIN=[%.0f,%.0f]%%",
+                       START_YEAR, WIN_LOW * 100, WIN_HIGH * 100))
 
 # ============================================================================
-# SECTION 2: LOAD RAW DATA
+# SECTION 2: CALL REPORT -- LOAD AND INITIAL CHECKS
 # ============================================================================
-section("2", "Load Raw Form 5300 Data")
+section("2", "Call Report -- Load and Initial Checks")
 
-cat(sprintf("  Attempting to load: %s\n\n", RAW_FILE))
+RAW_FILE <- "Data/call_report.rds"
+cat(sprintf("  File: %s\n\n", RAW_FILE))
 
 if (!file.exists(RAW_FILE)) {
-  log_checkpoint("Raw file exists", "FAIL",
-                 paste("File not found:", RAW_FILE))
+  log_checkpoint("CK-02: call_report.rds exists", "FAIL",
+                 paste("Not found:", RAW_FILE))
 }
-log_checkpoint("Raw file exists", "PASS", RAW_FILE)
-
-ext <- tolower(tools::file_ext(RAW_FILE))
-cat(sprintf("  Detected file type: .%s\n", ext))
+log_checkpoint("CK-02: call_report.rds exists", "PASS", RAW_FILE)
 
 t_load <- system.time({
-  if (ext == "dta") {
-    raw <- as.data.table(haven::read_dta(RAW_FILE))
-    # Strip Stata labels IMMEDIATELY — CRITICAL (pitfall #4)
-    # haven_labelled objects break as.double() without this step
-    raw <- haven::zap_labels(raw)
-    raw <- haven::zap_formats(raw)
-    cat("  Applied: haven::zap_labels() + zap_formats() [Stata label strip]\n")
-  } else if (ext == "rds") {
-    raw <- readRDS(RAW_FILE)
-    if (!is.data.table(raw)) setDT(raw)
-  } else if (ext == "csv") {
-    raw <- fread(RAW_FILE)
-  } else {
-    log_checkpoint("Supported file type", "FAIL",
-                   paste("Unsupported extension:", ext))
-  }
+  cr <- setDT(readRDS(RAW_FILE))
+  setnames(cr, tolower(names(cr)))   # harmonise to lowercase
 })
 
-cat(sprintf("\n  Load time   : %.1f seconds\n", t_load["elapsed"]))
-cat(sprintf("  Rows loaded : %s\n", format(nrow(raw), big.mark = ",")))
-cat(sprintf("  Columns     : %d\n", ncol(raw)))
-cat(sprintf("  Object size : %.1f MB\n", object.size(raw) / 1e6))
+cat(sprintf("  Load time   : %.1f sec\n", t_load["elapsed"]))
+cat(sprintf("  Raw rows    : %s\n", format(nrow(cr), big.mark = ",")))
+cat(sprintf("  Raw columns : %d\n", ncol(cr)))
+cat(sprintf("  Object size : %.1f MB\n\n", object.size(cr) / 1e6))
 
-# CK-01: Raw file has meaningful data
-if (nrow(raw) < 10000) {
-  log_checkpoint("CK-01: Raw row count", "WARN",
-                 sprintf("Only %d rows loaded — expected >10,000", nrow(raw)))
+cat("  Column inventory (first 50):\n")
+cat(sprintf("    %s\n", paste(head(names(cr), 50), collapse = ", ")))
+if (ncol(cr) > 50)
+  cat(sprintf("    ... and %d more columns\n", ncol(cr) - 50))
+
+if (nrow(cr) < 10000L) {
+  log_checkpoint("CK-03: Raw row count", "WARN",
+                 sprintf("Only %s rows -- expected >10,000",
+                         format(nrow(cr), big.mark = ",")))
 } else {
-  log_checkpoint("CK-01: Raw row count", "PASS",
-                 sprintf("%s rows", format(nrow(raw), big.mark = ",")))
+  log_checkpoint("CK-03: Raw row count", "PASS",
+                 sprintf("%s rows", format(nrow(cr), big.mark = ",")))
 }
 
 # ============================================================================
-# SECTION 3: FILTER TO FEDERALLY INSURED CREDIT UNIONS (FICUs)
+# SECTION 3: IDENTIFIER STANDARDIZATION AND YEAR FILTER
 # ============================================================================
-section("3", "Filter to FICUs and Type Coercion")
+section("3", "Identifier Standardization and Year Filter")
 
-# --- 3a. cu_type filter ---
-cat("  Filter: cu_type == 1 (Federally Insured Credit Unions)\n\n")
+REQ_IDS      <- c("join_number", "year", "quarter")
+missing_ids  <- setdiff(REQ_IDS, names(cr))
+if (length(missing_ids) > 0) {
+  log_checkpoint("CK-04: Required id columns", "FAIL",
+                 paste("Missing:", paste(missing_ids, collapse = ", ")))
+}
+log_checkpoint("CK-04: Required id columns", "PASS",
+               paste(REQ_IDS, collapse = ", "))
 
-if ("cu_type" %in% names(raw)) {
-  type_dist <- table(raw$cu_type, useNA = "always")
-  cat("  cu_type distribution in raw file:\n")
-  print(type_dist)
-  cat("\n")
+cr[, `:=`(year = as.integer(year), quarter = as.integer(quarter))]
 
-  n_before <- nrow(raw)
-  panel    <- raw[cu_type == 1]
-  n_after  <- nrow(panel)
-  n_dropped <- n_before - n_after
+cat(sprintf("  year range (raw)    : %d -- %d\n",
+            min(cr$year, na.rm = TRUE), max(cr$year, na.rm = TRUE)))
+cat(sprintf("  quarter values      : %s\n",
+            paste(sort(unique(cr$quarter)), collapse = ", ")))
 
-  cat(sprintf("  Rows before filter : %s\n", format(n_before, big.mark = ",")))
-  cat(sprintf("  Rows after filter  : %s\n", format(n_after,  big.mark = ",")))
-  cat(sprintf("  Rows dropped       : %s (%.1f%%)\n",
-              format(n_dropped, big.mark = ","),
-              n_dropped / n_before * 100))
+bad_qtr <- cr[!quarter %in% 1:4, .N]
+if (bad_qtr > 0) {
+  log_checkpoint("CK-05: Quarter values valid", "WARN",
+                 sprintf("%d rows have quarter not in 1:4", bad_qtr))
+} else {
+  log_checkpoint("CK-05: Quarter values valid", "PASS", "All in {1,2,3,4}")
+}
 
-  if (n_after < MIN_CU_COUNT) {
-    log_checkpoint("CK-02: FICU row count after filter", "FAIL",
-                   sprintf("Only %d rows after cu_type==1 filter", n_after))
+# Start-year filter
+n_before  <- nrow(cr)
+cr        <- cr[year >= START_YEAR]
+n_dropped <- n_before - nrow(cr)
+
+cat(sprintf("\n  Rows before %dQ1 filter : %s\n",
+            START_YEAR, format(n_before, big.mark = ",")))
+cat(sprintf("  Rows dropped           : %s (%.1f%%)\n",
+            format(n_dropped, big.mark = ","), n_dropped / n_before * 100))
+cat(sprintf("  Rows retained          : %s\n",
+            format(nrow(cr), big.mark = ",")))
+
+log_checkpoint("CK-06: Start-year filter", "PASS",
+               sprintf("%s rows retained (>= %dQ1)",
+                       format(nrow(cr), big.mark = ","), START_YEAR))
+
+# Construct yyyyqq (integer) and cal_date
+cr[, `:=`(
+  yyyyqq   = year * 100L + quarter,
+  cal_date = as.Date(paste(year, Q_MONTH[as.character(quarter)], "01", sep = "-"))
+)]
+
+cat(sprintf("\n  yyyyqq format   : integer (e.g. %d)\n", cr$yyyyqq[1]))
+cat(sprintf("  cal_date range  : %s  to  %s\n",
+            format(min(cr$cal_date)), format(max(cr$cal_date))))
+cat(sprintf("  Unique quarters : %d\n", uniqueN(cr$yyyyqq)))
+cat(sprintf("  Unique CUs      : %s\n\n",
+            format(uniqueN(cr$join_number), big.mark = ",")))
+
+n_cu  <- uniqueN(cr$join_number)
+n_qtr <- uniqueN(cr$yyyyqq)
+
+if (n_cu < MIN_CU_COUNT) {
+  log_checkpoint("CK-07: CU count", "WARN",
+                 sprintf("Only %d CUs -- expected >= %d", n_cu, MIN_CU_COUNT))
+} else {
+  log_checkpoint("CK-07: CU count", "PASS",
+                 sprintf("%s unique CUs", format(n_cu, big.mark = ",")))
+}
+if (n_qtr < MIN_QTR) {
+  log_checkpoint("CK-08: Quarter count", "WARN",
+                 sprintf("Only %d quarters -- expected >= %d", n_qtr, MIN_QTR))
+} else {
+  log_checkpoint("CK-08: Quarter count", "PASS",
+                 sprintf("%d quarters (%s to %s)",
+                         n_qtr, format(min(cr$cal_date)), format(max(cr$cal_date))))
+}
+
+# Duplicate check
+dups <- cr[, .N, by = .(join_number, year, quarter)][N > 1, .N]
+if (dups > 0) {
+  cat(sprintf("  WARNING: %d duplicate CU-quarter keys -- keeping first\n", dups))
+  cr <- unique(cr, by = c("join_number", "year", "quarter"))
+  log_checkpoint("CK-09: Duplicates", "WARN",
+                 sprintf("%d duplicate keys removed", dups))
+} else {
+  log_checkpoint("CK-09: Duplicates", "PASS",
+                 "No duplicates on join_number x year x quarter")
+}
+
+# State column detection
+state_col <- intersect(c("reporting_state", "state_code", "state"), names(cr))[1]
+if (is.na(state_col)) {
+  log_checkpoint("CK-10: State column", "WARN",
+                 "No state column found -- oil-state classification will use fallback")
+} else {
+  n_states <- uniqueN(cr[[state_col]])
+  cat(sprintf("\n  State column: %s  |  %d unique values\n",
+              state_col, n_states))
+  if (n_states < 48L) {
+    log_checkpoint("CK-10: State column", "WARN",
+                   sprintf("Only %d states -- expected ~50+DC+territories", n_states))
   } else {
-    log_checkpoint("CK-02: FICU row count after filter", "PASS",
-                   sprintf("%s rows retained", format(n_after, big.mark = ",")))
-  }
-} else {
-  log_checkpoint("CK-02: cu_type column present", "WARN",
-                 "cu_type not found — using all rows as FICUs")
-  panel <- copy(raw)
-}
-
-# --- 3b. Force numeric columns to double ---
-cat("\n  Type coercion: forcing numeric/labelled columns to double...\n")
-n_coerced <- 0L
-n_failed  <- 0L
-
-for (cn in names(panel)) {
-  x <- panel[[cn]]
-  if (is.numeric(x) || inherits(x, "haven_labelled")) {
-    ok <- tryCatch({
-      set(panel, j = cn, value = as.double(x))
-      TRUE
-    }, error = function(e) FALSE)
-    if (ok) n_coerced <- n_coerced + 1L else n_failed <- n_failed + 1L
+    log_checkpoint("CK-10: State column", "PASS",
+                   sprintf("%s, %d unique values", state_col, n_states))
   }
 }
 
-cat(sprintf("  Columns coerced to double : %d\n", n_coerced))
-cat(sprintf("  Coercion failures         : %d\n", n_failed))
-log_checkpoint("CK-03: Type coercion", if (n_failed == 0) "PASS" else "WARN",
-               sprintf("%d coerced, %d failures", n_coerced, n_failed))
-
-# --- 3c. Drop non-atomic columns ---
-bad_cols <- names(panel)[sapply(names(panel), function(cn) !is.atomic(panel[[cn]]))]
-if (length(bad_cols) > 0) {
-  cat(sprintf("  Dropping %d non-atomic columns: %s\n",
-              length(bad_cols), paste(bad_cols, collapse = ", ")))
-  panel[, (bad_cols) := NULL]
-  log_checkpoint("CK-04: Non-atomic columns", "WARN",
-                 sprintf("Dropped: %s", paste(bad_cols, collapse = ", ")))
-} else {
-  log_checkpoint("CK-04: Non-atomic columns", "PASS", "None found")
-}
+# Sort before any lag operations
+setorderv(cr, c("join_number", "year", "quarter"))
 
 # ============================================================================
-# SECTION 4: IDENTIFIER STANDARDIZATION
+# SECTION 4: DIRECT-RATIO VARIABLE AUDIT
 # ============================================================================
-section("4", "Identifier Standardization")
+section("4", "Direct-Ratio Variable Audit")
 
-# --- 4a. join_number ---
-if (!"join_number" %in% names(panel)) {
-  log_checkpoint("CK-05: join_number column", "FAIL",
-                 "Column not found — cannot identify CUs")
-}
-n_cu <- uniqueN(panel$join_number)
-cat(sprintf("  Unique CU identifiers (join_number): %s\n",
-            format(n_cu, big.mark = ",")))
-log_checkpoint("CK-05: join_number column", "PASS",
-               sprintf("%s unique CUs", format(n_cu, big.mark = ",")))
+cat("  Checking for pre-computed ratio columns in call_report.rds...\n\n")
 
-# --- 4b. yyyyqq date parsing ---
-if (!"yyyyqq" %in% names(panel)) {
-  log_checkpoint("CK-06: yyyyqq column", "FAIL",
-                 "Quarter identifier not found")
-}
-
-panel[, yyyyqq := as.character(yyyyqq)]
-cat(sprintf("\n  yyyyqq sample values: %s\n",
-            paste(head(unique(panel$yyyyqq), 6), collapse = ", ")))
-
-n_before_date <- nrow(panel)
-panel[, date := parse_q(yyyyqq)]
-
-n_bad_dates <- sum(is.na(panel$date))
-n_valid_fmt <- sum(grepl("^[0-9]{4}\\.[1-4]$", panel$yyyyqq))
-
-cat(sprintf("  Rows with valid yyyyqq format  : %s\n",
-            format(n_valid_fmt, big.mark = ",")))
-cat(sprintf("  Rows with unparseable yyyyqq   : %s\n",
-            format(n_bad_dates, big.mark = ",")))
-
-if (n_bad_dates > 0) {
-  bad_samples <- head(unique(panel[is.na(date), yyyyqq]), 5)
-  cat(sprintf("  Bad yyyyqq samples             : %s\n",
-              paste(bad_samples, collapse = ", ")))
-  panel <- panel[!is.na(date)]
-  log_checkpoint("CK-06: yyyyqq parsing", "WARN",
-                 sprintf("%d rows dropped for bad yyyyqq format", n_bad_dates))
-} else {
-  log_checkpoint("CK-06: yyyyqq parsing", "PASS", "All rows parse cleanly")
-}
-
-# --- 4c. Date range ---
-date_min <- min(panel$date)
-date_max <- max(panel$date)
-n_qtrs   <- uniqueN(panel$yyyyqq)
-
-cat(sprintf("\n  Date range : %s  to  %s\n", format(date_min), format(date_max)))
-cat(sprintf("  Quarters   : %d\n", n_qtrs))
-cat(sprintf("  Years span : %.1f\n", as.numeric(date_max - date_min) / 365.25))
-
-if (n_qtrs < MIN_QTR_COUNT) {
-  log_checkpoint("CK-07: Date range", "WARN",
-                 sprintf("Only %d quarters — expected >=%d", n_qtrs, MIN_QTR_COUNT))
-} else {
-  log_checkpoint("CK-07: Date range", "PASS",
-                 sprintf("%d quarters (%s to %s)", n_qtrs,
-                         format(date_min), format(date_max)))
-}
-
-# --- 4d. reporting_state ---
-if ("reporting_state" %in% names(panel)) {
-  n_states <- uniqueN(panel$reporting_state)
-  cat(sprintf("\n  Unique reporting states: %d\n", n_states))
-  cat(sprintf("  State distribution (top 10 by N):\n"))
-  state_ct <- panel[, .N, by = reporting_state][order(-N)][1:min(10, .N)]
-  for (i in seq_len(nrow(state_ct))) {
-    cat(sprintf("    %-4s  %s\n", state_ct$reporting_state[i],
-                format(state_ct$N[i], big.mark = ",")))
-  }
-  log_checkpoint("CK-08: reporting_state", "PASS",
-                 sprintf("%d unique states", n_states))
-} else {
-  log_checkpoint("CK-08: reporting_state", "WARN",
-                 "reporting_state column not found — state-level analysis will fail")
-}
-
-# Sort panel for all lag operations
-setorder(panel, join_number, date)
-
-# ============================================================================
-# SECTION 5: RAW ACCOUNT COLUMN AUDIT
-# ============================================================================
-section("5", "Raw Account Column Audit")
-
-cat("  Checking for required Form 5300 account columns...\n\n")
-
-# Required accounts and what they power
-ACCT_MANIFEST <- list(
-  acct_041a = "Loans 60+ days delinquent → dq_rate numerator",
-  acct_025  = "Total loans outstanding → dq_rate denominator, loan_to_share numerator",
-  acct_116  = "Net interest income → netintmrg numerator",
-  acct_010  = "Average assets → netintmrg denominator, pcanetworth denominator",
-  acct_018  = "Total shares/deposits → insured_share_growth, loan_to_share fallback",
-  acct_083  = "Number of members → member_growth_yoy",
-  acct_131  = "Interest expense → costfds numerator",
-  acct_674  = "Provision for loan losses → pll_rate numerator",
-  acct_998  = "Net worth → pcanetworth numerator",
-  dep_tot   = "Total deposits (preferred) → loan_to_share denominator"
+DIRECT_RATIOS <- c("netintmrg", "networth", "networthalt", "pcanetworth",
+                   "costfds", "roa", "dq_rate", "chg_tot_lns_ratio")
+DIRECT_META   <- list(
+  netintmrg         = "Net interest margin",
+  networth          = "Net worth ($000s)",
+  networthalt       = "Alternative net worth measure",
+  pcanetworth       = "Net worth ratio (PCA)",
+  costfds           = "Cost of funds",
+  roa               = "Return on assets",
+  dq_rate           = "Delinquency rate",
+  chg_tot_lns_ratio = "Charge-off ratio"
 )
 
-cat(sprintf("  %-12s  %-6s  %-10s  %s\n", "Account", "Found", "Non-NA%", "Powers"))
-cat(sprintf("  %s\n", paste(rep("-", 70), collapse = "")))
+cat(sprintf("  %-22s  %-6s  %-8s  %s\n", "Column", "Found", "Non-NA%", "Description"))
+cat(sprintf("  %s\n", paste(rep("-", 65), collapse = "")))
 
-acct_status <- list()
-for (acct in names(ACCT_MANIFEST)) {
-  found   <- acct %in% names(panel)
-  pct_ok  <- if (found) round(mean(!is.na(panel[[acct]])) * 100, 1) else NA
-  status  <- if (!found) "MISSING" else if (pct_ok < 50) "LOW" else "OK"
-  cat(sprintf("  %-12s  %-6s  %s  %s\n",
-              acct,
-              if (found) "YES" else "NO",
-              if (found) sprintf("%5.1f%%", pct_ok) else "  ---  ",
-              ACCT_MANIFEST[[acct]]))
-  acct_status[[acct]] <- list(found = found, pct_ok = pct_ok, status = status)
-}
-
-# Critical accounts — fail if missing
-CRITICAL_ACCTS <- c("acct_025", "acct_010", "acct_018")
-for (acct in CRITICAL_ACCTS) {
-  if (!acct_status[[acct]]$found) {
-    log_checkpoint(paste("CK-09: Critical account", acct), "FAIL",
-                   "Required for multiple outcomes — cannot proceed")
-  }
-}
-log_checkpoint("CK-09: Critical account columns", "PASS",
-               paste(CRITICAL_ACCTS, collapse = ", "))
-
-# ============================================================================
-# SECTION 6: OUTCOME VARIABLE CONSTRUCTION
-# ============================================================================
-section("6", "Outcome Variable Construction")
-
-# We track construction status for each variable
-OUTCOMES <- c("dq_rate", "pll_rate", "netintmrg", "insured_share_growth",
-              "member_growth_yoy", "costfds", "loan_to_share", "pcanetworth")
-
-# Outcome metadata for interpretation
-OUTCOME_META <- list(
-  dq_rate              = list(label = "Delinquency Rate",           formula = "acct_041a / acct_025",         expected_range = c(0, 0.30)),
-  pll_rate             = list(label = "PLL Rate",                    formula = "acct_674 / avg(acct_025)",      expected_range = c(0, 0.05)),
-  netintmrg            = list(label = "Net Interest Margin",         formula = "acct_116 / acct_010",          expected_range = c(0, 0.10)),
-  insured_share_growth = list(label = "Deposit Growth (QoQ%)",       formula = "Δacct_018 / acct_018_lag",     expected_range = c(-0.50, 0.50)),
-  member_growth_yoy    = list(label = "Membership Growth (YoY%)",    formula = "Δacct_083 / acct_083_lag4",    expected_range = c(-0.30, 0.30)),
-  costfds              = list(label = "Cost of Funds",               formula = "acct_131 / acct_018 * 4",     expected_range = c(0, 0.15)),
-  loan_to_share        = list(label = "Loan-to-Share Ratio",         formula = "acct_025 / dep_tot",           expected_range = c(0, 2.00)),
-  pcanetworth          = list(label = "Net Worth Ratio",             formula = "acct_998 / acct_010",          expected_range = c(-0.05, 0.30))
-)
-
-# Raw account descriptives before construction
-cat("  Raw denominator/driver variables before construction:\n\n")
-for (acct in c("acct_025", "acct_010", "acct_018", "acct_083")) {
-  if (acct %in% names(panel)) {
-    describe_var(panel[[acct]], acct)
-  }
-}
-
-# --------------------------------------------------------------------------
-# 6a. dq_rate = acct_041a / acct_025
-# --------------------------------------------------------------------------
-cat("\n  [6a] dq_rate — Delinquency Rate\n")
-cat("       Formula : acct_041a / acct_025\n")
-cat("       Logic   : Loans 60+ days past due / Total loans; zero denominator → NA\n\n")
-
-if (all(c("acct_041a", "acct_025") %in% names(panel))) {
-  n_zero_denom <- panel[acct_025 <= 0, .N]
-  n_neg_num    <- panel[acct_041a < 0, .N]
-  cat(sprintf("  acct_025 <= 0 (zero denominator): %s rows → set to NA\n",
-              format(n_zero_denom, big.mark = ",")))
-  cat(sprintf("  acct_041a < 0  (negative delinq) : %s rows\n",
-              format(n_neg_num, big.mark = ",")))
-
-  panel[, dq_rate := fifelse(acct_025 > 0, acct_041a / acct_025, NA_real_)]
-
-  # Economic sanity: dq_rate > 1 is impossible (more delinquent than loans)
-  n_gt1 <- panel[!is.na(dq_rate) & dq_rate > 1, .N]
-  if (n_gt1 > 0) {
-    cat(sprintf("  WARNING: %d obs have dq_rate > 1.0 (economically impossible)\n",
-                n_gt1))
-    cat("  Action: Setting dq_rate > 1 to NA before winsorization\n")
-    panel[dq_rate > 1, dq_rate := NA_real_]
-  }
-
-  cat("\n  Pre-winsorization stats:\n")
-  describe_var(panel$dq_rate, "dq_rate", "pre-winsor")
-  log_checkpoint("CK-10: dq_rate constructed", "PASS",
-                 sprintf("zero-denom: %d, impossible values fixed: %d",
-                         n_zero_denom, n_gt1))
-} else {
-  missing_accts <- setdiff(c("acct_041a", "acct_025"), names(panel))
-  panel[, dq_rate := NA_real_]
-  log_checkpoint("CK-10: dq_rate constructed", "WARN",
-                 paste("Missing accounts:", paste(missing_accts, collapse = ", ")))
-}
-
-# --------------------------------------------------------------------------
-# 6b. netintmrg = acct_116 / acct_010
-# --------------------------------------------------------------------------
-cat("\n  [6b] netintmrg — Net Interest Margin\n")
-cat("       Formula : acct_116 / acct_010\n")
-cat("       Logic   : Net interest income / Average assets; zero denominator → NA\n\n")
-
-if (all(c("acct_116", "acct_010") %in% names(panel))) {
-  n_zero_denom <- panel[acct_010 <= 0, .N]
-  cat(sprintf("  acct_010 <= 0 (zero/neg assets): %s rows → set to NA\n",
-              format(n_zero_denom, big.mark = ",")))
-
-  panel[, netintmrg := fifelse(acct_010 > 0, acct_116 / acct_010, NA_real_)]
-
-  # NIM should be bounded: [-0.05, 0.20] under normal conditions
-  n_extreme <- panel[!is.na(netintmrg) & (netintmrg < -0.05 | netintmrg > 0.25), .N]
-  if (n_extreme > 0) {
-    cat(sprintf("  Extreme NIM values (outside [-5%%, +25%%]): %d obs (flagged)\n",
-                n_extreme))
-  }
-
-  cat("\n  Pre-winsorization stats:\n")
-  describe_var(panel$netintmrg, "netintmrg", "pre-winsor")
-  log_checkpoint("CK-11: netintmrg constructed", "PASS",
-                 sprintf("zero-denom: %d", n_zero_denom))
-} else {
-  missing_accts <- setdiff(c("acct_116", "acct_010"), names(panel))
-  panel[, netintmrg := NA_real_]
-  log_checkpoint("CK-11: netintmrg constructed", "WARN",
-                 paste("Missing:", paste(missing_accts, collapse = ", ")))
-}
-
-# --------------------------------------------------------------------------
-# 6c. insured_share_growth = Δacct_018 / acct_018_lag (QoQ %)
-# CRITICAL: Deposit growth is the single most exposed outcome (3x SHAP, v1)
-# --------------------------------------------------------------------------
-cat("\n  [6c] insured_share_growth — Deposit Growth (QoQ %)\n")
-cat("       Formula : (acct_018_t - acct_018_{t-1}) / acct_018_{t-1} * 100\n")
-cat("       NOTE    : THIS IS THE #1 OUTCOME BY SHAP IMPORTANCE (v1 finding)\n")
-cat("       Logic   : QoQ growth rate; lag = NA for first obs → NA result\n\n")
-
-if ("acct_018" %in% names(panel)) {
-  panel[, acct_018_lag := shift(acct_018, 1L, type = "lag"), by = join_number]
-
-  n_first_obs    <- panel[is.na(acct_018_lag), .N]
-  n_zero_lag     <- panel[!is.na(acct_018_lag) & acct_018_lag <= 0, .N]
-  n_neg_deposits <- panel[acct_018 < 0, .N]
-
-  cat(sprintf("  First-obs NA (no lag)           : %s rows\n",
-              format(n_first_obs, big.mark = ",")))
-  cat(sprintf("  Zero/negative lagged deposits   : %s rows → NA\n",
-              format(n_zero_lag, big.mark = ",")))
-  cat(sprintf("  Negative current deposits       : %s rows\n",
-              format(n_neg_deposits, big.mark = ",")))
-
-  panel[, insured_share_growth := fifelse(
-    !is.na(acct_018_lag) & acct_018_lag > 0,
-    (acct_018 - acct_018_lag) / acct_018_lag * 100,
-    NA_real_
-  )]
-
-  # Flag implausible growth rates (>200% or < -90% QoQ are data issues)
-  n_implaus_hi <- panel[!is.na(insured_share_growth) & insured_share_growth > 200, .N]
-  n_implaus_lo <- panel[!is.na(insured_share_growth) & insured_share_growth < -90, .N]
-  if (n_implaus_hi + n_implaus_lo > 0) {
-    cat(sprintf("  Implausible growth >200%%        : %d obs (will be winsorized)\n",
-                n_implaus_hi))
-    cat(sprintf("  Implausible growth < -90%%       : %d obs (will be winsorized)\n",
-                n_implaus_lo))
-  }
-
-  cat("\n  Pre-winsorization stats:\n")
-  describe_var(panel$insured_share_growth, "insured_share_growth", "pre-winsor")
-  log_checkpoint("CK-12: insured_share_growth constructed", "PASS",
-                 sprintf("first-obs NAs: %d, zero-lag dropped: %d",
-                         n_first_obs, n_zero_lag))
-} else {
-  panel[, insured_share_growth := NA_real_]
-  log_checkpoint("CK-12: insured_share_growth constructed", "WARN",
-                 "acct_018 missing — deposit growth will be all NA")
-}
-
-# --------------------------------------------------------------------------
-# 6d. member_growth_yoy = Δacct_083 / acct_083_lag4 (YoY %)
-# --------------------------------------------------------------------------
-cat("\n  [6d] member_growth_yoy — Membership Growth (YoY %)\n")
-cat("       Formula : (acct_083_t - acct_083_{t-4}) / acct_083_{t-4} * 100\n")
-cat("       Logic   : YoY rate; lag-4 = NA for first 4 obs per CU\n\n")
-
-if ("acct_083" %in% names(panel)) {
-  panel[, acct_083_lag4 := shift(acct_083, 4L, type = "lag"), by = join_number]
-
-  n_first_obs4 <- panel[is.na(acct_083_lag4), .N]
-  n_zero_lag4  <- panel[!is.na(acct_083_lag4) & acct_083_lag4 <= 0, .N]
-
-  cat(sprintf("  First-4-obs NA (no 4-lag)       : %s rows\n",
-              format(n_first_obs4, big.mark = ",")))
-  cat(sprintf("  Zero lagged members             : %s rows → NA\n",
-              format(n_zero_lag4, big.mark = ",")))
-
-  panel[, member_growth_yoy := fifelse(
-    !is.na(acct_083_lag4) & acct_083_lag4 > 0,
-    (acct_083 - acct_083_lag4) / acct_083_lag4 * 100,
-    NA_real_
-  )]
-
-  cat("\n  Pre-winsorization stats:\n")
-  describe_var(panel$member_growth_yoy, "member_growth_yoy", "pre-winsor")
-  log_checkpoint("CK-13: member_growth_yoy constructed", "PASS",
-                 sprintf("first-4-obs NAs: %d", n_first_obs4))
-} else {
-  panel[, member_growth_yoy := NA_real_]
-  log_checkpoint("CK-13: member_growth_yoy constructed", "WARN",
-                 "acct_083 missing")
-}
-
-# --------------------------------------------------------------------------
-# 6e. costfds = acct_131 / acct_018 * 4 (annualized rate)
-# --------------------------------------------------------------------------
-cat("\n  [6e] costfds — Cost of Funds (annualized)\n")
-cat("       Formula : acct_131 / acct_018 * 4\n")
-cat("       Logic   : Interest expense / Deposits × 4 = annualized rate\n\n")
-
-if (all(c("acct_131", "acct_018") %in% names(panel))) {
-  n_zero_dep <- panel[acct_018 <= 0, .N]
-  n_neg_exp  <- panel[acct_131 < 0, .N]
-  cat(sprintf("  Zero/neg deposits (denominator) : %s rows → NA\n",
-              format(n_zero_dep, big.mark = ",")))
-  cat(sprintf("  Negative interest expense       : %s rows\n",
-              format(n_neg_exp, big.mark = ",")))
-
-  panel[, costfds := fifelse(acct_018 > 0, acct_131 / acct_018 * 4, NA_real_)]
-  cat("\n  Pre-winsorization stats:\n")
-  describe_var(panel$costfds, "costfds", "pre-winsor")
-  log_checkpoint("CK-14: costfds constructed", "PASS",
-                 sprintf("zero-denom: %d", n_zero_dep))
-} else if ("costfds" %in% names(panel)) {
-  panel[, costfds := as.double(costfds)]
-  cat("  Using pre-computed costfds column from raw data\n")
-  describe_var(panel$costfds, "costfds", "pre-computed")
-  log_checkpoint("CK-14: costfds constructed", "INFO",
-                 "Used pre-computed column (acct_131/018 not available)")
-} else {
-  panel[, costfds := NA_real_]
-  log_checkpoint("CK-14: costfds constructed", "WARN", "All accounts missing")
-}
-
-# --------------------------------------------------------------------------
-# 6f. loan_to_share = acct_025 / dep_tot  (fallback: acct_025 / acct_018)
-# --------------------------------------------------------------------------
-cat("\n  [6f] loan_to_share — Loan-to-Share Ratio\n")
-cat("       Formula : acct_025 / dep_tot  [fallback: acct_025 / acct_018]\n")
-cat("       Logic   : dep_tot preferred; acct_018 fallback if dep_tot missing\n\n")
-
-if (all(c("acct_025", "dep_tot") %in% names(panel))) {
-  n_zero_dt <- panel[dep_tot <= 0, .N]
-  cat(sprintf("  Using dep_tot (preferred path)\n"))
-  cat(sprintf("  dep_tot <= 0                    : %s rows → NA\n",
-              format(n_zero_dt, big.mark = ",")))
-  panel[, loan_to_share := fifelse(dep_tot > 0, acct_025 / dep_tot, NA_real_)]
-  denom_used <- "dep_tot"
-} else if (all(c("acct_025", "acct_018") %in% names(panel))) {
-  n_zero_18 <- panel[acct_018 <= 0, .N]
-  cat(sprintf("  dep_tot not found — using acct_018 FALLBACK\n"))
-  cat(sprintf("  acct_018 <= 0                   : %s rows → NA\n",
-              format(n_zero_18, big.mark = ",")))
-  panel[, loan_to_share := fifelse(acct_018 > 0, acct_025 / acct_018, NA_real_)]
-  denom_used <- "acct_018 (FALLBACK)"
-  log_checkpoint("CK-15a: loan_to_share denominator", "WARN",
-                 "dep_tot not found — using acct_018 fallback")
-} else {
-  panel[, loan_to_share := NA_real_]
-  denom_used <- "NONE"
-}
-
-# Sanity: loan-to-share > 3 is economically unusual
-n_extreme_lts <- panel[!is.na(loan_to_share) & loan_to_share > 3, .N]
-cat(sprintf("  Denominator used                : %s\n", denom_used))
-cat(sprintf("  loan_to_share > 3.0 (unusual)   : %d obs\n", n_extreme_lts))
-cat("\n  Pre-winsorization stats:\n")
-describe_var(panel$loan_to_share, "loan_to_share", "pre-winsor")
-log_checkpoint("CK-15: loan_to_share constructed", "PASS",
-               sprintf("denom: %s", denom_used))
-
-# --------------------------------------------------------------------------
-# 6g. pcanetworth = acct_998 / acct_010
-# --------------------------------------------------------------------------
-cat("\n  [6g] pcanetworth — Net Worth Ratio\n")
-cat("       Formula : acct_998 / acct_010\n")
-cat("       Logic   : Net worth / Average assets; NCUA PCA thresholds at 6%/7%/10%\n\n")
-
-if (all(c("acct_998", "acct_010") %in% names(panel))) {
-  n_zero_assets <- panel[acct_010 <= 0, .N]
-  n_neg_nw      <- panel[acct_998 < 0, .N]
-  cat(sprintf("  Zero/neg assets (denominator)   : %s rows → NA\n",
-              format(n_zero_assets, big.mark = ",")))
-  cat(sprintf("  Negative net worth (undercap'd) : %s rows\n",
-              format(n_neg_nw, big.mark = ",")))
-
-  panel[, pcanetworth := fifelse(acct_010 > 0, acct_998 / acct_010, NA_real_)]
-
-  # NCUA PCA context: flag critically undercapitalized (<2%)
-  n_critical <- panel[!is.na(pcanetworth) & pcanetworth < 0.02, .N]
-  if (n_critical > 0) {
-    cat(sprintf("  Critically undercapitalized (<2%%): %d CU-quarters (informational)\n",
-                n_critical))
-  }
-
-  cat("\n  Pre-winsorization stats:\n")
-  describe_var(panel$pcanetworth, "pcanetworth", "pre-winsor")
-  log_checkpoint("CK-16: pcanetworth constructed", "PASS",
-                 sprintf("zero-denom: %d, neg NW: %d", n_zero_assets, n_neg_nw))
-} else if ("pcanetworth" %in% names(panel)) {
-  panel[, pcanetworth := as.double(pcanetworth)]
-  cat("  Using pre-computed pcanetworth column\n")
-  describe_var(panel$pcanetworth, "pcanetworth", "pre-computed")
-  log_checkpoint("CK-16: pcanetworth constructed", "INFO",
-                 "Used pre-computed column")
-} else {
-  panel[, pcanetworth := NA_real_]
-  log_checkpoint("CK-16: pcanetworth constructed", "WARN", "All accounts missing")
-}
-
-# --------------------------------------------------------------------------
-# 6h. pll_rate = acct_674 / avg(acct_025)
-# CRITICAL: avg loan denominator confirmed in v1 Script 04d
-# --------------------------------------------------------------------------
-cat("\n  [6h] pll_rate — PLL Rate\n")
-cat("       Formula : acct_674 / [(acct_025_t + acct_025_{t-1}) / 2]\n")
-cat("       Logic   : Provision / Average loans; confirmed construction from v1 04d\n\n")
-
-if ("acct_025" %in% names(panel)) {
-  panel[, lns_tot_lag := shift(acct_025, 1L, type = "lag"), by = join_number]
-  panel[, lns_tot_avg := (acct_025 + lns_tot_lag) / 2]
-
-  n_avg_na <- panel[is.na(lns_tot_avg), .N]
-  n_avg_zero <- panel[!is.na(lns_tot_avg) & lns_tot_avg <= 0, .N]
-  cat(sprintf("  lns_tot_avg NA (first obs)      : %s rows\n",
-              format(n_avg_na, big.mark = ",")))
-  cat(sprintf("  lns_tot_avg <= 0                : %s rows → NA\n",
-              format(n_avg_zero, big.mark = ",")))
-} else {
-  panel[, lns_tot_avg := NA_real_]
-  n_avg_na <- nrow(panel); n_avg_zero <- 0
-}
-
-if ("acct_674" %in% names(panel)) {
-  n_neg_pll <- panel[acct_674 < 0, .N]
-  cat(sprintf("  Negative PLL (recoveries > prov): %d obs\n", n_neg_pll))
-  panel[, pll_rate := fifelse(!is.na(lns_tot_avg) & lns_tot_avg > 0,
-                              acct_674 / lns_tot_avg,
-                              NA_real_)]
-  cat("\n  Pre-winsorization stats:\n")
-  describe_var(panel$pll_rate, "pll_rate", "pre-winsor")
-  log_checkpoint("CK-17: pll_rate constructed", "PASS",
-                 sprintf("avg-loan NAs: %d, zero-denom: %d", n_avg_na, n_avg_zero))
-} else if ("pll_rate" %in% names(panel)) {
-  panel[, pll_rate := as.double(pll_rate)]
-  cat("  Using pre-computed pll_rate column\n")
-  describe_var(panel$pll_rate, "pll_rate", "pre-computed")
-  log_checkpoint("CK-17: pll_rate constructed", "INFO", "Used pre-computed column")
-} else {
-  panel[, pll_rate := NA_real_]
-  log_checkpoint("CK-17: pll_rate constructed", "WARN",
-                 "acct_674 missing and no pre-computed column")
-}
-
-# --------------------------------------------------------------------------
-# 6i. chg_totlns_ratio — charge-off column name audit
-# --------------------------------------------------------------------------
-cat("\n  [6i] chg_totlns_ratio — Charge-off Ratio (column audit only)\n")
-if ("chg_totlns_ratio" %in% names(panel)) {
-  cat("  Found: chg_totlns_ratio (exact v1 name — CORRECT)\n")
-  log_checkpoint("CK-18: chg_totlns_ratio name", "PASS", "Exact v1 column name found")
-} else if ("chg_tot_lns_ratio" %in% names(panel)) {
-  cat("  Found variant: chg_tot_lns_ratio → renaming to chg_totlns_ratio\n")
-  setnames(panel, "chg_tot_lns_ratio", "chg_totlns_ratio")
-  log_checkpoint("CK-18: chg_totlns_ratio name", "WARN",
-                 "Renamed from chg_tot_lns_ratio (common mis-naming from v1)")
-} else {
-  panel[, chg_totlns_ratio := NA_real_]
-  log_checkpoint("CK-18: chg_totlns_ratio name", "WARN",
-                 "Column not found — set to NA (not a primary outcome variable)")
-}
-
-# ============================================================================
-# SECTION 7: PRE-WINSORIZATION MISSINGNESS REPORT
-# ============================================================================
-section("7", "Pre-Winsorization Missingness Report")
-
-cat("  Outcome missingness BEFORE winsorization:\n\n")
-cat(sprintf("  %-28s  %8s  %8s  %8s\n", "Variable", "N (valid)", "N (miss)", "% Miss"))
-cat(sprintf("  %s\n", paste(rep("-", 62), collapse = "")))
-
-present_outcomes <- intersect(OUTCOMES, names(panel))
-for (v in present_outcomes) {
-  n_valid <- sum(!is.na(panel[[v]]))
-  n_miss  <- sum(is.na(panel[[v]]))
-  pct_m   <- n_miss / nrow(panel) * 100
-  flag    <- if (pct_m > 20) "  ← HIGH" else if (pct_m > 5) "  ← NOTE" else ""
-  cat(sprintf("  %-28s  %8s  %8s  %7.2f%%%s\n",
+direct_present <- character(0)
+for (v in DIRECT_RATIOS) {
+  found  <- v %in% names(cr)
+  pct_ok <- if (found) round(mean(!is.na(cr[[v]])) * 100, 1) else NA
+  cat(sprintf("  %-22s  %-6s  %s  %s\n",
               v,
-              format(n_valid, big.mark = ","),
-              format(n_miss,  big.mark = ","),
-              pct_m, flag))
+              if (found) "YES" else "NO",
+              if (found) sprintf("%5.1f%%", pct_ok) else "  ---",
+              DIRECT_META[[v]]))
+  if (found) direct_present <- c(direct_present, v)
+}
+cat(sprintf("\n  Direct ratios confirmed: %s\n",
+            if (length(direct_present) > 0)
+              paste(direct_present, collapse = ", ")
+            else "NONE"))
+log_checkpoint("CK-11: Direct ratio audit", "PASS",
+               sprintf("%d of %d pre-computed ratios present",
+                       length(direct_present), length(DIRECT_RATIOS)))
+
+if (length(direct_present) > 0) {
+  cat("\n  Distributions of pre-computed ratio variables:\n\n")
+  for (v in direct_present) describe_var(cr[[v]], v, "pre-computed, pre-winsor")
 }
 
-# CK: every outcome must be constructible
-n_all_na <- sum(sapply(present_outcomes, function(v) all(is.na(panel[[v]]))))
-if (n_all_na > 0) {
-  log_checkpoint("CK-19: Outcome construction", "WARN",
-                 sprintf("%d outcomes are entirely NA", n_all_na))
+# ============================================================================
+# SECTION 5: ASSET TIER ASSIGNMENT
+# ============================================================================
+section("5", "Asset Tier Assignment")
+
+cat("  Tier breaks (units: $thousands in call report):\n")
+cat("    T1_under10M  : assets < $10M     (<   10,000)\n")
+cat("    T2_10to100M  : assets $10-100M   (10,000 -- 100,000)\n")
+cat("    T3_100Mto1B  : assets $100M-$1B  (100,000 -- 1,000,000)\n")
+cat("    T4_over1B    : assets > $1B      (>= 1,000,000)\n\n")
+
+asset_col <- intersect(c("assets_tot", "acct_010"), names(cr))[1]
+
+if (!is.na(asset_col)) {
+  cat(sprintf("  Asset column: %s\n\n", asset_col))
+  describe_var(cr[[asset_col]], asset_col, "raw")
+
+  cr[, asset_tier := factor(
+    findInterval(get(asset_col), ASSET_BREAKS, rightmost.closed = TRUE),
+    levels = 1:4, labels = ASSET_LABELS
+  )]
+
+  tier_dist <- cr[, .N, by = asset_tier][order(asset_tier)]
+  tier_dist[, pct := round(N / nrow(cr) * 100, 1)]
+  n_na_tier <- cr[is.na(asset_tier), .N]
+
+  cat("\n  Asset tier distribution:\n")
+  cat(sprintf("  %-20s  %10s  %8s\n", "Tier", "N (CU-qtrs)", "Pct"))
+  cat(sprintf("  %s\n", paste(rep("-", 42), collapse = "")))
+  for (i in seq_len(nrow(tier_dist))) {
+    cat(sprintf("  %-20s  %10s  %7.1f%%\n",
+                as.character(tier_dist$asset_tier[i]),
+                format(tier_dist$N[i], big.mark = ","),
+                tier_dist$pct[i]))
+  }
+  if (n_na_tier > 0)
+    cat(sprintf("  %-20s  %10s  %7.1f%%  (zero/NA assets)\n",
+                "NA",
+                format(n_na_tier, big.mark = ","),
+                n_na_tier / nrow(cr) * 100))
+
+  log_checkpoint("CK-12: Asset tiers", "PASS",
+                 sprintf("Using %s; %d NA-tier rows", asset_col, n_na_tier))
 } else {
-  log_checkpoint("CK-19: Outcome construction", "PASS",
-                 "All outcomes have at least some valid values")
+  cat("  WARNING: Neither assets_tot nor acct_010 found\n")
+  cr[, asset_tier := NA_character_]
+  log_checkpoint("CK-12: Asset tiers", "WARN",
+                 "No asset column found -- tier set to NA")
 }
 
 # ============================================================================
-# SECTION 8: OUTLIER TREATMENT (WINSORIZATION)
+# SECTION 6: CONSTRUCTED OUTCOME VARIABLES
 # ============================================================================
-section("8", "Outlier Treatment — Winsorization")
+section("6", "Constructed Outcome Variables")
 
-cat(sprintf("  Method      : Winsorization at [%.0f%%, %.0f%%] percentiles\n",
-            WIN_LOW * 100, WIN_HIGH * 100))
-cat("  Scope       : Applied to each outcome variable across full panel\n")
-cat("  Rationale   : Preserves distributional shape; avoids deletion of valid extremes\n")
-cat("                Outlier observations are clipped to boundary, not dropped\n")
-cat("  Auditability: Every observation affected is logged to Results/01_outlier_log.csv\n\n")
-
-cat(sprintf("  %-28s  %8s  %8s  %8s  %8s  %8s  %8s\n",
-            "Variable", "p1 (lo)", "p99 (hi)", "N clipped", "N clipped",
-            "% aff.", "Change"))
-cat(sprintf("  %-28s  %8s  %8s  %8s  %8s  %8s  %8s\n",
-            "", "boundary", "boundary", "below p1", "above p99", "", "in mean"))
-cat(sprintf("  %s\n", paste(rep("-", 86), collapse = "")))
+cat("  Variables computed here: YoY growth rates, pll_rate, level ratios\n")
+cat("  All YoY rates use lag-4 within join_number\n")
+cat("  Data is pre-sorted by (join_number, year, quarter)\n\n")
 
 OUTLIER_RECORDS <- list()
-PRE_MEANS  <- list()
-POST_MEANS <- list()
 
-for (v in present_outcomes) {
-  x_pre  <- panel[[v]]
-  if (all(is.na(x_pre))) {
-    cat(sprintf("  %-28s  ALL MISSING — skipped\n", v))
-    next
-  }
-
-  PRE_MEANS[[v]]  <- mean(x_pre, na.rm = TRUE)
-  w               <- winsorize_audit(x_pre, v, WIN_LOW, WIN_HIGH)
-  panel[, (v) := w$x]
-  POST_MEANS[[v]] <- mean(w$x, na.rm = TRUE)
-  delta_mean      <- POST_MEANS[[v]] - PRE_MEANS[[v]]
-
-  cat(sprintf("  %-28s  %8.4f  %8.4f  %8d  %8d  %7.3f%%  %+8.5f\n",
-              v,
-              w$lo, w$hi,
-              w$n_lo, w$n_hi,
-              w$pct_affected,
-              delta_mean))
-
-  # Build audit records for observations clipped BELOW p1
-  if (w$n_lo > 0) {
-    idx_lo <- which(!is.na(x_pre) & x_pre < w$lo)
-    OUTLIER_RECORDS[[paste0(v, "_lo")]] <- data.table(
-      variable     = v,
-      direction    = "below_p1",
-      join_number  = panel$join_number[idx_lo],
-      yyyyqq       = panel$yyyyqq[idx_lo],
-      raw_value    = x_pre[idx_lo],
-      clipped_to   = w$lo,
-      clip_amount  = x_pre[idx_lo] - w$lo
-    )
-  }
-
-  # Build audit records for observations clipped ABOVE p99
-  if (w$n_hi > 0) {
-    idx_hi <- which(!is.na(x_pre) & x_pre > w$hi)
-    OUTLIER_RECORDS[[paste0(v, "_hi")]] <- data.table(
-      variable     = v,
-      direction    = "above_p99",
-      join_number  = panel$join_number[idx_hi],
-      yyyyqq       = panel$yyyyqq[idx_hi],
-      raw_value    = x_pre[idx_hi],
-      clipped_to   = w$hi,
-      clip_amount  = x_pre[idx_hi] - w$hi
-    )
-  }
+# Helper: apply winsorize and print the audit line
+apply_winsor <- function(dt, col) {
+  x   <- dt[[col]]
+  idx <- !is.na(x)
+  w   <- winsorize_audit(x[idx])
+  set(dt, which(idx), col, w$x)
+  cat(sprintf("  Winsorize %-26s: lo=%9.5f  hi=%9.5f  clipped lo=%d  hi=%d  (%.3f%% of valid)\n",
+              col, w$lo, w$hi, w$n_lo, w$n_hi, w$pct))
+  invisible(w)
 }
 
-# Save outlier audit log
-outlier_log <- rbindlist(OUTLIER_RECORDS, fill = TRUE)
-fwrite(outlier_log, file.path(RESULTS_DIR, "01_outlier_log.csv"))
-cat(sprintf("\n  Total obs winsorized        : %s\n",
-            format(nrow(outlier_log), big.mark = ",")))
-cat(sprintf("  Outlier log saved to        : Results/01_outlier_log.csv\n"))
-cat(sprintf("  Columns in log              : %s\n",
-            paste(names(outlier_log), collapse = ", ")))
+# --------------------------------------------------------------------------
+# 6a. insured_share_growth -- YoY change in insured shares
+# CRITICAL: #1 outcome by SHAP importance (3x next-highest, v1 finding)
+# --------------------------------------------------------------------------
+cat("  [6a] insured_share_growth\n")
+cat("       Source  : insured_tot  |  YoY % change (lag-4 within CU)\n")
+cat("       CRITICAL: #1 SHAP importance outcome in v1 (3x next-highest)\n\n")
 
-log_checkpoint("CK-20: Winsorization complete", "PASS",
-               sprintf("%s obs winsorized across %d outcomes",
-                       format(nrow(outlier_log), big.mark = ","),
-                       length(present_outcomes)))
+if ("insured_tot" %in% names(cr)) {
+  describe_var(cr[["insured_tot"]], "insured_tot", "raw level")
+  cr[, insured_share_growth := cu_yoy(cr, "insured_tot")]
+  n_valid_pre <- sum(!is.na(cr$insured_share_growth))
+  cat(sprintf("  Valid obs (non-NA) after YoY construction: %s\n",
+              format(n_valid_pre, big.mark = ",")))
+  describe_var(cr$insured_share_growth, "insured_share_growth", "pre-winsor")
+  w <- apply_winsor(cr, "insured_share_growth")
+  OUTLIER_RECORDS[["insured_share_growth"]] <- data.table(
+    variable = "insured_share_growth", method = "winsor_1_99",
+    lo_boundary = w$lo, hi_boundary = w$hi,
+    n_clipped_lo = w$n_lo, n_clipped_hi = w$n_hi, pct_affected = w$pct
+  )
+  log_checkpoint("CK-13: insured_share_growth", "PASS",
+                 sprintf("N=%s valid; clipped=%d",
+                         format(n_valid_pre, big.mark = ","), w$n_lo + w$n_hi))
+} else {
+  cat("  SKIP: 'insured_tot' not found in call_report.rds\n\n")
+  cr[, insured_share_growth := NA_real_]
+  log_checkpoint("CK-13: insured_share_growth", "WARN",
+                 "'insured_tot' not found")
+}
 
-# ============================================================================
-# SECTION 9: POST-WINSORIZATION SUMMARY STATISTICS
-# ============================================================================
-section("9", "Post-Winsorization Summary Statistics")
+# --------------------------------------------------------------------------
+# 6b. dep_growth_yoy -- YoY change in total deposits (acct_018)
+# --------------------------------------------------------------------------
+cat("\n  [6b] dep_growth_yoy\n")
+cat("       Source  : acct_018  |  YoY % change\n\n")
 
-cat("  Full distribution for each outcome AFTER winsorization:\n\n")
+if ("acct_018" %in% names(cr)) {
+  cr[, dep_growth_yoy := cu_yoy(cr, "acct_018")]
+  describe_var(cr$dep_growth_yoy, "dep_growth_yoy", "pre-winsor")
+  w <- apply_winsor(cr, "dep_growth_yoy")
+  OUTLIER_RECORDS[["dep_growth_yoy"]] <- data.table(
+    variable = "dep_growth_yoy", method = "winsor_1_99",
+    lo_boundary = w$lo, hi_boundary = w$hi,
+    n_clipped_lo = w$n_lo, n_clipped_hi = w$n_hi, pct_affected = w$pct
+  )
+  log_checkpoint("CK-14: dep_growth_yoy", "PASS",
+                 sprintf("clipped=%d", w$n_lo + w$n_hi))
+} else {
+  cr[, dep_growth_yoy := NA_real_]
+  log_checkpoint("CK-14: dep_growth_yoy", "WARN", "acct_018 not found")
+}
 
-VAR_SUMMARY <- list()
+# --------------------------------------------------------------------------
+# 6c. cert_growth_yoy -- YoY change in certificate shares
+# --------------------------------------------------------------------------
+cat("\n  [6c] cert_growth_yoy\n")
+cat("       Source  : dep_shrcert  |  YoY % change\n\n")
 
-for (v in present_outcomes) {
-  x <- panel[[v]]
-  if (all(is.na(x))) next
+if ("dep_shrcert" %in% names(cr)) {
+  cr[, cert_growth_yoy := cu_yoy(cr, "dep_shrcert")]
+  describe_var(cr$cert_growth_yoy, "cert_growth_yoy", "pre-winsor")
+  w <- apply_winsor(cr, "cert_growth_yoy")
+  OUTLIER_RECORDS[["cert_growth_yoy"]] <- data.table(
+    variable = "cert_growth_yoy", method = "winsor_1_99",
+    lo_boundary = w$lo, hi_boundary = w$hi,
+    n_clipped_lo = w$n_lo, n_clipped_hi = w$n_hi, pct_affected = w$pct
+  )
+  log_checkpoint("CK-15: cert_growth_yoy", "PASS",
+                 sprintf("clipped=%d", w$n_lo + w$n_hi))
+} else {
+  cr[, cert_growth_yoy := NA_real_]
+  log_checkpoint("CK-15: cert_growth_yoy", "INFO", "dep_shrcert not found -- skipped")
+}
 
-  n      <- sum(!is.na(x))
-  nmiss  <- mean(is.na(x))
-  qs     <- quantile(x, probs = c(0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99),
-                     na.rm = TRUE)
-  mn_val <- mean(x, na.rm = TRUE)
-  sd_val <- sd(x, na.rm = TRUE)
-  sk_val <- (mn_val - qs["50%"]) / sd_val   # simple skewness proxy
+# --------------------------------------------------------------------------
+# 6d. member_growth_yoy -- YoY change in membership
+# Economic note: M&A events create structural breaks (sudden large
+# positives/negatives); winsorisation at 1/99 removes M&A noise.
+# --------------------------------------------------------------------------
+cat("\n  [6d] member_growth_yoy\n")
+cat("       Source  : 'members' (fallback: acct_083, number_of_members, tot_members)\n")
+cat("       Note    : M&A events create outliers; winsorisation removes M&A noise\n\n")
 
-  # Check against economic expected range
-  meta       <- OUTCOME_META[[v]]
-  exp_lo     <- meta$expected_range[1]
-  exp_hi     <- meta$expected_range[2]
-  pct_in_range <- mean(x >= exp_lo & x <= exp_hi, na.rm = TRUE) * 100
+mem_col <- intersect(c("members", "acct_083", "number_of_members",
+                        "tot_members"), names(cr))[1]
+if (!is.na(mem_col)) {
+  cat(sprintf("  Column used: %s\n", mem_col))
+  describe_var(cr[[mem_col]], mem_col, "raw level")
+  cr[, member_growth_yoy := cu_yoy(cr, mem_col)]
+  describe_var(cr$member_growth_yoy, "member_growth_yoy", "pre-winsor")
+  w <- apply_winsor(cr, "member_growth_yoy")
+  OUTLIER_RECORDS[["member_growth_yoy"]] <- data.table(
+    variable = "member_growth_yoy", method = "winsor_1_99",
+    lo_boundary = w$lo, hi_boundary = w$hi,
+    n_clipped_lo = w$n_lo, n_clipped_hi = w$n_hi, pct_affected = w$pct
+  )
+  log_checkpoint("CK-16: member_growth_yoy", "PASS",
+                 sprintf("source=%s; clipped=%d", mem_col, w$n_lo + w$n_hi))
+} else {
+  cat("  SKIP: no membership column found\n")
+  cr[, member_growth_yoy := NA_real_]
+  log_checkpoint("CK-16: member_growth_yoy", "WARN", "No membership column found")
+}
 
-  cat(sprintf("  %s — %s\n", v, meta$label))
-  cat(sprintf("    N=%-8s  miss=%.1f%%  mean=%8.5f  sd=%8.5f  skew=%+.3f\n",
-              format(n, big.mark = ","), nmiss * 100, mn_val, sd_val, sk_val))
-  cat(sprintf("    p01=%8.5f  p10=%8.5f  p25=%8.5f  p50=%8.5f\n",
-              qs[1], qs[2], qs[3], qs[4]))
-  cat(sprintf("    p75=%8.5f  p90=%8.5f  p99=%8.5f\n",
-              qs[5], qs[6], qs[7]))
-  cat(sprintf("    Expected range: [%.4f, %.4f]  |  %.1f%% of obs within range\n",
-              exp_lo, exp_hi, pct_in_range))
-  if (pct_in_range < 80) {
-    cat(sprintf("    *** WARNING: Only %.1f%% within expected range — check construction\n",
-                pct_in_range))
+# --------------------------------------------------------------------------
+# 6e. cert_share = dep_shrcert / acct_018  (proportion 0-1, bounded)
+# --------------------------------------------------------------------------
+cat("\n  [6e] cert_share\n")
+cat("       Formula : dep_shrcert / acct_018  |  Bounded [0, 1]\n")
+cat("       Logic   : Hard bounds, not winsorisation (outside [0,1] = data error)\n\n")
+
+if (all(c("dep_shrcert", "acct_018") %in% names(cr))) {
+  n_zero_dep <- cr[acct_018 <= 0, .N]
+  cat(sprintf("  acct_018 <= 0 (zero denominator): %s rows -> NA\n",
+              format(n_zero_dep, big.mark = ",")))
+  cr[, cert_share := fifelse(
+    !is.na(acct_018) & is.finite(acct_018) & acct_018 > 0,
+    dep_shrcert / acct_018,
+    NA_real_
+  )]
+  n_gt1 <- cr[!is.na(cert_share) & cert_share > 1, .N]
+  n_lt0 <- cr[!is.na(cert_share) & cert_share < 0, .N]
+  cr[!is.na(cert_share), cert_share := pmin(pmax(cert_share, 0), 1)]
+  cat(sprintf("  Hard-bounded at [0,1]: %d above 1, %d below 0\n", n_gt1, n_lt0))
+  describe_var(cr$cert_share, "cert_share", "post-bounding")
+  OUTLIER_RECORDS[["cert_share"]] <- data.table(
+    variable = "cert_share", method = "hard_bound_0_1",
+    lo_boundary = 0, hi_boundary = 1,
+    n_clipped_lo = n_lt0, n_clipped_hi = n_gt1, pct_affected = NA_real_
+  )
+  log_checkpoint("CK-17: cert_share", "PASS",
+                 sprintf("hard-bounded: %d obs capped", n_gt1 + n_lt0))
+} else {
+  cr[, cert_share := NA_real_]
+  log_checkpoint("CK-17: cert_share", "INFO", "dep_shrcert or acct_018 missing")
+}
+
+# --------------------------------------------------------------------------
+# 6f. loan_to_share = lns_tot / dep_tot  (bounded 0-2)
+# dep_tot preferred; acct_018 fallback
+# --------------------------------------------------------------------------
+cat("\n  [6f] loan_to_share\n")
+cat("       Formula : lns_tot / dep_tot  (fallback denominator: acct_018)\n")
+cat("       Bounded : [0, 2]  -- ratios above 2 or below 0 are data errors\n\n")
+
+dep_denom <- intersect(c("dep_tot", "acct_018"), names(cr))[1]
+if (!is.na(dep_denom) && "lns_tot" %in% names(cr)) {
+  n_zero_dd <- cr[get(dep_denom) <= 0, .N]
+  cat(sprintf("  Denominator: %s  |  %d zero/neg rows -> NA\n",
+              dep_denom, n_zero_dd))
+  cr[, loan_to_share := fifelse(
+    !is.na(get(dep_denom)) & is.finite(get(dep_denom)) & get(dep_denom) > 0,
+    lns_tot / get(dep_denom),
+    NA_real_
+  )]
+  n_hi_lts <- cr[!is.na(loan_to_share) & loan_to_share > 2, .N]
+  n_lo_lts <- cr[!is.na(loan_to_share) & loan_to_share < 0, .N]
+  cr[!is.na(loan_to_share), loan_to_share := pmin(pmax(loan_to_share, 0), 2)]
+  cat(sprintf("  Hard-bounded at [0,2]: %d above 2, %d below 0\n",
+              n_hi_lts, n_lo_lts))
+  describe_var(cr$loan_to_share, "loan_to_share", "post-bounding")
+  OUTLIER_RECORDS[["loan_to_share"]] <- data.table(
+    variable = "loan_to_share", method = "hard_bound_0_2",
+    lo_boundary = 0, hi_boundary = 2,
+    n_clipped_lo = n_lo_lts, n_clipped_hi = n_hi_lts, pct_affected = NA_real_
+  )
+  log_checkpoint("CK-18: loan_to_share", "PASS",
+                 sprintf("denom=%s; capped=%d", dep_denom, n_hi_lts + n_lo_lts))
+} else {
+  cr[, loan_to_share := NA_real_]
+  log_checkpoint("CK-18: loan_to_share", "WARN",
+                 "lns_tot or deposit denominator not found")
+}
+
+# --------------------------------------------------------------------------
+# 6g. nim_spread = yldavgloans - costfds
+# --------------------------------------------------------------------------
+cat("\n  [6g] nim_spread\n")
+cat("       Formula : yldavgloans - costfds\n\n")
+
+if (all(c("yldavgloans", "costfds") %in% names(cr))) {
+  cr[, nim_spread := fifelse(
+    !is.na(yldavgloans) & !is.na(costfds) &
+      is.finite(yldavgloans) & is.finite(costfds),
+    yldavgloans - costfds,
+    NA_real_
+  )]
+  describe_var(cr$nim_spread, "nim_spread", "computed")
+  log_checkpoint("CK-19: nim_spread", "PASS", "yldavgloans - costfds")
+} else {
+  miss_nim <- setdiff(c("yldavgloans", "costfds"), names(cr))
+  cr[, nim_spread := NA_real_]
+  log_checkpoint("CK-19: nim_spread", "INFO",
+                 sprintf("Missing: %s", paste(miss_nim, collapse = ", ")))
+}
+
+# --------------------------------------------------------------------------
+# 6h. pll_rate = pll / avg(lns_tot) * 100
+# CRITICAL construction confirmed in v1 Script 04d
+# Bounded [-2%, +5%] THEN winsorized within bounds
+# --------------------------------------------------------------------------
+cat("\n  [6h] pll_rate -- Provision for Loan Loss Rate\n")
+cat("       Formula  : pll / [(lns_tot_t + lns_tot_{t-1}) / 2]  x 100\n")
+cat("       Expressed: % of average loans (quarterly, not annualized)\n")
+cat("       CRITICAL : avg loan denominator confirmed from v1 Script 04d\n")
+cat("       Step 1   : Hard bounds [-2%, +5%]  (outside = data error)\n")
+cat("       Step 2   : Winsorize within bounds at 1/99\n\n")
+cat("       Economic note:\n")
+cat("         Rising oil  => energy-sector stress => management raises provisions proactively\n")
+cat("         Falling oil => regional unemployment => PLL spikes in oil-state CUs\n")
+cat("         Post-2015   => pll_rate diverges from dq_rate (forward- vs backward-looking)\n\n")
+
+if ("pll" %in% names(cr) && "lns_tot" %in% names(cr)) {
+  describe_var(cr[["pll"]],     "pll",     "raw level")
+  describe_var(cr[["lns_tot"]], "lns_tot", "raw level")
+
+  cr[, lns_avg := (lns_tot + shift(lns_tot, 1L)) / 2, by = join_number]
+
+  n_avg_na   <- cr[is.na(lns_avg), .N]
+  n_avg_zero <- cr[!is.na(lns_avg) & lns_avg <= 0, .N]
+  n_neg_pll  <- sum(cr$pll < 0, na.rm = TRUE)
+
+  cat(sprintf("  lns_avg NA (first obs per CU)    : %s rows\n",
+              format(n_avg_na, big.mark = ",")))
+  cat(sprintf("  lns_avg <= 0 (zero avg loans)    : %s rows -> NA\n",
+              format(n_avg_zero, big.mark = ",")))
+  cat(sprintf("  Negative pll (recoveries > prov) : %d obs (valid, not an error)\n\n",
+              n_neg_pll))
+
+  cr[, pll_rate := fifelse(
+    !is.na(pll) & !is.na(lns_avg) & is.finite(lns_avg) & lns_avg > 0,
+    pll / lns_avg * 100,
+    NA_real_
+  )]
+
+  # Step 1: hard bounds
+  n_below_minus2 <- cr[!is.na(pll_rate) & pll_rate < -2, .N]
+  n_above_5      <- cr[!is.na(pll_rate) & pll_rate >  5, .N]
+  cr[!is.na(pll_rate), pll_rate := pmin(pmax(pll_rate, -2), 5)]
+  cat(sprintf("  Hard bounds [-2%%, +5%%]:\n"))
+  cat(sprintf("    Below -2%%  : %d obs hard-capped\n", n_below_minus2))
+  cat(sprintf("    Above +5%%  : %d obs hard-capped\n\n", n_above_5))
+
+  # Step 2: winsorize within bounds
+  describe_var(cr$pll_rate, "pll_rate", "pre-winsor (post hard-bound)")
+  w <- apply_winsor(cr, "pll_rate")
+
+  cat(sprintf("\n  pll_rate FINAL:\n"))
+  cat(sprintf("    N valid : %s\n", format(sum(!is.na(cr$pll_rate)), big.mark = ",")))
+  cat(sprintf("    Mean    : %.4f%%\n", mean(cr$pll_rate, na.rm = TRUE)))
+  cat(sprintf("    p99     : %.4f%%\n", quantile(cr$pll_rate, 0.99, na.rm = TRUE)))
+
+  OUTLIER_RECORDS[["pll_rate"]] <- data.table(
+    variable = "pll_rate", method = "hard_bound_then_winsor_1_99",
+    lo_boundary = w$lo, hi_boundary = w$hi,
+    n_clipped_lo = w$n_lo, n_clipped_hi = w$n_hi, pct_affected = w$pct,
+    n_hardbound_lo = n_below_minus2, n_hardbound_hi = n_above_5
+  )
+
+  cr[, lns_avg := NULL]  # drop intermediate column
+
+  log_checkpoint("CK-20: pll_rate", "PASS",
+                 sprintf("hard-capped=%d; winsorized=%d",
+                         n_below_minus2 + n_above_5, w$n_lo + w$n_hi))
+} else {
+  miss_pll <- setdiff(c("pll", "lns_tot"), names(cr))
+  cat(sprintf("  SKIP: missing columns: %s\n", paste(miss_pll, collapse = ", ")))
+  cr[, pll_rate := NA_real_]
+  log_checkpoint("CK-20: pll_rate", "WARN",
+                 sprintf("Missing: %s", paste(miss_pll, collapse = ", ")))
+}
+
+# --------------------------------------------------------------------------
+# 6i. pll_per_loan = pll / lns_tot_n  (per-loan count, size-neutral)
+# --------------------------------------------------------------------------
+cat("\n  [6i] pll_per_loan\n")
+cat("       Formula : pll / lns_tot_n  ($ provision per loan count)\n")
+cat("       Use     : Size-neutral complement to pll_rate\n\n")
+
+if ("pll" %in% names(cr) && "lns_tot_n" %in% names(cr)) {
+  n_zero_n <- cr[lns_tot_n <= 0, .N]
+  cat(sprintf("  lns_tot_n <= 0: %d rows -> NA\n", n_zero_n))
+  cr[, pll_per_loan := fifelse(
+    !is.na(pll) & !is.na(lns_tot_n) & is.finite(lns_tot_n) & lns_tot_n > 0,
+    pll / lns_tot_n,
+    NA_real_
+  )]
+  describe_var(cr$pll_per_loan, "pll_per_loan", "pre-winsor")
+  w <- apply_winsor(cr, "pll_per_loan")
+  OUTLIER_RECORDS[["pll_per_loan"]] <- data.table(
+    variable = "pll_per_loan", method = "winsor_1_99",
+    lo_boundary = w$lo, hi_boundary = w$hi,
+    n_clipped_lo = w$n_lo, n_clipped_hi = w$n_hi, pct_affected = w$pct
+  )
+  log_checkpoint("CK-21: pll_per_loan", "PASS",
+                 sprintf("clipped=%d", w$n_lo + w$n_hi))
+} else {
+  cr[, pll_per_loan := NA_real_]
+  log_checkpoint("CK-21: pll_per_loan", "INFO", "pll or lns_tot_n not found")
+}
+
+# --------------------------------------------------------------------------
+# 6j. Winsorize pre-computed direct ratio variables
+# --------------------------------------------------------------------------
+cat("\n  [6j] Winsorizing pre-computed direct ratio variables\n\n")
+
+WINSOR_DIRECT <- intersect(
+  c("netintmrg", "pcanetworth", "costfds", "roa",
+    "dq_rate", "chg_tot_lns_ratio"),
+  names(cr)
+)
+
+cat(sprintf("  %-22s  %8s  %8s  %6s  %6s  %8s\n",
+            "Variable", "p1 (lo)", "p99 (hi)", "N < p1", "N > p99", "% affect"))
+cat(sprintf("  %s\n", paste(rep("-", 68), collapse = "")))
+
+for (v in WINSOR_DIRECT) {
+  if (all(is.na(cr[[v]]))) {
+    cat(sprintf("  %-22s  ALL MISSING\n", v))
+    next
   }
-  cat("\n")
-
-  VAR_SUMMARY[[v]] <- data.table(
-    variable = v, label = meta$label,
-    n = n, pct_miss = round(nmiss * 100, 2),
-    mean = round(mn_val, 6), sd = round(sd_val, 6),
-    p01 = round(qs[1], 6), p10 = round(qs[2], 6),
-    p25 = round(qs[3], 6), p50 = round(qs[4], 6),
-    p75 = round(qs[5], 6), p90 = round(qs[6], 6),
-    p99 = round(qs[7], 6),
-    expected_lo = exp_lo, expected_hi = exp_hi,
-    pct_in_expected_range = round(pct_in_range, 2)
+  x_pre <- cr[[v]]
+  w     <- winsorize_audit(x_pre)
+  cr[, (v) := w$x]
+  cat(sprintf("  %-22s  %8.5f  %8.5f  %6d  %6d  %7.3f%%\n",
+              v, w$lo, w$hi, w$n_lo, w$n_hi, w$pct))
+  OUTLIER_RECORDS[[paste0(v, "_winsor")]] <- data.table(
+    variable = v, method = "winsor_1_99",
+    lo_boundary = w$lo, hi_boundary = w$hi,
+    n_clipped_lo = w$n_lo, n_clipped_hi = w$n_hi, pct_affected = w$pct
   )
 }
 
-var_summary_dt <- rbindlist(VAR_SUMMARY, fill = TRUE)
-fwrite(var_summary_dt, file.path(RESULTS_DIR, "01_variable_summary.csv"))
-cat(sprintf("  Saved: Results/01_variable_summary.csv\n"))
-
-log_checkpoint("CK-21: Post-winsorization stats", "PASS",
-               sprintf("%d outcome variables summarized", nrow(var_summary_dt)))
+log_checkpoint("CK-22: Direct ratio winsorization", "PASS",
+               sprintf("%d variables processed", length(WINSOR_DIRECT)))
 
 # ============================================================================
-# SECTION 10: LAGGED OUTCOMES FOR AR(1) STRUCTURE
+# SECTION 7: TIME FLAGS (post2015, first_obs, cecl)
 # ============================================================================
-section("10", "Lagged Outcomes (AR(1) Structure)")
+section("7", "Time Flags")
 
-cat("  Constructing one-period lags for each outcome variable.\n")
-cat("  ANCHOR: v1 AR(1) coefficient ≈ 0.59 — lags required for Script 04a.\n\n")
+cr[, post2015 := as.integer(cal_date >= as.Date("2015-01-01"))]
 
-cat(sprintf("  %-28s  %8s  %8s  %8s\n",
-            "Variable", "Lag name", "N (valid)", "% of parent"))
-cat(sprintf("  %s\n", paste(rep("-", 62), collapse = "")))
+cat(sprintf("  post2015 == 0 (pre-shale)  : %s CU-quarters\n",
+            format(cr[post2015 == 0, .N], big.mark = ",")))
+cat(sprintf("  post2015 == 1 (post-shale) : %s CU-quarters\n",
+            format(cr[post2015 == 1, .N], big.mark = ",")))
+cat("  ANCHOR: 2015Q1 structural break reverses all transmission signs (v1)\n\n")
 
-for (v in present_outcomes) {
-  lag_nm <- paste0(v, "_lag1")
-  panel[, (lag_nm) := shift(get(v), 1L, type = "lag"), by = join_number]
-
-  n_parent <- sum(!is.na(panel[[v]]))
-  n_lag    <- sum(!is.na(panel[[lag_nm]]))
-  pct_lag  <- if (n_parent > 0) n_lag / n_parent * 100 else 0
-
-  cat(sprintf("  %-28s  %-28s  %8s  %7.1f%%\n",
-              v, lag_nm,
-              format(n_lag, big.mark = ","),
-              pct_lag))
+if (cr[post2015 == 0, .N] == 0 || cr[post2015 == 1, .N] == 0) {
+  log_checkpoint("CK-23a: 2015Q1 splits data", "WARN",
+                 "One side of the 2015Q1 split is empty -- check date range")
+} else {
+  log_checkpoint("CK-23a: 2015Q1 splits data", "PASS",
+                 sprintf("pre=%s, post=%s",
+                         format(cr[post2015==0,.N], big.mark=","),
+                         format(cr[post2015==1,.N], big.mark=",")))
 }
 
-log_checkpoint("CK-22: Lag construction", "PASS",
-               sprintf("%d outcome lags constructed", length(present_outcomes)))
-
-# ============================================================================
-# SECTION 11: FLAGS — FIRST OBS AND CECL
-# ============================================================================
-section("11", "Observation Flags (first_obs_flag, cecl_flag)")
-
-# first_obs_flag: any lag unavailable → row should not enter AR models
-panel[, first_obs_flag := as.integer(
-  is.na(insured_share_growth_lag1) | is.na(dq_rate_lag1)
-)]
-n_first <- panel[first_obs_flag == 1, .N]
-n_usable <- panel[first_obs_flag == 0, .N]
-
-cat(sprintf("  first_obs_flag == 1 (lag missing, exclude from AR models): %s rows (%.1f%%)\n",
-            format(n_first, big.mark = ","),
-            n_first / nrow(panel) * 100))
-cat(sprintf("  first_obs_flag == 0 (usable for AR models)               : %s rows (%.1f%%)\n",
-            format(n_usable, big.mark = ","),
-            n_usable / nrow(panel) * 100))
-
-# cecl_flag: CECL transition creates accounting break in PLL/charge-offs
-# Large CUs: 2020Q1; Small CUs (FICUs): 2023Q1
-panel[, cecl_flag := as.integer(
-  (date >= as.Date("2020-01-01") & date <= as.Date("2020-03-31")) |
-  (date >= as.Date("2023-01-01") & date <= as.Date("2023-03-31"))
-)]
-n_cecl <- panel[cecl_flag == 1, .N]
-cat(sprintf("\n  cecl_flag == 1 (CECL transition quarters):                 %s rows (%.2f%%)\n",
-            format(n_cecl, big.mark = ","),
-            n_cecl / nrow(panel) * 100))
-cat("  CECL quarters flagged: 2020Q1 (large CU adoption), 2023Q1 (FICU adoption)\n")
-cat("  Recommendation: Exclude cecl_flag==1 from PLL/charge-off regressions\n")
-
-log_checkpoint("CK-23: Observation flags", "PASS",
-               sprintf("first_obs=%d, cecl=%d", n_first, n_cecl))
-
-# ============================================================================
-# SECTION 12: ASSET TIERS
-# ============================================================================
-section("12", "Asset Tier Assignment")
-
-cat("  Tier thresholds (call report units = $thousands):\n")
-cat("    T1 : < $50M           (<     50,000)\n")
-cat("    T2 : $50M – $100M     (50,000 – 100,000)\n")
-cat("    T3 : $100M – $500M    (100,000 – 500,000)\n")
-cat("    T4 : $500M – $1B      (500,000 – 1,000,000)\n")
-cat("    T5 : > $1B            (>= 1,000,000)\n\n")
-
-ASSET_COL <- if ("acct_010" %in% names(panel)) "acct_010" else
-             if ("total_assets" %in% names(panel)) "total_assets" else NA_character_
-
-if (!is.na(ASSET_COL)) {
-  cat(sprintf("  Asset column used: %s\n\n", ASSET_COL))
-
-  describe_var(panel[[ASSET_COL]], ASSET_COL, "raw assets")
-
-  panel[, asset_tier := fcase(
-    get(ASSET_COL) <  50000,                                 "T1",
-    get(ASSET_COL) >= 50000  & get(ASSET_COL) < 100000,     "T2",
-    get(ASSET_COL) >= 100000 & get(ASSET_COL) < 500000,     "T3",
-    get(ASSET_COL) >= 500000 & get(ASSET_COL) < 1000000,    "T4",
-    get(ASSET_COL) >= 1000000,                               "T5",
-    default = NA_character_
+# First-obs flag (lag unavailable for AR models)
+lag_check_vars <- intersect(c("insured_share_growth", "dq_rate"), names(cr))
+if (length(lag_check_vars) > 0) {
+  for (v in lag_check_vars) {
+    lag_nm <- paste0(v, "_lag1")
+    cr[, (lag_nm) := shift(get(v), 1L, type = "lag"), by = join_number]
+  }
+  cr[, first_obs_flag := as.integer(
+    Reduce(`|`, lapply(paste0(lag_check_vars, "_lag1"),
+                       function(nm) is.na(cr[[nm]])))
   )]
+} else {
+  cr[, first_obs_flag := 0L]
+}
 
-  tier_dist <- panel[, .N, by = asset_tier][order(asset_tier)]
-  tier_dist[, pct := round(N / nrow(panel) * 100, 1)]
+n_first <- cr[first_obs_flag == 1, .N]
+cat(sprintf("  first_obs_flag == 1 : %s rows (no lag -- exclude from AR models)\n",
+            format(n_first, big.mark = ",")))
 
-  cat("\n  Asset tier distribution:\n")
-  cat(sprintf("  %-6s  %10s  %8s  %s\n", "Tier", "N (CU-qtrs)", "Pct", "Range"))
-  cat(sprintf("  %s\n", paste(rep("-", 50), collapse = "")))
-  tier_labels <- c(T1 = "<$50M", T2 = "$50-100M", T3 = "$100-500M",
-                   T4 = "$500M-$1B", T5 = ">$1B")
-  for (i in seq_len(nrow(tier_dist))) {
-    tier <- tier_dist$asset_tier[i]
-    if (!is.na(tier)) {
-      cat(sprintf("  %-6s  %10s  %7.1f%%  %s\n",
-                  tier, format(tier_dist$N[i], big.mark = ","),
-                  tier_dist$pct[i],
-                  tier_labels[tier]))
+# CECL flags
+cr[, cecl_flag := as.integer(
+  (cal_date >= as.Date("2020-01-01") & cal_date <= as.Date("2020-03-31")) |
+    (cal_date >= as.Date("2023-01-01") & cal_date <= as.Date("2023-03-31"))
+)]
+n_cecl <- cr[cecl_flag == 1, .N]
+cat(sprintf("  cecl_flag == 1      : %s rows (2020Q1 large-CU and 2023Q1 FICU CECL)\n",
+            format(n_cecl, big.mark = ",")))
+cat("  Note: Exclude cecl_flag==1 from PLL/charge-off regressions\n")
+
+log_checkpoint("CK-23: Time flags", "PASS",
+               sprintf("post2015=%d/%d; first_obs=%d; cecl=%d",
+                       cr[post2015==1,.N], nrow(cr), n_first, n_cecl))
+
+# ============================================================================
+# SECTION 8: PRELIMINARY OIL-STATE FLAG
+# ============================================================================
+section("8", "Preliminary Oil-State Flag")
+
+cat("  This is a BINARY PRELIMINARY flag only.\n")
+cat("  It is SUPERSEDED by oil_exposure.rds from 01b_oil_exposure_v2.R\n")
+cat("  which provides QCEW-based continuous exposure weights.\n\n")
+cat(sprintf("  States: %s\n\n", paste(OIL_STATES_PRELIM, collapse = ", ")))
+
+if (!is.na(state_col)) {
+  cr[, oil_state_prelim := toupper(get(state_col)) %in% OIL_STATES_PRELIM]
+  n_oil <- cr[oil_state_prelim == TRUE, .N]
+  n_non <- cr[oil_state_prelim == FALSE, .N]
+  cat(sprintf("  oil_state_prelim == TRUE  : %s CU-quarters\n",
+              format(n_oil, big.mark = ",")))
+  cat(sprintf("  oil_state_prelim == FALSE : %s CU-quarters\n",
+              format(n_non, big.mark = ",")))
+  log_checkpoint("CK-24: Preliminary oil flag", "PASS",
+                 sprintf("oil=%s, non-oil=%s",
+                         format(n_oil, big.mark = ","),
+                         format(n_non, big.mark = ",")))
+} else {
+  cr[, oil_state_prelim := NA]
+  log_checkpoint("CK-24: Preliminary oil flag", "WARN",
+                 "No state column -- oil_state_prelim set to NA")
+}
+
+# ============================================================================
+# SECTION 9: SAVE CALL_CLEAN (FIRST SAVE -- BEFORE MACRO MERGE)
+# ============================================================================
+section("9", "Save call_clean.rds (CU panel, no macro yet)")
+
+setorderv(cr, c("join_number", "year", "quarter"))
+saveRDS(cr, "Data/call_clean.rds")
+cat(sprintf("  Saved: Data/call_clean.rds  |  %s rows x %d cols  |  %.1f MB\n",
+            format(nrow(cr), big.mark = ","), ncol(cr),
+            file.size("Data/call_clean.rds") / 1e6))
+log_checkpoint("CK-25: call_clean.rds first save", "PASS",
+               sprintf("%s rows, %d cols", format(nrow(cr), big.mark = ","), ncol(cr)))
+
+# ============================================================================
+# SECTION 10: FRB CCAR SCENARIO LOADER
+# ============================================================================
+section("10", "FRB CCAR Scenario Loader")
+
+cat("  Files : FRB_Baseline_2026.xlsx  and  FRB_Severely_Adverse_2026.xlsx\n")
+cat("  Format: Date column in YYYY.Q format (e.g. 2005.1 = 2005Q1)\n\n")
+
+parse_frb_date <- function(x, path = "") {
+  x_num  <- suppressWarnings(as.numeric(as.character(x)))
+  yr_p   <- floor(x_num)
+  qn_p   <- round((x_num - yr_p) * 10)
+  valid  <- !is.na(x_num) & yr_p >= 1900 & yr_p <= 2100 &
+    qn_p >= 1 & qn_p <= 4
+
+  if (mean(valid, na.rm = TRUE) > 0.8) {
+    mo   <- c("1"="01","2"="04","3"="07","4"="10")[as.character(qn_p)]
+    return(list(
+      dates = as.Date(paste(yr_p, mo, "01", sep = "-")),
+      yr = yr_p, qn = qn_p
+    ))
+  }
+  # Excel serial date fallback
+  if (is.numeric(x)) {
+    d <- suppressWarnings(as.Date(x, origin = "1899-12-30"))
+    if (mean(!is.na(d)) > 0.8)
+      return(list(dates = d, yr = year(d), qn = quarter(d)))
+  }
+  stop(paste("Cannot parse Date column in", path,
+             "\n  Sample:", paste(head(as.character(x), 5), collapse = ", ")))
+}
+
+load_frb <- function(path, prefix) {
+  cat(sprintf("\n  Loading: %s  [prefix: %s]\n", basename(path), prefix))
+
+  if (!file.exists(path)) {
+    log_checkpoint(paste("FRB file:", basename(path)), "FAIL",
+                   paste("Not found:", path))
+  }
+
+  raw <- tryCatch(
+    as.data.table(read_excel(path, .name_repair = "unique")),
+    error = function(e) stop("Cannot read ", path, ": ", e$message)
+  )
+
+  raw <- raw[!apply(raw, 1, function(r)
+    all(is.na(r) | !suppressWarnings(!is.na(as.numeric(r[!is.na(r)])))))]
+
+  cat(sprintf("  Dims after cleaning: %d rows x %d cols\n", nrow(raw), ncol(raw)))
+
+  date_idx <- which(tolower(names(raw)) == "date")[1]
+  if (is.na(date_idx)) {
+    date_idx <- which(vapply(raw, function(x) {
+      x2 <- suppressWarnings(as.numeric(as.character(x)))
+      mean(!is.na(x2) & x2 > 1990 & x2 < 2100) > 0.4
+    }, logical(1)))[1]
+  }
+  if (is.na(date_idx))
+    log_checkpoint(paste("Date col in", basename(path)), "FAIL", "Not found")
+
+  date_col <- names(raw)[date_idx]
+  cat(sprintf("  Date column: '%s'\n", date_col))
+
+  parsed  <- parse_frb_date(raw[[date_col]], path)
+  dv_num  <- suppressWarnings(as.numeric(as.character(raw[[date_col]])))
+  yr_src  <- floor(dv_num)
+  qn_src  <- round((dv_num - yr_src) * 10)
+  use_src <- !is.na(dv_num) & yr_src >= 1900 & qn_src >= 1 & qn_src <= 4
+
+  raw[, date_parsed := parsed$dates]
+  raw[, year    := fifelse(use_src, as.integer(yr_src), year(parsed$dates))]
+  raw[, quarter := fifelse(use_src, as.integer(qn_src), quarter(parsed$dates))]
+  raw[, yyyyqq  := year * 100L + quarter]
+  raw <- raw[!is.na(date_parsed) & year >= 2004]
+
+  id_cols    <- c(date_col, "date_parsed", "year", "quarter", "yyyyqq")
+  macro_cols <- setdiff(names(raw), id_cols)
+  macro_cols <- macro_cols[vapply(raw[, ..macro_cols], is.numeric, logical(1))]
+  macro_cols <- macro_cols[!grepl("^\\.\\.", macro_cols)]
+  cat(sprintf("  Macro columns identified: %d\n", length(macro_cols)))
+
+  wide <- raw[, c(.(year = first(year), quarter = first(quarter)),
+                  lapply(.SD, function(x) mean(as.numeric(x), na.rm = TRUE))),
+              by = yyyyqq, .SDcols = macro_cols]
+  wide <- wide[order(yyyyqq)]
+
+  new_nms  <- paste0(prefix, tolower(macro_cols))
+  dupe_nm  <- duplicated(new_nms)
+  if (any(dupe_nm)) new_nms[dupe_nm] <- paste0(new_nms[dupe_nm], "_v2")
+  setnames(wide, macro_cols, new_nms)
+
+  key     <- paste0(prefix, c("pbrent","lurc","pcpi","pcpixfe","rmtg",
+                               "phpi","uypsav","ypds","gdps","rff"))
+  found   <- intersect(key, names(wide))
+  missing <- setdiff(key, names(wide))
+  cat(sprintf("  Key vars found   : %s\n", paste(found, collapse = ", ")))
+  if (length(missing) > 0)
+    cat(sprintf("  Key vars MISSING : %s\n", paste(missing, collapse = ", ")))
+  cat(sprintf("  Quarters: %dQ%d -- %dQ%d  (%d rows)\n",
+              wide[1, year], wide[1, quarter],
+              wide[.N, year], wide[.N, quarter], nrow(wide)))
+
+  wide[]
+}
+
+macro_base   <- load_frb("Data/FRB_Baseline_2026.xlsx",         "macro_base_")
+macro_severe <- load_frb("Data/FRB_Severely_Adverse_2026.xlsx", "macro_severe_")
+
+saveRDS(macro_base,   "Data/macro_base.rds")
+saveRDS(macro_severe, "Data/macro_severe.rds")
+cat(sprintf("\n  Saved: macro_base.rds (%d cols)  |  macro_severe.rds (%d cols)\n",
+            ncol(macro_base), ncol(macro_severe)))
+log_checkpoint("CK-26: FRB scenarios loaded", "PASS",
+               sprintf("base=%d cols, severe=%d cols",
+                       ncol(macro_base), ncol(macro_severe)))
+
+# ============================================================================
+# SECTION 11: DERIVED MACRO VARIABLES
+# ============================================================================
+section("11", "Derived Macro Variables")
+
+cat("  Computing: oil transforms, yield curve, real rate, FOMC regime, CPI YoY\n")
+cat("  Applied to BOTH macro_base_ and macro_severe_ scenarios\n\n")
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+add_macro_derived <- function(dt, pfx) {
+  gc <- function(nm) {
+    col <- paste0(pfx, nm)
+    if (col %in% names(dt)) dt[[col]] else NULL
+  }
+  setorderv(dt, "yyyyqq")
+
+  # Oil price transforms
+  pb <- gc("pbrent")
+  if (!is.null(pb)) {
+    dt[, (paste0(pfx,"yoy_oil"))    := (pb - shift(pb,4)) / shift(pb,4) * 100]
+    dt[, (paste0(pfx,"qoq_oil"))    := (pb - shift(pb,1)) / shift(pb,1) * 100]
+    dt[, (paste0(pfx,"oil_pos"))    := pmax(get(paste0(pfx,"yoy_oil")), 0, na.rm=TRUE)]
+    dt[, (paste0(pfx,"oil_neg"))    := pmin(get(paste0(pfx,"yoy_oil")), 0, na.rm=TRUE)]
+    for (k in 1:4)
+      dt[, (paste0(pfx,"yoy_oil_lag",k)) := shift(get(paste0(pfx,"yoy_oil")), k)]
+    dt[, (paste0(pfx,"oil_rsd4"))   := frollapply(get(paste0(pfx,"qoq_oil")),4,sd,na.rm=TRUE,align="right")]
+    dt[, (paste0(pfx,"oil_rmean8")) := frollmean(pb, 8, na.rm=TRUE, align="right")]
+    dt[, (paste0(pfx,"oil_cyc"))    := pb - get(paste0(pfx,"oil_rmean8"))]
+    yoy_col <- paste0(pfx, "yoy_oil")
+    cat(sprintf("  [%s] pbrent YoY oil: mean=%+.1f%%  min=%+.1f%%  max=%+.1f%%\n",
+                pfx,
+                mean(dt[[yoy_col]], na.rm=TRUE),
+                min(dt[[yoy_col]], na.rm=TRUE),
+                max(dt[[yoy_col]], na.rm=TRUE)))
+    cat(sprintf("  [%s] Oil transforms created: YoY, QoQ, pos/neg, lags 1-4, rsd4, cyc\n", pfx))
+  } else {
+    cat(sprintf("  WARN [%s] pbrent not found -- oil transforms skipped\n", pfx))
+  }
+
+  # Yield curve
+  gs10 <- gc("rs10y") %||% gc("gs10")
+  gs3m <- gc("rs3m")  %||% gc("gs3m")
+  if (!is.null(gs10) && !is.null(gs3m)) {
+    dt[, (paste0(pfx,"yield_curve"))     := gs10 - gs3m]
+    dt[, (paste0(pfx,"yield_curve_inv")) := as.integer(gs10 - gs3m < 0)]
+    yc_inv <- sum(dt[[paste0(pfx,"yield_curve_inv")]], na.rm=TRUE)
+    cat(sprintf("  [%s] yield_curve (inverted in %d quarters)\n", pfx, yc_inv))
+  }
+
+  # Real rate
+  rff  <- gc("rff")  %||% gc("fedfunds")
+  pcpi <- gc("pcpi") %||% gc("cpi")
+  if (!is.null(rff) && !is.null(pcpi)) {
+    dt[, (paste0(pfx,"real_rate")) := rff - pcpi]
+    cat(sprintf("  [%s] real_rate (rff - pcpi)\n", pfx))
+  }
+
+  # FOMC regime + hike run
+  if (!is.null(rff)) {
+    chg    <- c(NA, diff(rff))
+    regime <- fifelse(chg >  0.10,  1L,
+               fifelse(chg < -0.10, -1L, 0L))
+    run <- integer(length(regime))
+    for (i in seq_along(regime)) {
+      if (is.na(regime[i]) || regime[i] == 0L) {
+        run[i] <- 0L
+      } else if (i == 1 || is.na(regime[i-1]) || regime[i] != regime[i-1]) {
+        run[i] <- regime[i]
+      } else {
+        run[i] <- run[i-1] + regime[i]
+      }
+    }
+    dt[, (paste0(pfx,"fomc_regime")) := regime]
+    dt[, (paste0(pfx,"hike_run"))    := run]
+    n_hike <- sum(regime ==  1L, na.rm=TRUE)
+    n_cut  <- sum(regime == -1L, na.rm=TRUE)
+    cat(sprintf("  [%s] fomc_regime: %d hike qtrs, %d cut qtrs\n", pfx, n_hike, n_cut))
+  }
+
+  # CPI YoY
+  if (!is.null(pcpi)) {
+    dt[, (paste0(pfx,"cpi_yoy")) := (pcpi - shift(pcpi,4)) / shift(pcpi,4) * 100]
+    cat(sprintf("  [%s] cpi_yoy\n", pfx))
+  }
+
+  invisible(dt)
+}
+
+add_macro_derived(macro_base,   "macro_base_")
+cat("\n")
+add_macro_derived(macro_severe, "macro_severe_")
+
+saveRDS(macro_base,   "Data/macro_base.rds")
+saveRDS(macro_severe, "Data/macro_severe.rds")
+cat("\n  Saved: macro_base.rds and macro_severe.rds (with derived vars)\n")
+log_checkpoint("CK-27: Derived macro vars", "PASS",
+               "Oil transforms, yield curve, FOMC regime for both scenarios")
+
+# ============================================================================
+# SECTION 12: PANEL ASSEMBLY (CU x MACRO)
+# ============================================================================
+section("12", "Panel Assembly -- Call Report x Macro Scenarios")
+
+cat("  Merge key: yyyyqq (integer: year*100+quarter)\n\n")
+
+macro_merge_fn <- function(macro_dt) {
+  drop <- intersect(c("year", "quarter"), names(macro_dt))
+  macro_dt[, !drop, with = FALSE]
+}
+
+panel_base   <- merge(cr, macro_merge_fn(macro_base),   by = "yyyyqq", all.x = TRUE)
+panel_severe <- merge(cr, macro_merge_fn(macro_severe),  by = "yyyyqq", all.x = TRUE)
+
+for (nm in c("macro_base_pbrent", "macro_severe_pbrent")) {
+  pnl <- if (grepl("base", nm)) panel_base else panel_severe
+  if (nm %in% names(pnl)) {
+    v    <- pnl[[nm]]
+    n_ok <- sum(!is.na(v))
+    cat(sprintf("  %-28s  coverage: %s / %s (%.1f%%)  min=%5.1f  max=%5.1f\n",
+                nm,
+                format(n_ok, big.mark = ","),
+                format(nrow(pnl), big.mark = ","),
+                n_ok / nrow(pnl) * 100,
+                min(v, na.rm=TRUE), max(v, na.rm=TRUE)))
+  }
+}
+
+cat(sprintf("\n  panel_base   : %s rows x %d cols\n",
+            format(nrow(panel_base), big.mark = ","), ncol(panel_base)))
+cat(sprintf("  panel_severe : %s rows x %d cols\n",
+            format(nrow(panel_severe), big.mark = ","), ncol(panel_severe)))
+
+log_checkpoint("CK-28: Panel assembly", "PASS",
+               sprintf("base=%s rows, severe=%s rows",
+                       format(nrow(panel_base), big.mark = ","),
+                       format(nrow(panel_severe), big.mark = ",")))
+
+# ============================================================================
+# SECTION 13: OIL EXPOSURE MERGE (from 01b_oil_exposure_v2.R)
+# ============================================================================
+section("13", "Oil Exposure Merge")
+
+cat("  Source: Data/oil_exposure.rds  (built by 01b_oil_exposure_v2.R)\n")
+cat("  Join  : state_code x yyyyqq\n\n")
+
+merge_exposure <- function(pnl, exp_dt, sc) {
+  if (is.na(sc)) {
+    cat("  WARNING: no state column -- skipping exposure merge\n")
+    return(pnl)
+  }
+  exp_data_cols <- setdiff(names(exp_dt), c("state_code", "yyyyqq"))
+  stale <- intersect(exp_data_cols, names(pnl))
+  if (length(stale)) pnl[, (stale) := NULL]
+
+  pnl[,    (sc) := as.character(get(sc))]
+  exp_dt[, state_code := as.character(state_code)]
+  pnl[,    yyyyqq := as.integer(yyyyqq)]
+  exp_dt[, yyyyqq := as.integer(yyyyqq)]
+
+  out <- merge(pnl, exp_dt,
+               by.x = c(sc, "yyyyqq"),
+               by.y = c("state_code", "yyyyqq"),
+               all.x = TRUE)
+
+  fill_zero <- c("oil_exposure_bin", "oil_exposure_cont",
+                 "oil_exposure_bin_1pct", "oil_exposure_bin_3pct",
+                 "spillover_exposure", "spillover_exposure_wtd")
+  for (col in intersect(fill_zero, names(out)))
+    out[is.na(get(col)), (col) := 0]
+
+  if ("oil_exposure_bin" %in% names(out))
+    out[, oil_exposure_idx := oil_exposure_bin]
+
+  out[]
+}
+
+if (file.exists("Data/oil_exposure.rds")) {
+  exp_dt   <- setDT(readRDS("Data/oil_exposure.rds"))
+  exp_keep <- intersect(
+    c("state_code","yyyyqq","mining_emp_share","oil_exposure_cont",
+      "oil_exposure_bin","oil_exposure_bin_1pct","oil_exposure_bin_3pct",
+      "oil_exposure_tier","oil_exposure_smooth","oil_bartik_iv",
+      "spillover_exposure","spillover_exposure_wtd","cu_group"),
+    names(exp_dt)
+  )
+  exp_merge_dt <- exp_dt[, ..exp_keep]
+
+  cat(sprintf("  oil_exposure.rds: %s rows x %d cols\n",
+              format(nrow(exp_merge_dt), big.mark = ","), ncol(exp_merge_dt)))
+  cat(sprintf("  Exposure cols: %s\n\n",
+              paste(setdiff(exp_keep, c("state_code","yyyyqq")), collapse = ", ")))
+
+  cr           <- merge_exposure(cr,           exp_merge_dt, state_col)
+  panel_base   <- merge_exposure(panel_base,   exp_merge_dt, state_col)
+  panel_severe <- merge_exposure(panel_severe, exp_merge_dt, state_col)
+
+  cat(sprintf("  cr           : %s rows x %d cols\n",
+              format(nrow(cr),           big.mark = ","), ncol(cr)))
+  cat(sprintf("  panel_base   : %s rows x %d cols\n",
+              format(nrow(panel_base),   big.mark = ","), ncol(panel_base)))
+  cat(sprintf("  panel_severe : %s rows x %d cols\n",
+              format(nrow(panel_severe), big.mark = ","), ncol(panel_severe)))
+
+  if ("cu_group" %in% names(panel_base)) {
+    cat("\n  CU group distribution (panel_base):\n")
+    grp <- panel_base[, .N, by = cu_group][order(cu_group)]
+    for (i in seq_len(nrow(grp))) {
+      cat(sprintf("    %-20s : %s (%.1f%%)\n",
+                  as.character(grp$cu_group[i]),
+                  format(grp$N[i], big.mark = ","),
+                  grp$N[i] / nrow(panel_base) * 100))
     }
   }
-  n_na_tier <- panel[is.na(asset_tier), .N]
-  if (n_na_tier > 0) cat(sprintf("  %-6s  %10s  %7.1f%%  (zero/NA assets)\n",
-                                  "NA", format(n_na_tier, big.mark = ","),
-                                  n_na_tier / nrow(panel) * 100))
+  log_checkpoint("CK-29: Oil exposure merged", "PASS",
+                 sprintf("From oil_exposure.rds -- %d exposure cols",
+                         length(exp_keep) - 2))
 
-  log_checkpoint("CK-24: Asset tier assignment", "PASS",
-                 sprintf("5 tiers assigned, %d NA", n_na_tier))
 } else {
-  panel[, asset_tier := NA_character_]
-  log_checkpoint("CK-24: Asset tier assignment", "WARN",
-                 "No asset column found — all tiers set to NA")
+  cat("  WARNING: Data/oil_exposure.rds NOT FOUND\n")
+  cat("  Run 01b_oil_exposure_v2.R first, then re-run this script\n")
+  cat("  Fallback: Provisional binary flag from hard-coded state list\n\n")
+
+  if (!is.na(state_col)) {
+    for (pnl_nm in c("cr", "panel_base", "panel_severe")) {
+      pnl <- get(pnl_nm)
+      pnl[, oil_exposure_idx  := as.integer(toupper(get(state_col)) %in% OIL_STATES_PRELIM)]
+      pnl[, oil_exposure_cont := as.numeric(oil_exposure_idx)]
+      pnl[, spillover_exposure := 0]
+      pnl[, cu_group := fifelse(oil_exposure_idx == 1L, "Direct", "Indirect")]
+      assign(pnl_nm, pnl)
+    }
+    cat("  Provisional oil_exposure_idx set from hard-coded state list\n")
+  }
+  log_checkpoint("CK-29: Oil exposure merged", "WARN",
+                 "oil_exposure.rds not found -- provisional binary flag used")
 }
 
 # ============================================================================
-# SECTION 13: TIME VARIABLES AND STRUCTURAL BREAK FLAG
+# SECTION 14: INTERACTION TERMS
 # ============================================================================
-section("13", "Time Variables and Structural Break Flag")
+section("14", "Interaction Terms")
 
-panel[, year     := year(date)]
-panel[, qtr      := quarter(date)]
-panel[, post2015 := as.integer(date >= as.Date("2015-01-01"))]
-panel[, t        := as.integer(factor(date))]   # integer time index (1, 2, 3...)
+cat("  Direct channel  : oil_x_brent         = oil_exposure_cont x macro_*_yoy_oil\n")
+cat("  Binary direct   : oil_x_brent_bin      = oil_exposure_bin  x macro_*_yoy_oil\n")
+cat("  Bartik IV       : bartik_x_brent       = oil_bartik_iv     x macro_*_yoy_oil\n")
+cat("  Indirect channel: spillover_x_brent    = spillover_exposure x macro_*_yoy_oil\n")
+cat("  FOMC channel    : fomc_x_brent         = fomc_regime        x macro_*_yoy_oil\n\n")
 
-cat("  Variables created:\n")
-cat("    year     : calendar year from date\n")
-cat("    qtr      : quarter (1–4)\n")
-cat("    post2015 : 1 if date >= 2015-01-01  [STRUCTURAL BREAK — v1 finding]\n")
-cat("    t        : integer time index (1=earliest quarter)\n\n")
+add_interactions <- function(pnl, oil_yoy_col) {
+  if (!oil_yoy_col %in% names(pnl)) {
+    cat(sprintf("  SKIP interactions: '%s' not in panel\n", oil_yoy_col))
+    return(invisible(pnl))
+  }
+  oy <- pnl[[oil_yoy_col]]
+  cat(sprintf("  Oil YoY col: %s  |  mean=%+.2f%%  min=%+.2f%%  max=%+.2f%%\n",
+              oil_yoy_col,
+              mean(oy, na.rm=TRUE), min(oy, na.rm=TRUE), max(oy, na.rm=TRUE)))
 
-cat(sprintf("  post2015 == 0 (pre-shale revolution) : %s CU-quarters\n",
-            format(panel[post2015 == 0, .N], big.mark = ",")))
-cat(sprintf("  post2015 == 1 (post-shale revolution): %s CU-quarters\n",
-            format(panel[post2015 == 1, .N], big.mark = ",")))
-cat(sprintf("  First t value : %d (= %s)\n", min(panel$t), format(min(panel$date))))
-cat(sprintf("  Last  t value : %d (= %s)\n", max(panel$t), format(max(panel$date))))
-
-# Confirm 2015Q1 cutoff falls in the data
-if (as.Date("2015-01-01") < date_min || as.Date("2015-01-01") > date_max) {
-  log_checkpoint("CK-25: 2015Q1 in date range", "WARN",
-                 "2015Q1 outside data range — post2015 flag may be all 0 or all 1")
-} else {
-  log_checkpoint("CK-25: 2015Q1 in date range", "PASS",
-                 sprintf("post2015: %d pre, %d post",
-                         panel[post2015 == 0, .N],
-                         panel[post2015 == 1, .N]))
+  if ("oil_exposure_cont" %in% names(pnl)) {
+    pnl[, oil_x_brent := oil_exposure_cont * oy]
+    cat("    oil_x_brent created\n")
+  }
+  if ("oil_exposure_bin" %in% names(pnl)) {
+    pnl[, oil_x_brent_bin := oil_exposure_bin * oy]
+    cat("    oil_x_brent_bin created\n")
+  }
+  if ("oil_bartik_iv" %in% names(pnl)) {
+    pnl[, bartik_x_brent := oil_bartik_iv * oy]
+    cat("    bartik_x_brent created\n")
+  }
+  if ("spillover_exposure" %in% names(pnl)) {
+    pnl[, spillover_x_brent := spillover_exposure * oy]
+    cat("    spillover_x_brent created\n")
+  }
+  if ("spillover_exposure_wtd" %in% names(pnl)) {
+    pnl[, spillover_wtd_x_brent := spillover_exposure_wtd * oy]
+    cat("    spillover_wtd_x_brent created\n")
+  }
+  fomc_col <- sub("yoy_oil", "fomc_regime", oil_yoy_col)
+  if (fomc_col %in% names(pnl)) {
+    pnl[, fomc_x_brent := get(fomc_col) * oy]
+    cat("    fomc_x_brent created\n")
+  }
+  invisible(pnl)
 }
 
+cat("  --- Baseline scenario ---\n")
+add_interactions(panel_base,   "macro_base_yoy_oil")
+cat("\n  --- Severely adverse scenario ---\n")
+add_interactions(panel_severe, "macro_severe_yoy_oil")
+
+log_checkpoint("CK-30: Interaction terms", "PASS",
+               "oil_x_brent, spillover_x_brent, fomc_x_brent for both panels")
+
 # ============================================================================
-# SECTION 14: PANEL BALANCE DIAGNOSTICS
+# SECTION 15: SAVE FINAL PANELS
 # ============================================================================
-section("14", "Panel Balance Diagnostics")
+section("15", "Save Final Panels")
 
-cat("  Checking for unbalanced panel issues...\n\n")
+setorderv(cr,           c("join_number","year","quarter"))
+setorderv(panel_base,   c("join_number","year","quarter"))
+setorderv(panel_severe, c("join_number","year","quarter"))
 
-# Observations per CU
-obs_per_cu <- panel[, .N, by = join_number]
-cat(sprintf("  Obs per CU — min: %d  median: %.0f  mean: %.1f  max: %d\n",
-            min(obs_per_cu$N), median(obs_per_cu$N),
-            mean(obs_per_cu$N), max(obs_per_cu$N)))
+saveRDS(cr,           "Data/call_clean.rds")
+saveRDS(panel_base,   "Data/panel_base.rds")
+saveRDS(panel_severe, "Data/panel_severe.rds")
 
-# Short-panel CUs (fewer than 4 quarters — insufficient for lags)
-n_short <- obs_per_cu[N < 4, .N]
-cat(sprintf("  CUs with < 4 quarters (lag-limited): %d (%.1f%% of CUs)\n",
-            n_short, n_short / nrow(obs_per_cu) * 100))
+cat(sprintf("  %-20s  %s rows x %d cols  %.1f MB\n", "call_clean.rds",
+            format(nrow(cr),big.mark=","), ncol(cr),
+            file.size("Data/call_clean.rds")/1e6))
+cat(sprintf("  %-20s  %s rows x %d cols  %.1f MB\n", "panel_base.rds",
+            format(nrow(panel_base),big.mark=","), ncol(panel_base),
+            file.size("Data/panel_base.rds")/1e6))
+cat(sprintf("  %-20s  %s rows x %d cols  %.1f MB\n", "panel_severe.rds",
+            format(nrow(panel_severe),big.mark=","), ncol(panel_severe),
+            file.size("Data/panel_severe.rds")/1e6))
 
-# CUs per quarter
-cu_per_qtr <- panel[, .(n_cu = uniqueN(join_number)), by = yyyyqq]
-setorder(cu_per_qtr, yyyyqq)
-cat(sprintf("\n  CUs per quarter — min: %d  median: %.0f  mean: %.1f  max: %d\n",
-            min(cu_per_qtr$n_cu), median(cu_per_qtr$n_cu),
-            mean(cu_per_qtr$n_cu), max(cu_per_qtr$n_cu)))
+log_checkpoint("CK-31: Final panels saved", "PASS",
+               "call_clean.rds, panel_base.rds, panel_severe.rds")
 
-# Quarters with big drops in CU count (potential data issues)
-cu_per_qtr[, n_cu_lag := shift(n_cu, 1L)]
-cu_per_qtr[, drop_pct := (n_cu - n_cu_lag) / n_cu_lag * 100]
-big_drops <- cu_per_qtr[!is.na(drop_pct) & drop_pct < -5]
-if (nrow(big_drops) > 0) {
-  cat("\n  Quarters with >5% drop in CU count (investigate):\n")
-  print(big_drops[, .(yyyyqq, n_cu, n_cu_lag, drop_pct)])
-  log_checkpoint("CK-26: Panel CU count stability", "WARN",
-                 sprintf("%d quarters with >5%% CU count drop", nrow(big_drops)))
-} else {
-  log_checkpoint("CK-26: Panel CU count stability", "PASS",
-                 "No quarters with >5% drop in CU count")
-}
+# ============================================================================
+# SECTION 16: DATA QUALITY REPORT
+# ============================================================================
+section("16", "Data Quality Report")
 
-# State coverage
-if ("reporting_state" %in% names(panel)) {
-  n_states_panel <- uniqueN(panel$reporting_state)
-  cat(sprintf("\n  States represented: %d\n", n_states_panel))
-  if (n_states_panel < 48) {
-    log_checkpoint("CK-27: State coverage", "WARN",
-                   sprintf("Only %d states — may affect oil-state classification", n_states_panel))
-  } else {
-    log_checkpoint("CK-27: State coverage", "PASS",
-                   sprintf("%d states", n_states_panel))
+cat("  CALL REPORT SUMMARY\n")
+cat(sprintf("  %-22s : %s\n", "CU-quarter obs",
+            format(nrow(cr), big.mark = ",")))
+cat(sprintf("  %-22s : %s\n", "Unique CUs",
+            format(uniqueN(cr$join_number), big.mark = ",")))
+cat(sprintf("  %-22s : %dQ%d -- %dQ%d\n", "Quarter range",
+            min(cr$year), cr[which.min(yyyyqq), quarter],
+            max(cr$year), cr[which.max(yyyyqq), quarter]))
+
+if ("asset_tier" %in% names(cr)) {
+  cat("\n  Asset tiers:\n")
+  tier_tbl <- cr[, .N, by = asset_tier][order(asset_tier)]
+  for (i in seq_len(nrow(tier_tbl))) {
+    cat(sprintf("    %-20s : %s (%.1f%%)\n",
+                as.character(tier_tbl$asset_tier[i]),
+                format(tier_tbl$N[i], big.mark = ","),
+                tier_tbl$N[i] / nrow(cr) * 100))
   }
 }
 
-# ============================================================================
-# SECTION 15: FINAL PANEL SUMMARY
-# ============================================================================
-section("15", "Final Panel Summary")
-
-cat(sprintf("  Total rows             : %s\n", format(nrow(panel), big.mark = ",")))
-cat(sprintf("  Total columns          : %d\n", ncol(panel)))
-cat(sprintf("  Unique CUs             : %s\n", format(uniqueN(panel$join_number), big.mark = ",")))
-cat(sprintf("  Unique quarters        : %d\n", uniqueN(panel$yyyyqq)))
-cat(sprintf("  Date range             : %s  to  %s\n", format(date_min), format(date_max)))
-cat(sprintf("  Object size            : %.1f MB\n", object.size(panel) / 1e6))
-cat(sprintf("  post2015 == 0 rows     : %s\n", format(panel[post2015==0, .N], big.mark=",")))
-cat(sprintf("  post2015 == 1 rows     : %s\n", format(panel[post2015==1, .N], big.mark=",")))
-cat(sprintf("  first_obs_flag == 1    : %s\n", format(panel[first_obs_flag==1, .N], big.mark=",")))
-cat(sprintf("  cecl_flag == 1         : %s\n", format(panel[cecl_flag==1, .N], big.mark=",")))
-
-cat("\n  Outcome variables in final panel:\n")
-cat(sprintf("  %-28s  %8s  %8s\n", "Variable", "N (valid)", "% Valid"))
-cat(sprintf("  %s\n", paste(rep("-", 52), collapse = "")))
-for (v in present_outcomes) {
-  n_v   <- sum(!is.na(panel[[v]]))
-  pct_v <- n_v / nrow(panel) * 100
-  cat(sprintf("  %-28s  %8s  %7.1f%%\n",
-              v, format(n_v, big.mark = ","), pct_v))
-}
-
-cat("\n  Lag variables in final panel:\n")
-cat(sprintf("  %-28s  %8s  %8s\n", "Variable", "N (valid)", "% Valid"))
-cat(sprintf("  %s\n", paste(rep("-", 52), collapse = "")))
-for (v in present_outcomes) {
-  lag_nm <- paste0(v, "_lag1")
-  if (lag_nm %in% names(panel)) {
-    n_v   <- sum(!is.na(panel[[lag_nm]]))
-    pct_v <- n_v / nrow(panel) * 100
-    cat(sprintf("  %-28s  %8s  %7.1f%%\n",
-                lag_nm, format(n_v, big.mark = ","), pct_v))
+if ("cu_group" %in% names(cr)) {
+  cat("\n  CU exposure groups:\n")
+  grp_tbl <- cr[, .N, by = cu_group][order(cu_group)]
+  for (i in seq_len(nrow(grp_tbl))) {
+    cat(sprintf("    %-20s : %s (%.1f%%)\n",
+                as.character(grp_tbl$cu_group[i]),
+                format(grp_tbl$N[i], big.mark = ","),
+                grp_tbl$N[i] / nrow(cr) * 100))
   }
 }
 
+# PBRENT range
+cat("\n  FRB MACRO PBRENT ($/bbl)\n")
+for (nm in c("macro_base_pbrent", "macro_severe_pbrent")) {
+  pnl <- if (grepl("base", nm)) panel_base else panel_severe
+  if (nm %in% names(pnl)) {
+    v <- pnl[[nm]]
+    cat(sprintf("  %-30s : min=%5.1f  max=%5.1f  latest=%5.1f\n",
+                nm,
+                min(v, na.rm = TRUE),
+                max(v, na.rm = TRUE),
+                v[max(which(!is.na(v)))]))
+  }
+}
+
+# Missingness table
+cat("\n  KEY VARIABLE MISSINGNESS (panel_base)\n")
+check_vars <- c(
+  "join_number","year","quarter",
+  "netintmrg","networth","pcanetworth","costfds","roa",
+  "dq_rate","chg_tot_lns_ratio",
+  "insured_tot","dep_shrcert","acct_018","members",
+  "insured_share_growth","cert_share","loan_to_share",
+  "dep_growth_yoy","member_growth_yoy","pll_rate","pll_per_loan","nim_spread",
+  "macro_base_pbrent","macro_base_lurc","macro_base_pcpi",
+  "macro_base_rmtg","macro_base_phpi","macro_base_yoy_oil",
+  "macro_base_yield_curve","macro_base_fomc_regime",
+  "oil_exposure_cont","oil_exposure_bin","spillover_exposure",
+  "oil_x_brent","spillover_x_brent","fomc_x_brent","oil_bartik_iv"
+)
+fv  <- intersect(check_vars, names(panel_base))
+pct <- sapply(panel_base[, ..fv], function(x) round(mean(is.na(x)) * 100, 1))
+miss_tbl <- data.table(variable = names(pct), pct_missing = pct)[order(-pct_missing)]
+
+cat(sprintf("\n  %-34s  %s\n", "Variable", "% Missing"))
+cat(sprintf("  %s\n", paste(rep("-", 46), collapse = "")))
+for (i in seq_len(nrow(miss_tbl))) {
+  flag <- if (miss_tbl$pct_missing[i] > 20) "  <- HIGH"
+          else if (miss_tbl$pct_missing[i] > 5) "  <- NOTE"
+          else ""
+  cat(sprintf("  %-34s  %5.1f%%%s\n",
+              miss_tbl$variable[i], miss_tbl$pct_missing[i], flag))
+}
+
+log_checkpoint("CK-32: Data quality report", "PASS",
+               sprintf("%d variables checked", nrow(miss_tbl)))
+
 # ============================================================================
-# SECTION 16: CHECKPOINT SUMMARY
+# SECTION 17: SAVE AUDIT FILES
 # ============================================================================
-section("16", "Checkpoint Summary")
+section("17", "Save Audit Files")
+
+outlier_dt <- rbindlist(OUTLIER_RECORDS, fill = TRUE)
+fwrite(outlier_dt, file.path(RESULTS_DIR, "01_outlier_log.csv"))
+cat(sprintf("  Saved: Results/01_outlier_log.csv  (%d variable records)\n",
+            nrow(outlier_dt)))
+
+ALL_OUT_VARS <- intersect(
+  c("insured_share_growth","dep_growth_yoy","cert_growth_yoy",
+    "member_growth_yoy","pll_rate","pll_per_loan","cert_share",
+    "loan_to_share","nim_spread","netintmrg","pcanetworth",
+    "costfds","roa","dq_rate","chg_tot_lns_ratio"),
+  names(panel_base)
+)
+
+var_summ <- rbindlist(lapply(ALL_OUT_VARS, function(v) {
+  x  <- panel_base[[v]]
+  qs <- tryCatch(
+    quantile(x, c(0.01,.10,.25,.50,.75,.90,.99), na.rm = TRUE),
+    error = function(e) rep(NA_real_, 7)
+  )
+  data.table(
+    variable = v,
+    n        = sum(!is.na(x)),
+    pct_miss = round(mean(is.na(x)) * 100, 2),
+    mean     = round(mean(x, na.rm=TRUE), 6),
+    sd       = round(sd(x, na.rm=TRUE), 6),
+    p01 = round(qs[1],6), p10 = round(qs[2],6), p25 = round(qs[3],6),
+    p50 = round(qs[4],6), p75 = round(qs[5],6), p90 = round(qs[6],6),
+    p99 = round(qs[7],6)
+  )
+}))
+
+fwrite(var_summ, file.path(RESULTS_DIR, "01_variable_summary.csv"))
+cat(sprintf("  Saved: Results/01_variable_summary.csv  (%d variables)\n",
+            nrow(var_summ)))
+
+log_checkpoint("CK-33: Audit files saved", "PASS",
+               "01_outlier_log.csv, 01_variable_summary.csv")
+
+# ============================================================================
+# SECTION 18: CHECKPOINT SUMMARY
+# ============================================================================
+section("18", "Checkpoint Summary")
 
 n_pass <- sum(CHKPT_LOG$status == "PASS")
 n_warn <- sum(CHKPT_LOG$status == "WARN")
 n_fail <- sum(CHKPT_LOG$status == "FAIL")
 n_info <- sum(CHKPT_LOG$status == "INFO")
 
-cat(sprintf("  Total checkpoints  : %d\n", nrow(CHKPT_LOG)))
-cat(sprintf("  PASS               : %d\n", n_pass))
-cat(sprintf("  WARN               : %d\n", n_warn))
-cat(sprintf("  FAIL               : %d  (script would have halted)\n", n_fail))
-cat(sprintf("  INFO               : %d\n", n_info))
+cat(sprintf("  Total: %d  |  PASS: %d  |  WARN: %d  |  FAIL: %d  |  INFO: %d\n",
+            nrow(CHKPT_LOG), n_pass, n_warn, n_fail, n_info))
 
 if (n_warn > 0) {
   cat("\n  Warnings requiring attention:\n")
   for (i in which(CHKPT_LOG$status == "WARN")) {
     cat(sprintf("    ! %s\n", CHKPT_LOG$checkpoint[i]))
     if (nchar(CHKPT_LOG$detail[i]) > 0)
-      cat(sprintf("      └─ %s\n", CHKPT_LOG$detail[i]))
+      cat(sprintf("      => %s\n", CHKPT_LOG$detail[i]))
   }
 }
 
@@ -1289,34 +1481,36 @@ fwrite(as.data.table(CHKPT_LOG),
 cat(sprintf("\n  Checkpoint log saved: Results/01_checkpoint_log.csv\n"))
 
 # ============================================================================
-# SECTION 17: SAVE
-# ============================================================================
-section("17", "Save Output")
-
-if (!dir.exists(DATA_DIR)) dir.create(DATA_DIR, recursive = TRUE)
-
-t_save <- system.time({
-  saveRDS(panel, file.path(DATA_DIR, "01_panel_clean.rds"))
-})
-
-fsize <- round(file.size(file.path(DATA_DIR, "01_panel_clean.rds")) / 1e6, 1)
-cat(sprintf("  Saved : Data/01_panel_clean.rds\n"))
-cat(sprintf("  Size  : %.1f MB\n", fsize))
-cat(sprintf("  Time  : %.1f seconds\n", t_save["elapsed"]))
-
-log_checkpoint("CK-28: File saved", "PASS",
-               sprintf("Data/01_panel_clean.rds — %.1f MB", fsize))
-
-# ============================================================================
 # CLOSING BANNER
 # ============================================================================
 cat("\n", SEP, "\n", sep = "")
 cat("  SCRIPT 01 COMPLETE\n")
-cat(sprintf("  Finished  : %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
-cat("\n  Output files:\n")
-cat("    Data/01_panel_clean.rds          — Main panel for Script 02\n")
-cat("    Results/01_outlier_log.csv       — Every obs winsorized (CU + quarter + value)\n")
-cat("    Results/01_variable_summary.csv  — Pre/post-winsorization stats\n")
-cat("    Results/01_checkpoint_log.csv    — All checkpoint pass/warn/fail records\n")
+cat(sprintf("  Finished : %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
+cat("\n  Data outputs:\n")
+cat("    Data/call_clean.rds      CU panel + derived vars + oil exposure\n")
+cat("    Data/macro_base.rds      Baseline macro (macro_base_ prefix)\n")
+cat("    Data/macro_severe.rds    Severely adverse (macro_severe_ prefix)\n")
+cat("    Data/panel_base.rds      Full panel: CU x macro_base + interactions\n")
+cat("    Data/panel_severe.rds    Full panel: CU x macro_severe\n")
+cat("\n  Audit outputs:\n")
+cat("    Results/01_outlier_log.csv       Winsorization summary per variable\n")
+cat("    Results/01_variable_summary.csv  Post-cleaning distributional stats\n")
+cat("    Results/01_checkpoint_log.csv    All checkpoint pass/warn/fail records\n")
+cat("\n  CU-level derived variables:\n")
+cat("    insured_share_growth  YoY change in insured shares  [#1 SHAP outcome, v1]\n")
+cat("    dep_growth_yoy        YoY change in total deposits (acct_018)\n")
+cat("    cert_growth_yoy       YoY change in certificate shares\n")
+cat("    member_growth_yoy     YoY change in membership\n")
+cat("    cert_share            Certificate share of deposits (0-1, bounded)\n")
+cat("    loan_to_share         Loan-to-share ratio (0-2, bounded)\n")
+cat("    nim_spread            yldavgloans - costfds\n")
+cat("    pll_rate              pll/avg(lns_tot) x100 (bounded [-2,5], winsorised)\n")
+cat("    pll_per_loan          pll/lns_tot_n ($ per loan count)\n")
+cat("\n  Direct/indirect effect interactions (both scenarios):\n")
+cat("    oil_x_brent           oil_exposure_cont x yoy_oil\n")
+cat("    oil_x_brent_bin       oil_exposure_bin  x yoy_oil\n")
+cat("    bartik_x_brent        oil_bartik_iv     x yoy_oil\n")
+cat("    spillover_x_brent     spillover_exposure x yoy_oil\n")
+cat("    fomc_x_brent          fomc_regime        x yoy_oil\n")
 cat(sprintf("\n  Checkpoints: %d PASS | %d WARN | %d FAIL\n", n_pass, n_warn, n_fail))
 cat(SEP, "\n", sep = "")
