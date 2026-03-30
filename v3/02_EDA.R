@@ -345,6 +345,20 @@ agg_group <- function(dt, vars, group_col, by_vars = c("yyyyqq", group_col)) {
   ][order(yyyyqq)]
 }
 
+# Median-based aggregation for tier charts -- robust to small-CU outliers.
+# T1 (<$10M) CUs have extreme ratios due to single-employer concentration;
+# unweighted mean is distorted by a handful of outlier CUs within the tier.
+# Median gives the central tendency of the typical CU in each tier.
+agg_group_median <- function(dt, vars, group_col, by_vars = c("yyyyqq", group_col)) {
+  dt[!is.na(get(group_col)),
+     c(list(cal_date = first(cal_date), year = first(year),
+             quarter  = first(quarter),
+             n_cus    = .N),
+        lapply(.SD, function(x) median(x, na.rm = TRUE))),
+     by = by_vars, .SDcols = intersect(vars, names(dt))
+  ][order(yyyyqq)]
+}
+
 agg <- agg_quarter(panel, cu_outcomes)
 agg <- merge(agg, mac_spine[, .(yyyyqq, pbrent, yoy_oil)],
              by = "yyyyqq", all.x = TRUE)
@@ -705,7 +719,10 @@ hdr("CHART 06: Asset tier response (8-tier assets_cat2)")
 tier_col_06 <- "tier_norm"
 
 if (any(!is.na(panel$tier_norm))) {
-  tier_agg <- agg_group(panel,
+  # Use median aggregation -- T1 (<$10M) unweighted mean is severely distorted
+  # by outlier CUs (single-employer SEGs with extreme ratios).
+  # Median gives the central tendency of the typical CU within each tier.
+  tier_agg <- agg_group_median(panel,
                          intersect(c("dq_rate","netintmrg","costfds",
                                      "cert_share","insured_share_growth",
                                      "member_growth_yoy","pll_rate",
@@ -714,6 +731,21 @@ if (any(!is.na(panel$tier_norm))) {
                          "tier_norm")
   tier_agg <- merge(tier_agg, mac_spine[, .(yyyyqq, pbrent, yoy_oil)],
                     by = "yyyyqq", all.x = TRUE)
+
+  # Diagnostic: compare T1 mean vs median for key outcomes to verify robustness
+  cat("
+  Chart 06 -- T1 (<$10M) mean vs median diagnostic (dq_rate, netintmrg):
+")
+  t1_diag <- panel[tier_norm == "T1_under10M" & !is.na(dq_rate),
+                    .(mean_dq  = round(mean(dq_rate,   na.rm=TRUE), 4),
+                      median_dq = round(median(dq_rate, na.rm=TRUE), 4),
+                      mean_nim  = round(mean(netintmrg, na.rm=TRUE), 4),
+                      median_nim = round(median(netintmrg, na.rm=TRUE), 4),
+                      n_cus     = uniqueN(join_number))]
+  print(t1_diag)
+  cat("  (Large mean-median gap = outliers present; median is the right choice)
+
+")
 
   tier_var_06    <- "tier_norm"
   tier_cols_use  <- TIER_COLS[intersect(names(TIER_COLS),
@@ -766,8 +798,9 @@ if (any(!is.na(panel$tier_norm))) {
       plot_annotation(
         title    = "FIGURE 06 -- CU Outcomes by Asset Tier -- 8-Tier assets_cat2 (2005-2025)",
         subtitle = paste("T1 <$10M | T2 $10-50M | T3 $50-100M | T4 $100-500M |",
-                         "T5 $500M-$1B | T6 $1-5B | T7 $5-10B | T8 >$10B"),
-        caption  = "Source: NCUA Form 5300 Call Report | assets_cat2 from OCE_combined",
+                         "T5 $500M-$1B | T6 $1-5B | T7 $5-10B | T8 >$10B",
+                         "| Lines = MEDIAN per tier (robust to small-CU outliers)"),
+        caption  = "Source: NCUA Form 5300 Call Report | Median used: T1 outliers (single-employer SEGs) distort mean",
         theme    = theme(plot.title    = element_text(face = "bold", size = 12),
                          plot.subtitle = element_text(size = 8.5, colour = "#555"))
       )
@@ -1136,7 +1169,7 @@ if ("member_growth_yoy" %in% names(panel)) {
 hdr("CHART NEW-C: Membership growth by asset tier")
 
 if ("member_growth_yoy" %in% names(panel) && any(!is.na(panel$tier_norm))) {
-  tier_mem <- agg_group(panel, "member_growth_yoy", "tier_norm")
+  tier_mem <- agg_group_median(panel, "member_growth_yoy", "tier_norm")
   tier_mem <- merge(tier_mem, mac_spine[, .(yyyyqq, yoy_oil)],
                     by = "yyyyqq", all.x = TRUE)
   tier_mem_col <- "tier_norm"
@@ -1301,7 +1334,7 @@ if ("pll_rate" %in% names(panel)) {
 
   # By tier
   pll_tier <- if (any(!is.na(panel$tier_norm))) {
-    tier_pll <- agg_group(panel, "pll_rate", "tier_norm")
+    tier_pll <- agg_group_median(panel, "pll_rate", "tier_norm")
     tc_pll    <- "tier_norm"
     tc_use_pll <- TIER_COLS[intersect(names(TIER_COLS), levels(panel$tier_norm))]
     ggplot(tier_pll[!is.na(pll_rate) & !is.na(tier_norm)],
