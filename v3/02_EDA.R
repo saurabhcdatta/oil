@@ -224,94 +224,47 @@ add_date <- function(dt) {
 }
 add_date(panel); add_date(macro)
 
-# ── Normalise tier column to canonical T-codes ────────────────────────────────
-# assets_cat2 may arrive as: integer codes (Stata after zap_labels),
-# string labels ("Assets < 10 million"), or already T-codes ("T1_under10M").
-# This block normalises everything to T-codes used throughout all charts.
+# ── Tier column setup ─────────────────────────────────────────────────────────
+# Script 01 now builds asset_tier directly from assets_tot (no Stata encoding
+# dependency) -- guaranteed to be a clean T-code factor with full coverage.
+# tier_norm is just a direct reference to asset_tier; the TIER_LABELS8 lookup
+# table is kept for display labels used in all chart legends and axes.
 
 TIER_LABELS8 <- c(
-  "T1_under10M"  = "< $10M",     "T2_10to50M"   = "$10-50M",
-  "T3_50to100M"  = "$50-100M",   "T4_100to500M" = "$100-500M",
-  "T5_500Mto1B"  = "$500M-$1B",  "T6_1Bto5B"    = "$1-5B",
-  "T7_5Bto10B"   = "$5-10B",     "T8_over10B"   = "> $10B"
+  "T1_under10M"  = "< $10M",      "T2_10to50M"   = "$10-50M",
+  "T3_50to100M"  = "$50-100M",    "T4_100to500M" = "$100-500M",
+  "T5_500Mto1B"  = "$500M-$1B",   "T6_1Bto5B"    = "$1-5B",
+  "T7_5Bto10B"   = "$5-10B",      "T8_over10B"   = "> $10B"
 )
 
-# Integer code -> T-code (Stata value labels 1-8)
-INT_TO_T <- c("1"="T1_under10M","2"="T2_10to50M","3"="T3_50to100M",
-              "4"="T4_100to500M","5"="T5_500Mto1B","6"="T6_1Bto5B",
-              "7"="T7_5Bto10B","8"="T8_over10B")
+T_LEVELS <- names(TIER_LABELS8)   # canonical level order T1 -> T8
 
-# String label -> T-code
-STR_TO_T <- c(
-  "Assets < 10 million"    = "T1_under10M",
-  "10M up to 50M"          = "T2_10to50M",
-  "50M through 100M"       = "T3_50to100M",
-  "Over 100M through 500M" = "T4_100to500M",
-  "Over 500M through 1B"   = "T5_500Mto1B",
-  "Over 1B through 5B"     = "T6_1Bto5B",
-  "Over 5B through 10B"    = "T7_5Bto10B",
-  "Over 10B"               = "T8_over10B"
-)
-
-normalise_tier <- function(x) {
-  xs <- as.character(x)
-  # Already a T-code?
-  ok_t <- xs %in% names(TIER_LABELS8)
-  # Integer string (Stata value labels)?
-  ok_i <- grepl("^[1-8]$", xs) & !ok_t
-  # String label?
-  ok_s <- xs %in% names(STR_TO_T) & !ok_t & !ok_i
-
-  result <- rep(NA_character_, length(xs))
-  result[ok_t] <- xs[ok_t]
-  result[ok_i] <- INT_TO_T[xs[ok_i]]
-  result[ok_s] <- STR_TO_T[xs[ok_s]]
-  factor(result, levels = names(TIER_LABELS8))
-}
-
-# Apply normaliser: try assets_cat2 first (primary source from OCE_combined),
-# then asset_tier (T-codes built in Script 01), then give up.
-# Within each branch, if the result is all-NA, fall through to the next source.
-tier_norm_built <- FALSE
-
-if ("assets_cat2" %in% names(panel)) {
-  cand <- normalise_tier(panel$assets_cat2)
-  if (sum(!is.na(cand)) > 0) {
-    panel[, tier_norm := cand]
-    msg("  Tier column: assets_cat2 -> tier_norm (T-codes) | valid: %s",
-        format(sum(!is.na(cand)), big.mark=","))
-    tier_norm_built <- TRUE
-  } else {
-    msg("  assets_cat2 present but all NA after normalisation -- trying asset_tier")
-  }
-}
-
-if (!tier_norm_built && "asset_tier" %in% names(panel)) {
-  cand <- normalise_tier(panel$asset_tier)
-  if (sum(!is.na(cand)) > 0) {
-    panel[, tier_norm := cand]
-    msg("  Tier column: asset_tier -> tier_norm (T-codes) | valid: %s",
-        format(sum(!is.na(cand)), big.mark=","))
-    tier_norm_built <- TRUE
-  } else {
-    msg("  asset_tier present but all NA after normalisation")
-  }
-}
-
-if (!tier_norm_built) {
-  panel[, tier_norm := factor(NA_character_, levels = names(TIER_LABELS8))]
-  msg("  WARNING: No usable tier column found -- tier_norm set to NA")
-  msg("  Columns checked: assets_cat2, asset_tier")
-  msg("  Check that Script 01 ran successfully and produced at least one tier column")
+if ("asset_tier" %in% names(panel)) {
+  # Primary path: asset_tier built from assets_tot in Script 01
+  panel[, tier_norm := factor(as.character(asset_tier), levels = T_LEVELS)]
+  msg("  Tier column: asset_tier (from assets_tot, Script 01)")
+} else if ("assets_cat2" %in% names(panel)) {
+  # Fallback: assets_cat2 may still be T-codes if Script 01 produced it
+  panel[, tier_norm := factor(as.character(assets_cat2), levels = T_LEVELS)]
+  msg("  Tier column: assets_cat2 (fallback -- rerun Script 01 to use assets_tot)")
+} else {
+  panel[, tier_norm := factor(NA_character_, levels = T_LEVELS)]
+  msg("  WARNING: No tier column found -- check Script 01 ran successfully")
 }
 
 n_na_tier <- sum(is.na(panel$tier_norm))
 n_ok_tier <- sum(!is.na(panel$tier_norm))
-msg("  tier_norm: %s valid | %d NA | levels: %s",
-    format(n_ok_tier, big.mark=","), n_na_tier,
-    paste(levels(panel$tier_norm), collapse=", "))
+msg("  tier_norm: %s valid | %s NA (%.1f%%)",
+    format(n_ok_tier, big.mark=","),
+    format(n_na_tier, big.mark=","),
+    n_na_tier / nrow(panel) * 100)
 msg("  tier_norm distribution:")
 print(panel[, .N, by = tier_norm][order(tier_norm)])
+
+if (n_ok_tier == 0) {
+  msg("  CRITICAL: tier_norm is all NA -- Charts 06/16/22/NEW-C will be blank")
+  msg("  Action: re-run Script 01 with assets_tot present in call_report.rds")
+}
 
 # Macro spine
 mac_spine <- unique(macro[, .(
