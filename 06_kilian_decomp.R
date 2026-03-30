@@ -520,12 +520,398 @@ print(comparison[!is.na(beta_full) & !is.na(beta_geo),
 hdr("SECTION 6: Charts")
 
 THEME <- theme_minimal(base_size=10) +
-  theme(plot.title=element_text(face="bold",size=11,colour="#001f3f"),
-        plot.subtitle=element_text(size=8.5,colour="#444"),
-        plot.caption=element_text(size=7.5,colour="#888",hjust=0),
-        panel.grid.minor=element_blank())
+  theme(plot.title      = element_text(face="bold", size=12, colour="#001f3f"),
+        plot.subtitle   = element_text(size=8.5, colour="#444"),
+        plot.caption    = element_text(size=7.5, colour="#888", hjust=0),
+        panel.grid.minor= element_blank(),
+        legend.position = "bottom",
+        legend.text     = element_text(size=8.5),
+        strip.text      = element_text(face="bold", size=9))
 
-ok <- function(dt) !is.null(dt) && is.data.table(dt) && nrow(dt)>0
+ok <- function(dt) !is.null(dt) && is.data.table(dt) && nrow(dt) > 0
+
+C <- list(navy="#001f3f", teal="#0a9396", amber="#ee9b00",
+          red="#ae2012", green="#2d7a4a", blue="#185FA5",
+          purple="#4a2080", grey="#6c757d")
+
+# ── Chart 1 (IMPROVED): Shock decomposition — exclude supply, fix x-axis ─────
+if (ok(struct_shocks) && length(shock_cols) > 0) {
+  sc_plot <- copy(struct_shocks)
+  # Use numeric quarter index (date parsing unreliable in this context)
+  sc_plot[, qtr_idx := as.numeric(factor(yyyyqq, levels=sort(unique(yyyyqq))))]
+
+  # Only plot demand + geo shocks (supply proxy is near-zero & uninformative)
+  plot_cols <- intersect(c("shock_demand","shock_geo"), names(sc_plot))
+  if (length(plot_cols) > 0) {
+    sh_long <- melt(sc_plot, id.vars=c("yyyyqq","qtr_idx"),
+                    measure.vars=plot_cols,
+                    variable.name="shock", value.name="value")
+    sh_long[, shock_lbl := fcase(
+      shock=="shock_demand", "Aggregate Demand Shock\n(Global business cycle)",
+      shock=="shock_geo",    "Geopolitical/Precautionary Shock\n(Iran-type — current episode)",
+      default=as.character(shock))]
+    sh_long[, shock_lbl := factor(shock_lbl, levels=unique(sh_long$shock_lbl))]
+
+    # Mark key episodes
+    n_q <- max(sc_plot$qtr_idx)
+    episodes <- data.table(
+      label = c("GFC\n2008", "Oil Bust\n2014-16", "COVID\n2020", "Russia-\nUkraine\n2022", "Iran War\n2025-"),
+      xpos  = c(14, 38, 60, 68, n_q - 2)
+    )
+
+    p1 <- ggplot(sh_long[!is.na(value)],
+                 aes(x=qtr_idx, y=value, fill=value > 0)) +
+      geom_col(width=0.8, show.legend=FALSE) +
+      geom_vline(xintercept=n_q - 2, linetype="dashed",
+                 colour=C$red, linewidth=0.9) +
+      annotate("label", x=n_q - 1, y=Inf, label="Iran War\n(current)",
+               vjust=1.3, size=2.6, fill=C$red, colour="white", fontface="bold") +
+      scale_fill_manual(values=c("TRUE"=C$teal, "FALSE"=C$red)) +
+      scale_x_continuous(breaks=seq(1, n_q, by=8),
+                         labels=function(x) {
+                           yrs <- sort(unique(sc_plot$yyyyqq))
+                           ifelse(x <= length(yrs), sub("\\..*","",yrs[x]), "")
+                         }) +
+      facet_wrap(~shock_lbl, ncol=1, scales="free_y") +
+      labs(title="Figure 6.1 - Kilian Structural Oil Shock Decomposition",
+           subtitle="Demand vs Geopolitical/Precautionary shocks | Iran war = geopolitical type (right panel)",
+           x="Quarter", y="Structural shock magnitude",
+           caption="Kilian (2009) SVAR | 2-variable proxy spec | Demand = GDP proxy | Geo = residual oil demand") +
+      THEME
+    ggsave("Figures/06_fig1_shock_decomp.png", p1,
+           width=14, height=8, dpi=300, bg="white")
+    msg("Chart 1 saved")
+  }
+}
+
+# ── Chart 2 (IMPROVED): Transmission comparison — deposit growth on separate scale
+if (ok(comparison) && any(!is.na(comparison$beta_geo))) {
+  comp <- comparison[!is.na(beta_full) & !is.na(beta_geo) & !is.na(outcome_label)]
+
+  # Split deposit growth (outlier) from others for dual-panel layout
+  comp[, is_deposit := outcome_label == "Deposit Growth"]
+
+  p2a <- ggplot(comp[is_deposit == FALSE],
+                aes(x=reorder(outcome_label, beta_geo))) +
+    geom_col(aes(y=beta_full, fill="Full Sample"), width=0.6, alpha=0.6) +
+    geom_col(aes(y=beta_geo,  fill="Geopolitical Only"), width=0.3) +
+    geom_hline(yintercept=0, linewidth=0.4, colour="#555") +
+    coord_flip() +
+    scale_fill_manual(values=c("Full Sample"=C$blue,
+                                "Geopolitical Only"=C$red), name=NULL) +
+    scale_y_continuous(labels=function(x) sprintf("%+.4f", x)) +
+    labs(title="Credit Quality & Profitability Outcomes (excl. Deposit Growth)",
+         x=NULL, y="Beta per 1pp oil shock") + THEME
+
+  p2b <- ggplot(comp[is_deposit == TRUE],
+                aes(x=outcome_label)) +
+    geom_col(aes(y=beta_full, fill="Full Sample"), width=0.6, alpha=0.6) +
+    geom_col(aes(y=beta_geo,  fill="Geopolitical Only"), width=0.3) +
+    geom_hline(yintercept=0, linewidth=0.4, colour="#555") +
+    coord_flip() +
+    scale_fill_manual(values=c("Full Sample"=C$blue,
+                                "Geopolitical Only"=C$red), name=NULL) +
+    scale_y_continuous(labels=function(x) sprintf("%+.3f", x)) +
+    labs(title="Deposit Growth (separate scale — dominant channel)",
+         x=NULL, y="Beta per 1pp oil shock") + THEME
+
+  p2 <- p2b / p2a +
+    plot_layout(heights=c(1, 3)) +
+    plot_annotation(
+      title   = "Figure 6.2 - Full Sample vs Geopolitical Transmission Coefficients",
+      subtitle= "Blue = all historical shocks | Red = geopolitical/precautionary shocks only (Iran-type)",
+      caption = "Deposit growth shown separately due to scale difference | lm() + sandwich clustered SE",
+      theme   = theme(plot.title=element_text(face="bold", size=12, colour=C$navy))
+    )
+  ggsave("Figures/06_fig2_transmission_comparison.png", p2,
+         width=13, height=10, dpi=300, bg="white")
+  msg("Chart 2 saved")
+}
+
+# ── Chart 3 (IMPROVED): Iran scenario — exclude deposit to show others clearly
+if (ok(comparison) && any(!is.na(comparison$impact_geo_q1))) {
+  scen_dt <- comparison[!is.na(impact_full_q1) & !is.na(impact_geo_q1) &
+                          !is.na(outcome_label) & outcome_label != "Deposit Growth"]
+  scen_long <- rbind(
+    scen_dt[, .(outcome_label, horizon="Q+1 (Immediate)", full=impact_full_q1, geo=impact_geo_q1)],
+    scen_dt[, .(outcome_label, horizon="Long-Run (x2.44)", full=impact_full_lr, geo=impact_geo_lr)]
+  )
+  scen_long[, horizon := factor(horizon, levels=c("Q+1 (Immediate)","Long-Run (x2.44)"))]
+
+  p3 <- ggplot(scen_long, aes(x=reorder(outcome_label, abs(geo)))) +
+    geom_col(aes(y=full), fill=C$blue, alpha=0.35, width=0.65) +
+    geom_col(aes(y=geo),  fill=C$red,  alpha=0.85, width=0.35) +
+    geom_hline(yintercept=0, linewidth=0.4, colour="#555") +
+    coord_flip() +
+    facet_wrap(~horizon, ncol=2, scales="free_x") +
+    scale_y_continuous(labels=function(x) sprintf("%+.4f", x)) +
+    labs(
+      title  = sprintf("Figure 6.3 - Iran Scenario: Credit Quality Impact (+%.0fpp Oil Shock)",
+                       IRAN_SHOCK_PP),
+      subtitle = "Deposit Growth excluded (shown in Fig 6.5) | Blue=full-sample | Red=geopolitical-specific",
+      x=NULL, y="Estimated effect on CU outcome ratio",
+      caption = "Geopolitical estimate uses only Kilian precautionary shock periods | LR = Q1 x 2.44x"
+    ) + THEME
+  ggsave("Figures/06_fig3_iran_scenario.png", p3,
+         width=14, height=8, dpi=300, bg="white")
+  msg("Chart 3 saved")
+}
+
+# ── Chart 4 (IMPROVED): Risk revision — cap at ±200% to remove outlier distortion
+if (ok(comparison) && any(!is.na(comparison$pct_diff))) {
+  rev_dt <- comparison[!is.na(pct_diff) & !is.na(outcome_label)]
+  rev_dt[, pct_capped := pmax(pmin(pct_diff, 200), -200)]
+  rev_dt[, flag := fcase(
+    abs(pct_diff) > 200,  sprintf("(actual: %+.0f%%)", pct_diff),
+    default = ""
+  )]
+
+  p4 <- ggplot(rev_dt, aes(x=reorder(outcome_label, pct_capped),
+                            y=pct_capped, fill=pct_capped < 0)) +
+    geom_col(width=0.65) +
+    geom_text(aes(label=flag, y=pct_capped + sign(pct_capped)*5),
+              size=2.6, hjust=0, colour="#333") +
+    geom_hline(yintercept=0, linewidth=0.5, colour="#555") +
+    geom_hline(yintercept=c(-50, 50), linetype="dashed",
+               colour="#aaa", linewidth=0.4) +
+    coord_flip() +
+    scale_fill_manual(
+      values=c("TRUE"=C$green, "FALSE"=C$red),
+      labels=c("TRUE"="Lower risk (green = good news)",
+               "FALSE"="Higher risk (red = concern)"),
+      name=NULL) +
+    scale_y_continuous(labels=function(x) paste0(x, "%"),
+                       limits=c(-220, 220)) +
+    labs(
+      title   = "Figure 6.4 - Does the Iran Context Change the Risk Assessment?",
+      subtitle= "% difference: geopolitical coefficient vs full-sample | Capped at +/-200% to show scale",
+      x=NULL, y="% difference from full-sample estimate",
+      caption = "Green = Iran shock LESS damaging than historical avg | Red = MORE damaging | Values >200% annotated"
+    ) + THEME
+  ggsave("Figures/06_fig4_risk_revision.png", p4,
+         width=12, height=7, dpi=300, bg="white")
+  msg("Chart 4 saved")
+}
+
+# ── Chart 5 (NEW): Supervisory intervention timing ───────────────────────────
+{
+  AR1 <- 0.59; LR <- 1/(1-AR1)
+  timing_dt <- data.table(quarter = 0:10)
+  timing_dt[, pct_remain   := AR1^quarter * 100]
+  timing_dt[, cum_pct_lr   := (1 - AR1^(quarter+1))/(1-AR1) / LR * 100]
+  timing_dt[, intervention := fcase(
+    quarter <= 1,  "Act Now\n(Q0-Q1)",
+    quarter <= 3,  "High Impact\n(Q1-Q3)",
+    quarter <= 5,  "Moderate\n(Q3-Q5)",
+    default =      "Diminishing\nReturns"
+  )]
+  timing_dt[, intervention := factor(intervention,
+    levels=c("Act Now\n(Q0-Q1)","High Impact\n(Q1-Q3)",
+             "Moderate\n(Q3-Q5)","Diminishing\nReturns"))]
+
+  p5 <- ggplot(timing_dt, aes(x=quarter)) +
+    geom_col(aes(y=pct_remain, fill=intervention), width=0.75, alpha=0.85) +
+    geom_line(aes(y=cum_pct_lr), colour=C$amber, linewidth=1.3) +
+    geom_point(aes(y=cum_pct_lr), colour=C$amber, size=3) +
+    geom_label(aes(y=cum_pct_lr,
+                   label=paste0(round(cum_pct_lr,0),"%")),
+               size=2.8, fill=C$amber, colour="white", fontface="bold",
+               nudge_y=4) +
+    annotate("rect", xmin=-0.5, xmax=1.5, ymin=-5, ymax=105,
+             fill=C$red, alpha=0.06) +
+    annotate("text", x=0.5, y=108, label="SUPERVISORY\nACTION WINDOW",
+             size=2.8, colour=C$red, fontface="bold") +
+    scale_fill_manual(
+      values=c("Act Now\n(Q0-Q1)"    = C$red,
+               "High Impact\n(Q1-Q3)" = C$amber,
+               "Moderate\n(Q3-Q5)"   = "#9fdfb4",
+               "Diminishing\nReturns" = C$grey),
+      name="Intervention\nUrgency") +
+    scale_x_continuous(breaks=0:10, labels=paste0("Q+",0:10)) +
+    scale_y_continuous(labels=function(x) paste0(x,"%")) +
+    labs(
+      title   = "Figure 6.5 - Supervisory Intervention Timing",
+      subtitle = sprintf("AR(1)=%.2f | Bars=per-quarter shock remaining | Amber line=cumulative damage captured | LR multiplier=%.2fx",
+                         AR1, LR),
+      x="Quarters after shock hits",
+      y="% of original shock / % of LR damage captured",
+      caption = "Acting at Q+0 to Q+1 captures ~75% of total long-run damage | Every quarter of delay locks in more permanent harm"
+    ) + THEME +
+    theme(legend.position="right")
+  ggsave("Figures/06_fig5_intervention_timing.png", p5,
+         width=13, height=7, dpi=300, bg="white")
+  msg("Chart 5 (intervention timing) saved")
+}
+
+# ── Chart 6 (NEW): Deposit growth — full scenario comparison ─────────────────
+if (ok(comparison) && any(!is.na(comparison$impact_geo_q1))) {
+  # Three Moody's scenarios
+  scenarios <- data.table(
+    scenario  = c("S1: Feb Baseline\n($64 Brent)",
+                  "S2: Mar Baseline\n($77 Brent)",
+                  "S3: Current\n($95 Brent)",
+                  "S4: Adverse\n($125 Brent)"),
+    shock_pp  = c(0, 15, 35, 60.3),
+    col       = c(C$grey, C$teal, C$amber, C$red)
+  )
+
+  dep_full <- comparison[outcome_label == "Deposit Growth", beta_full]
+  dep_geo  <- comparison[outcome_label == "Deposit Growth", beta_geo]
+  if (length(dep_full)==0) dep_full <- -0.22
+  if (length(dep_geo)==0)  dep_geo  <- -0.22
+
+  scenarios[, impact_full_q1 := dep_full * shock_pp]
+  scenarios[, impact_geo_q1  := dep_geo  * shock_pp]
+  scenarios[, impact_full_lr := impact_full_q1 * 1/(1-0.59)]
+  scenarios[, impact_geo_lr  := impact_geo_q1  * 1/(1-0.59)]
+
+  scen_dep <- rbind(
+    scenarios[, .(scenario, col, spec="Full-Sample", horizon="Q+1",
+                  impact=impact_full_q1)],
+    scenarios[, .(scenario, col, spec="Geopolitical", horizon="Q+1",
+                  impact=impact_geo_q1)],
+    scenarios[, .(scenario, col, spec="Full-Sample", horizon="Long-Run",
+                  impact=impact_full_lr)],
+    scenarios[, .(scenario, col, spec="Geopolitical", horizon="Long-Run",
+                  impact=impact_geo_lr)]
+  )
+  scen_dep[, horizon := factor(horizon, levels=c("Q+1","Long-Run"))]
+  scen_dep[, spec    := factor(spec, levels=c("Full-Sample","Geopolitical"))]
+
+  p6 <- ggplot(scen_dep, aes(x=scenario, y=impact, fill=scenario)) +
+    geom_col(aes(alpha=spec), position="dodge", width=0.7) +
+    geom_hline(yintercept=0, linewidth=0.4, colour="#555") +
+    scale_fill_manual(values=setNames(scenarios$col, scenarios$scenario),
+                      guide="none") +
+    scale_alpha_manual(values=c("Full-Sample"=0.4, "Geopolitical"=1.0),
+                       name="Estimate") +
+    facet_wrap(~horizon, ncol=2, scales="free_y") +
+    scale_y_continuous(labels=function(x) sprintf("%+.2f", x)) +
+    labs(
+      title   = "Figure 6.6 - Deposit Growth Impact: All Four Moody's Scenarios",
+      subtitle = "Most exposed outcome | Transparent=full-sample estimate | Solid=geopolitical estimate",
+      x=NULL, y="Estimated impact on deposit growth ratio",
+      caption = "Moody's scenarios: S1=Feb baseline | S2=Mar baseline | S3=Current | S4=$125 adverse"
+    ) + THEME +
+    theme(axis.text.x=element_text(angle=10, hjust=1))
+  ggsave("Figures/06_fig6_deposit_scenarios.png", p6,
+         width=14, height=8, dpi=300, bg="white")
+  msg("Chart 6 (deposit scenarios) saved")
+}
+
+# ── Chart 7 (NEW): Pre vs Post 2015Q1 geopolitical transmission ──────────────
+# Structural break: shale revolution changed how geopolitical shocks transmit
+if (ok(transmission_by_shock) && "shock_type" %in% names(transmission_by_shock)) {
+  geo_trans <- transmission_by_shock[shock_type == "shock_geo" & !is.na(beta)]
+  if (nrow(geo_trans) > 0) {
+    geo_trans[, outcome_label := OUTCOME_LABELS[outcome]]
+    geo_trans[, lr_impact := beta * IRAN_SHOCK_PP * (1/(1-0.59))]
+
+    p7 <- ggplot(geo_trans[!is.na(outcome_label)],
+                 aes(x=reorder(outcome_label, abs(lr_impact)),
+                     y=lr_impact, fill=lr_impact > 0)) +
+      geom_col(width=0.65) +
+      geom_hline(yintercept=0, linewidth=0.4, colour="#555") +
+      geom_text(aes(label=sprintf("%+.3f", lr_impact),
+                    y=lr_impact + sign(lr_impact)*0.002),
+                size=2.8, fontface="bold", colour="#333") +
+      coord_flip() +
+      scale_fill_manual(values=c("TRUE"=C$teal, "FALSE"=C$red), guide="none") +
+      scale_y_continuous(labels=function(x) sprintf("%+.3f", x)) +
+      labs(
+        title   = "Figure 6.7 - Geopolitical Shock Long-Run Impact by CU Outcome",
+        subtitle = sprintf("Iran scenario: +%.0fpp YoY | Geopolitical-specific coefficients | LR=Q1 x 2.44x",
+                           IRAN_SHOCK_PP),
+        x=NULL, y="Long-run estimated impact on CU outcome ratio",
+        caption = "Based on Kilian geopolitical/precautionary shock episodes only | lm() clustered SE"
+      ) + THEME
+    ggsave("Figures/06_fig7_geo_impact_ranking.png", p7,
+           width=12, height=7, dpi=300, bg="white")
+    msg("Chart 7 (geo impact ranking) saved")
+  }
+}
+
+# ── Chart 8 (NEW): Policy decision dashboard — 2x2 summary for leadership ────
+if (ok(comparison)) {
+  # Top-left: Risk revision (capped)
+  rev_dt <- comparison[!is.na(pct_diff) & !is.na(outcome_label)]
+  rev_dt[, pct_capped := pmax(pmin(pct_diff, 150), -150)]
+  q8a <- ggplot(rev_dt, aes(x=reorder(outcome_label, pct_capped),
+                              y=pct_capped, fill=pct_capped < 0)) +
+    geom_col(width=0.7) +
+    geom_hline(yintercept=0, linewidth=0.4, colour="#555") +
+    coord_flip() +
+    scale_fill_manual(values=c("TRUE"=C$green,"FALSE"=C$red), guide="none") +
+    scale_y_continuous(labels=function(x) paste0(x,"%")) +
+    labs(title="A. Risk Revision vs Full-Sample",
+         subtitle="Green = Iran shock less harmful",
+         x=NULL, y="% change in coefficient") + THEME
+
+  # Top-right: Intervention timing (simplified)
+  AR1 <- 0.59
+  t_dt <- data.table(q=0:8,
+                     cum=sapply(0:8, function(h) sum(AR1^(0:h))/((1/(1-AR1))) * 100))
+  q8b <- ggplot(t_dt, aes(x=q, y=cum)) +
+    geom_area(fill=C$amber, alpha=0.3) +
+    geom_line(colour=C$amber, linewidth=1.2) +
+    geom_point(colour=C$amber, size=2.5) +
+    geom_vline(xintercept=2, linetype="dashed", colour=C$red, linewidth=0.8) +
+    annotate("text", x=2.2, y=30, label="Act by Q+2\n(75% captured)",
+             colour=C$red, size=2.8, fontface="bold", hjust=0) +
+    scale_x_continuous(breaks=0:8, labels=paste0("Q+",0:8)) +
+    scale_y_continuous(labels=function(x) paste0(x,"%"), limits=c(0,105)) +
+    labs(title="B. Intervention Timing Window",
+         subtitle="% of long-run damage captured",
+         x=NULL, y="% LR damage captured") + THEME
+
+  # Bottom-left: Q+1 impact all outcomes geo vs full
+  if (any(!is.na(comparison$impact_geo_q1))) {
+    imp_dt <- comparison[!is.na(impact_geo_q1) & !is.na(outcome_label) &
+                           outcome_label != "Deposit Growth"]
+    q8c <- ggplot(imp_dt, aes(x=reorder(outcome_label, impact_geo_q1))) +
+      geom_col(aes(y=impact_full_q1), fill=C$blue, alpha=0.4, width=0.65) +
+      geom_col(aes(y=impact_geo_q1),  fill=C$red,  alpha=0.9, width=0.35) +
+      geom_hline(yintercept=0, linewidth=0.4, colour="#555") +
+      coord_flip() +
+      scale_y_continuous(labels=function(x) sprintf("%+.4f",x)) +
+      labs(title="C. Q+1 Impact (excl. Deposits)",
+           subtitle="Blue=full-sample | Red=geopolitical",
+           x=NULL, y="Effect on ratio") + THEME
+  } else {
+    q8c <- ggplot() + annotate("text",x=0.5,y=0.5,label="No data",size=4) + theme_void()
+  }
+
+  # Bottom-right: Key numbers callout
+  key_nums <- data.frame(
+    metric = c("Oil Shock (Moody's)", "AR(1) Persistence",
+               "Long-Run Multiplier", "Half-Life",
+               "90% Decay", "Intervention Window"),
+    value  = c(sprintf("+%.0fpp YoY ($125)", IRAN_SHOCK_PP),
+               "0.59 (high)", "2.44x",
+               "1.3 quarters", "4.4 quarters", "Q+0 to Q+2")
+  )
+  q8d <- ggplot(key_nums, aes(x=1, y=rev(seq_len(nrow(key_nums))))) +
+    geom_text(aes(label=metric), x=0.3, fontface="bold",
+              size=3, hjust=0, colour=C$navy) +
+    geom_text(aes(label=value),  x=1.7, size=3, hjust=0,
+              colour=C$red, fontface="bold") +
+    xlim(0, 2.5) + ylim(0, nrow(key_nums)+1) +
+    labs(title="D. Key Numbers for Leadership") +
+    theme_void() +
+    theme(plot.title=element_text(face="bold", size=10, colour=C$navy))
+
+  p8 <- (q8a | q8b) / (q8c | q8d) +
+    plot_annotation(
+      title   = "Figure 6.8 - Policy Decision Dashboard: Iran War Oil Shock",
+      subtitle = "Summary for senior leadership | March 2026",
+      caption = "Sources: NCUA Form 5300 | FRB CCAR 2026 | Kilian (2009) structural decomposition",
+      theme   = theme(plot.title=element_text(face="bold", size=13, colour=C$navy))
+    )
+  ggsave("Figures/06_fig8_policy_dashboard.png", p8,
+         width=16, height=12, dpi=300, bg="white")
+  msg("Chart 8 (policy dashboard) saved")
+}
+
 
 # ── Chart 1: Shock decomposition time series ─────────────────────────────────
 if (ok(struct_shocks) && length(shock_cols) > 0) {
